@@ -1,0 +1,1009 @@
+import { Palette, Slider } from "std-widgets.slint";
+
+component ActionButton inherits Rectangle {
+    in property <string> text;
+    in property <bool> enabled: true;
+    in property <bool> primary: false;
+    in property <bool> selected: false;
+    callback clicked;
+
+    min-width: 58px;
+    height: 34px;
+    border-radius: 7px;
+    border-width: 1px;
+    border-color: primary || selected ? #5294ff : #3b4049;
+    background: !enabled ? #25282e
+        : touch.pressed ? (primary || selected ? #356fc8 : #363b44)
+        : touch.has-hover ? (primary || selected ? #4b76ab : #30343c)
+        : primary ? #397dde
+        : selected ? #29496f
+        : #292d34;
+    opacity: enabled ? 1 : 0.48;
+
+    Text {
+        text: root.text;
+        color: #f4f6fa;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+        font-size: 13px;
+        font-weight: 500;
+    }
+
+    touch := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+}
+
+component Divider inherits Rectangle {
+    width: 1px;
+    height: 24px;
+    background: #343840;
+}
+
+export component AppWindow inherits Window {
+    title: document-loaded ? file-name + " — Focusless Edit" : "Focusless Edit";
+    preferred-width: 1180px;
+    preferred-height: 760px;
+    min-width: 900px;
+    min-height: 700px;
+    background: #17191d;
+
+    in-out property <image> preview-image;
+    in-out property <float> exposure: 0;
+    in-out property <float> crop-x: 0;
+    in-out property <float> crop-y: 0;
+    in-out property <float> crop-width: 1;
+    in-out property <float> crop-height: 1;
+    in-out property <float> curve-shadow-input: 0.25;
+    in-out property <float> curve-shadows: 0.25;
+    in-out property <float> curve-midtone-input: 0.5;
+    in-out property <float> curve-midtones: 0.5;
+    in-out property <float> curve-highlight-input: 0.75;
+    in-out property <float> curve-highlights: 0.75;
+    in property <string> exposure-text: "0.0 EV";
+    in property <string> curve-text: "Identity";
+    in property <string> curve-path: "M 0 1 L 1 0";
+    in property <string> rotation-text: "0°";
+    in property <string> crop-text: "Full image";
+    in property <string> file-name: "No document";
+    in property <string> status-text: "Open a photo to get started";
+    in property <string> image-info: "";
+    in property <string> zoom-text: "Fit";
+    in property <bool> document-loaded: false;
+    in property <bool> can-undo: false;
+    in property <bool> can-redo: false;
+    in property <bool> rendering: false;
+    in property <bool> exporting: false;
+    in property <bool> crop-mode: false;
+    in property <bool> curve-mode: false;
+    in property <int> crop-aspect-mode: 0;
+    in property <float> photo-x: 0;
+    in property <float> photo-y: 0;
+    in property <float> photo-width: 0;
+    in property <float> photo-height: 0;
+
+    out property <int> canvas-width: canvas.width / 1px;
+    out property <int> canvas-height: canvas.height / 1px;
+
+    callback open-requested;
+    callback save-requested;
+    callback save-as-requested;
+    callback export-requested;
+    callback cancel-export-requested;
+    callback undo-requested;
+    callback redo-requested;
+    callback fit-requested;
+    callback actual-size-requested;
+    callback zoom-requested(factor: float);
+    callback pan-requested(delta-x: float, delta-y: float);
+    callback exposure-preview(value: float);
+    callback exposure-commit(value: float);
+    callback reset-exposure-requested;
+    callback curve-requested;
+    callback curve-preview(point: int, input: float, value: float);
+    callback curve-commit-requested;
+    callback curve-reset-requested;
+    callback curve-done-requested;
+    callback rotate-left-requested;
+    callback rotate-right-requested;
+    callback crop-requested;
+    callback crop-gesture(
+        kind: int,
+        start-x: float,
+        start-y: float,
+        start-width: float,
+        start-height: float,
+        delta-x: float,
+        delta-y: float,
+    );
+    callback crop-aspect-requested(ratio: float);
+    callback crop-apply-requested;
+    callback crop-cancel-requested;
+
+    init => {
+        Palette.color-scheme = ColorScheme.dark;
+    }
+
+    forward-focus: shortcuts;
+
+    VerticalLayout {
+        spacing: 0px;
+
+        Rectangle {
+            height: 54px;
+            background: #202329;
+            border-width: 0px;
+
+            HorizontalLayout {
+                padding-left: 12px;
+                padding-right: 12px;
+                padding-top: 10px;
+                padding-bottom: 10px;
+                spacing: 8px;
+                alignment: start;
+
+                ActionButton {
+                    text: "Import";
+                    clicked => { root.open-requested(); }
+                }
+                ActionButton {
+                    text: "Save";
+                    enabled: root.document-loaded && !root.crop-mode;
+                    clicked => { root.save-requested(); }
+                }
+                ActionButton {
+                    text: "Save As";
+                    enabled: root.document-loaded && !root.crop-mode;
+                    clicked => { root.save-as-requested(); }
+                }
+                Divider {}
+                ActionButton {
+                    text: "Undo";
+                    enabled: root.can-undo && !root.crop-mode && !root.curve-mode;
+                    clicked => { root.undo-requested(); }
+                }
+                ActionButton {
+                    text: "Redo";
+                    enabled: root.can-redo && !root.crop-mode && !root.curve-mode;
+                    clicked => { root.redo-requested(); }
+                }
+                Divider {}
+                ActionButton {
+                    text: "Export";
+                    primary: true;
+                    enabled: root.document-loaded && !root.exporting
+                        && !root.crop-mode;
+                    clicked => { root.export-requested(); }
+                }
+                if root.exporting: ActionButton {
+                    text: "Cancel";
+                    clicked => { root.cancel-export-requested(); }
+                }
+
+                Rectangle { horizontal-stretch: 1; background: transparent; }
+
+                Text {
+                    text: root.file-name;
+                    color: #b7bdc8;
+                    vertical-alignment: center;
+                    horizontal-alignment: right;
+                    overflow: elide;
+                    max-width: 280px;
+                    font-size: 13px;
+                }
+            }
+        }
+
+        Rectangle {
+            height: 1px;
+            background: #30343b;
+        }
+
+        HorizontalLayout {
+            spacing: 0px;
+
+            canvas := Rectangle {
+                horizontal-stretch: 1;
+                vertical-stretch: 1;
+                background: #101216;
+                clip: true;
+
+                if root.document-loaded: Image {
+                    source: root.preview-image;
+                    image-fit: fill;
+                    width: parent.width;
+                    height: parent.height;
+                }
+
+                if !root.document-loaded: VerticalLayout {
+                    alignment: center;
+                    spacing: 10px;
+                    Text {
+                        text: "FOCUSLESS EDIT";
+                        color: #e6e9ef;
+                        horizontal-alignment: center;
+                        font-size: 22px;
+                        font-weight: 700;
+                    }
+                    Text {
+                        text: "Open a JPEG, PNG, or WebP photo";
+                        color: #7f8795;
+                        horizontal-alignment: center;
+                        font-size: 14px;
+                    }
+                    Rectangle {
+                        height: 8px;
+                        background: transparent;
+                    }
+                    ActionButton {
+                        text: "Import Photo";
+                        primary: true;
+                        clicked => { root.open-requested(); }
+                    }
+                }
+
+                if root.rendering && root.document-loaded: Rectangle {
+                    x: parent.width - self.width - 16px;
+                    y: 16px;
+                    width: 112px;
+                    height: 30px;
+                    border-radius: 15px;
+                    background: #20252ee8;
+                    border-width: 1px;
+                    border-color: #39404b;
+                    HorizontalLayout {
+                        padding-left: 11px;
+                        padding-right: 11px;
+                        spacing: 8px;
+                        Rectangle {
+                            width: 7px;
+                            height: 7px;
+                            border-radius: 4px;
+                            background: #5a9cff;
+                        }
+                        Text {
+                            text: "Processing";
+                            color: #d9dde5;
+                            font-size: 12px;
+                            vertical-alignment: center;
+                        }
+                    }
+                }
+
+                canvas-touch := TouchArea {
+                    private property <length> last-x;
+                    private property <length> last-y;
+                    enabled: root.document-loaded && !root.crop-mode && !root.curve-mode;
+                    mouse-cursor: self.pressed ? grabbing : grab;
+                    moved => {
+                        root.pan-requested(
+                            (self.mouse-x - self.last-x) / 1px,
+                            (self.mouse-y - self.last-y) / 1px
+                        );
+                        self.last-x = self.mouse-x;
+                        self.last-y = self.mouse-y;
+                    }
+                    pointer-event(event) => {
+                        if event.kind == PointerEventKind.down {
+                            self.last-x = self.mouse-x;
+                            self.last-y = self.mouse-y;
+                        }
+                    }
+                    scroll-event(event) => {
+                        if event.delta-y < 0px {
+                            root.zoom-requested(1.15);
+                        } else if event.delta-y > 0px {
+                            root.zoom-requested(0.87);
+                        }
+                        accept
+                    }
+                }
+
+                if root.crop-mode: Rectangle {
+                    x: root.photo-x * 1px;
+                    y: root.photo-y * 1px;
+                    width: root.photo-width * 1px;
+                    height: root.photo-height * 1px;
+                    background: transparent;
+                    clip: true;
+
+                    Rectangle {
+                        x: 0px;
+                        y: 0px;
+                        width: parent.width;
+                        height: root.crop-y * parent.height;
+                        background: #0000009c;
+                    }
+                    Rectangle {
+                        x: 0px;
+                        y: root.crop-y * parent.height;
+                        width: root.crop-x * parent.width;
+                        height: root.crop-height * parent.height;
+                        background: #0000009c;
+                    }
+                    Rectangle {
+                        x: (root.crop-x + root.crop-width) * parent.width;
+                        y: root.crop-y * parent.height;
+                        width: (1 - root.crop-x - root.crop-width) * parent.width;
+                        height: root.crop-height * parent.height;
+                        background: #0000009c;
+                    }
+                    Rectangle {
+                        x: 0px;
+                        y: (root.crop-y + root.crop-height) * parent.height;
+                        width: parent.width;
+                        height: (1 - root.crop-y - root.crop-height) * parent.height;
+                        background: #0000009c;
+                    }
+
+                    crop-frame := Rectangle {
+                        x: root.crop-x * parent.width;
+                        y: root.crop-y * parent.height;
+                        width: root.crop-width * parent.width;
+                        height: root.crop-height * parent.height;
+                        background: transparent;
+                        border-width: 2px;
+                        border-color: #f8fafc;
+
+                        Rectangle {
+                            x: parent.width / 3;
+                            width: 1px;
+                            height: parent.height;
+                            background: #ffffff73;
+                        }
+                        Rectangle {
+                            x: parent.width * 2 / 3;
+                            width: 1px;
+                            height: parent.height;
+                            background: #ffffff73;
+                        }
+                        Rectangle {
+                            y: parent.height / 3;
+                            width: parent.width;
+                            height: 1px;
+                            background: #ffffff73;
+                        }
+                        Rectangle {
+                            y: parent.height * 2 / 3;
+                            width: parent.width;
+                            height: 1px;
+                            background: #ffffff73;
+                        }
+                    }
+
+                    for handle[index] in [0, 1, 2, 3]: Rectangle {
+                        x: (index == 0 || index == 2
+                            ? root.crop-x
+                            : root.crop-x + root.crop-width) * parent.width - 6px;
+                        y: (index == 0 || index == 1
+                            ? root.crop-y
+                            : root.crop-y + root.crop-height) * parent.height - 6px;
+                        width: 12px;
+                        height: 12px;
+                        border-radius: 2px;
+                        background: #f8fafc;
+                        border-width: 1px;
+                        border-color: #252a31;
+                    }
+
+                    for edge[index] in [0, 1, 2, 3]: Rectangle {
+                        x: index == 0 || index == 2
+                            ? (root.crop-x + root.crop-width / 2) * parent.width - 12px
+                            : (index == 1
+                                ? root.crop-x
+                                : root.crop-x + root.crop-width) * parent.width - 3px;
+                        y: index == 1 || index == 3
+                            ? (root.crop-y + root.crop-height / 2) * parent.height - 12px
+                            : (index == 0
+                                ? root.crop-y
+                                : root.crop-y + root.crop-height) * parent.height - 3px;
+                        width: index == 0 || index == 2 ? 24px : 6px;
+                        height: index == 1 || index == 3 ? 24px : 6px;
+                        border-radius: 2px;
+                        background: #f8fafc;
+                        border-width: 1px;
+                        border-color: #252a31;
+                    }
+
+                    crop-touch := TouchArea {
+                        private property <int> drag-kind: -1;
+                        private property <float> start-crop-x;
+                        private property <float> start-crop-y;
+                        private property <float> start-crop-width;
+                        private property <float> start-crop-height;
+
+                        width: parent.width;
+                        height: parent.height;
+                        mouse-cursor: self.pressed ? grabbing : crosshair;
+
+                        pointer-event(event) => {
+                            if event.button == PointerEventButton.left
+                                && event.kind == PointerEventKind.down {
+                                self.start-crop-x = root.crop-x;
+                                self.start-crop-y = root.crop-y;
+                                self.start-crop-width = root.crop-width;
+                                self.start-crop-height = root.crop-height;
+
+                                if abs(self.mouse-x - root.crop-x * self.width) <= 20px
+                                    && abs(self.mouse-y - root.crop-y * self.height) <= 20px {
+                                    self.drag-kind = 1;
+                                } else if abs(self.mouse-x - (root.crop-x + root.crop-width) * self.width) <= 20px
+                                    && abs(self.mouse-y - root.crop-y * self.height) <= 20px {
+                                    self.drag-kind = 2;
+                                } else if abs(self.mouse-x - root.crop-x * self.width) <= 20px
+                                    && abs(self.mouse-y - (root.crop-y + root.crop-height) * self.height) <= 20px {
+                                    self.drag-kind = 3;
+                                } else if abs(self.mouse-x - (root.crop-x + root.crop-width) * self.width) <= 20px
+                                    && abs(self.mouse-y - (root.crop-y + root.crop-height) * self.height) <= 20px {
+                                    self.drag-kind = 4;
+                                } else if abs(self.mouse-x - root.crop-x * self.width) <= 14px
+                                    && self.mouse-y >= root.crop-y * self.height
+                                    && self.mouse-y <= (root.crop-y + root.crop-height) * self.height {
+                                    self.drag-kind = 5;
+                                } else if abs(self.mouse-y - root.crop-y * self.height) <= 14px
+                                    && self.mouse-x >= root.crop-x * self.width
+                                    && self.mouse-x <= (root.crop-x + root.crop-width) * self.width {
+                                    self.drag-kind = 6;
+                                } else if abs(self.mouse-x - (root.crop-x + root.crop-width) * self.width) <= 14px
+                                    && self.mouse-y >= root.crop-y * self.height
+                                    && self.mouse-y <= (root.crop-y + root.crop-height) * self.height {
+                                    self.drag-kind = 7;
+                                } else if abs(self.mouse-y - (root.crop-y + root.crop-height) * self.height) <= 14px
+                                    && self.mouse-x >= root.crop-x * self.width
+                                    && self.mouse-x <= (root.crop-x + root.crop-width) * self.width {
+                                    self.drag-kind = 8;
+                                } else if self.mouse-x >= root.crop-x * self.width
+                                    && self.mouse-x <= (root.crop-x + root.crop-width) * self.width
+                                    && self.mouse-y >= root.crop-y * self.height
+                                    && self.mouse-y <= (root.crop-y + root.crop-height) * self.height {
+                                    self.drag-kind = 0;
+                                } else {
+                                    self.drag-kind = -1;
+                                }
+                            } else if event.kind == PointerEventKind.up {
+                                self.drag-kind = -1;
+                            }
+                        }
+
+                        moved => {
+                            if self.pressed && self.drag-kind >= 0 {
+                                root.crop-gesture(
+                                    self.drag-kind,
+                                    self.start-crop-x,
+                                    self.start-crop-y,
+                                    self.start-crop-width,
+                                    self.start-crop-height,
+                                    (self.mouse-x - self.pressed-x) / self.width,
+                                    (self.mouse-y - self.pressed-y) / self.height,
+                                );
+                            }
+                        }
+                    }
+                }
+
+                if root.curve-mode: Rectangle {
+                    width: min(min(parent.width - 120px, parent.height - 120px), 520px);
+                    height: self.width;
+                    x: (parent.width - self.width) / 2;
+                    y: (parent.height - self.height) / 2;
+                    background: transparent;
+
+                    curve-graph := Rectangle {
+                        width: parent.width;
+                        height: parent.height;
+                        background: transparent;
+
+                        for grid[index] in [1, 2, 3]: Rectangle {
+                            x: grid * parent.width / 4;
+                            width: 1px;
+                            height: parent.height;
+                            background: grid == 2 ? #e4e8ee38 : #d5dae326;
+                        }
+                        for grid[index] in [1, 2, 3]: Rectangle {
+                            y: grid * parent.height / 4;
+                            width: parent.width;
+                            height: 1px;
+                            background: grid == 2 ? #e4e8ee38 : #d5dae326;
+                        }
+                        Rectangle {
+                            x: 0px;
+                            width: 1px;
+                            height: parent.height;
+                            background: #e4e8ee45;
+                        }
+                        Rectangle {
+                            x: parent.width - 1px;
+                            width: 1px;
+                            height: parent.height;
+                            background: #e4e8ee45;
+                        }
+                        Rectangle {
+                            y: 0px;
+                            width: parent.width;
+                            height: 1px;
+                            background: #e4e8ee45;
+                        }
+                        Rectangle {
+                            y: parent.height - 1px;
+                            width: parent.width;
+                            height: 1px;
+                            background: #e4e8ee45;
+                        }
+
+                        Path {
+                            width: parent.width;
+                            height: parent.height;
+                            viewbox-x: 0;
+                            viewbox-y: 0;
+                            viewbox-width: 1;
+                            viewbox-height: 1;
+                            commands: "M 0 1 L 1 0";
+                            stroke: #e4e8ee45;
+                            stroke-width: 1px;
+                        }
+
+                        Path {
+                            width: parent.width;
+                            height: parent.height;
+                            viewbox-x: 0;
+                            viewbox-y: 0;
+                            viewbox-width: 1;
+                            viewbox-height: 1;
+                            commands: root.curve-path;
+                            stroke: #f4f7fce8;
+                            stroke-width: 2px;
+                        }
+
+                        for fixed[index] in [0, 1]: Rectangle {
+                            x: index * parent.width - 4px;
+                            y: (1 - index) * parent.height - 4px;
+                            width: 8px;
+                            height: 8px;
+                            border-radius: 4px;
+                            background: #e5eaf0a8;
+                            border-width: 0px;
+                        }
+
+                        Rectangle {
+                            x: root.curve-shadow-input * parent.width - 7px;
+                            y: (1 - root.curve-shadows) * parent.height - 7px;
+                            width: 14px;
+                            height: 14px;
+                            border-radius: 7px;
+                            background: #f4f7fce0;
+                            border-width: 1px;
+                            border-color: #ffffff;
+                        }
+
+                        Rectangle {
+                            x: root.curve-highlight-input * parent.width - 7px;
+                            y: (1 - root.curve-highlights) * parent.height - 7px;
+                            width: 14px;
+                            height: 14px;
+                            border-radius: 7px;
+                            background: #f4f7fce0;
+                            border-width: 1px;
+                            border-color: #ffffff;
+                        }
+
+                        Rectangle {
+                            x: root.curve-midtone-input * parent.width - 7px;
+                            y: (1 - root.curve-midtones) * parent.height - 7px;
+                            width: 14px;
+                            height: 14px;
+                            border-radius: 7px;
+                            background: #f4f7fce0;
+                            border-width: 1px;
+                            border-color: #ffffff;
+                        }
+
+                        curve-touch := TouchArea {
+                            private property <int> drag-point: -1;
+                            width: parent.width;
+                            height: parent.height;
+                            mouse-cursor: crosshair;
+
+                            pointer-event(event) => {
+                                if event.button == PointerEventButton.left
+                                    && event.kind == PointerEventKind.down {
+                                    let shadow-dx = (self.mouse-x
+                                        - root.curve-shadow-input * self.width) / 1px;
+                                    let shadow-dy = (self.mouse-y
+                                        - (1 - root.curve-shadows) * self.height) / 1px;
+                                    let midtone-dx = (self.mouse-x
+                                        - root.curve-midtone-input * self.width) / 1px;
+                                    let midtone-dy = (self.mouse-y
+                                        - (1 - root.curve-midtones) * self.height) / 1px;
+                                    let highlight-dx = (self.mouse-x
+                                        - root.curve-highlight-input * self.width) / 1px;
+                                    let highlight-dy = (self.mouse-y
+                                        - (1 - root.curve-highlights) * self.height) / 1px;
+                                    let shadow-distance = shadow-dx * shadow-dx
+                                        + shadow-dy * shadow-dy;
+                                    let midtone-distance = midtone-dx * midtone-dx
+                                        + midtone-dy * midtone-dy;
+                                    let highlight-distance = highlight-dx * highlight-dx
+                                        + highlight-dy * highlight-dy;
+                                    if shadow-distance <= 1600
+                                        && shadow-distance <= midtone-distance
+                                        && shadow-distance <= highlight-distance {
+                                        self.drag-point = 0;
+                                    } else if midtone-distance <= 1600
+                                        && midtone-distance <= highlight-distance {
+                                        self.drag-point = 1;
+                                    } else if highlight-distance <= 1600 {
+                                        self.drag-point = 2;
+                                    } else {
+                                        self.drag-point = -1;
+                                    }
+                                    if self.drag-point >= 0 {
+                                        root.curve-preview(
+                                            self.drag-point,
+                                            max(0, min(1, self.mouse-x / self.width)),
+                                            max(0, min(1, 1 - self.mouse-y / self.height)),
+                                        );
+                                    }
+                                } else if event.kind == PointerEventKind.up {
+                                    if self.drag-point >= 0 {
+                                        root.curve-commit-requested();
+                                    }
+                                    self.drag-point = -1;
+                                }
+                            }
+
+                            moved => {
+                                if self.pressed && self.drag-point >= 0 {
+                                    root.curve-preview(
+                                        self.drag-point,
+                                        max(0, min(1, self.mouse-x / self.width)),
+                                        max(0, min(1, 1 - self.mouse-y / self.height)),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            Rectangle {
+                width: 292px;
+                background: #1d2025;
+                border-width: 0px;
+
+                VerticalLayout {
+                    padding: 18px;
+                    spacing: 14px;
+                    alignment: start;
+
+                    Text {
+                        text: "ADJUSTMENTS";
+                        color: #828a97;
+                        font-size: 11px;
+                        font-weight: 700;
+                    }
+
+                    Rectangle {
+                        height: 1px;
+                        background: #343840;
+                    }
+
+                    HorizontalLayout {
+                        spacing: 8px;
+                        Text {
+                            text: "Exposure";
+                            color: root.document-loaded ? #eef1f6 : #777d87;
+                            font-size: 14px;
+                            font-weight: 600;
+                        }
+                        Rectangle { horizontal-stretch: 1; background: transparent; }
+                        Text {
+                            text: root.exposure-text;
+                            color: #9fa7b4;
+                            font-size: 13px;
+                            horizontal-alignment: right;
+                        }
+                    }
+
+                    exposure-slider := Slider {
+                        minimum: -5;
+                        maximum: 5;
+                        step: 0.1;
+                        value <=> root.exposure;
+                        enabled: root.document-loaded && !root.crop-mode && !root.curve-mode;
+                        changed(value) => { root.exposure-preview(value); }
+                        released(value) => { root.exposure-commit(value); }
+                    }
+
+                    HorizontalLayout {
+                        Text {
+                            text: "-5";
+                            color: #6f7682;
+                            font-size: 11px;
+                        }
+                        Rectangle { horizontal-stretch: 1; background: transparent; }
+                        Text {
+                            text: "+5";
+                            color: #6f7682;
+                            font-size: 11px;
+                        }
+                    }
+
+                    ActionButton {
+                        text: "Reset Exposure";
+                        enabled: root.document-loaded && !root.crop-mode
+                            && !root.curve-mode && abs(root.exposure) > 0.001;
+                        clicked => { root.reset-exposure-requested(); }
+                    }
+
+                    HorizontalLayout {
+                        spacing: 8px;
+                        Text {
+                            text: "Tone Curve";
+                            color: root.document-loaded ? #eef1f6 : #777d87;
+                            font-size: 14px;
+                            font-weight: 600;
+                        }
+                        Rectangle { horizontal-stretch: 1; background: transparent; }
+                        Text {
+                            text: root.curve-text;
+                            color: #9fa7b4;
+                            font-size: 11px;
+                            horizontal-alignment: right;
+                            overflow: elide;
+                            max-width: 150px;
+                        }
+                    }
+
+                    if !root.curve-mode: ActionButton {
+                        text: "Edit Tone Curve";
+                        enabled: root.document-loaded && !root.crop-mode;
+                        clicked => { root.curve-requested(); }
+                    }
+
+                    if root.curve-mode: HorizontalLayout {
+                        spacing: 6px;
+                        ActionButton {
+                            text: "Reset";
+                            enabled: abs(root.curve-shadow-input - 0.25) > 0.001
+                                || abs(root.curve-shadows - 0.25) > 0.001
+                                || abs(root.curve-midtone-input - 0.5) > 0.001
+                                || abs(root.curve-midtones - 0.5) > 0.001
+                                || abs(root.curve-highlight-input - 0.75) > 0.001
+                                || abs(root.curve-highlights - 0.75) > 0.001;
+                            clicked => { root.curve-reset-requested(); }
+                        }
+                        ActionButton {
+                            text: "Done";
+                            primary: true;
+                            clicked => { root.curve-done-requested(); }
+                        }
+                    }
+
+                    Rectangle {
+                        height: 1px;
+                        background: #343840;
+                    }
+
+                    Text {
+                        text: "GEOMETRY";
+                        color: #828a97;
+                        font-size: 11px;
+                        font-weight: 700;
+                    }
+
+                    HorizontalLayout {
+                        spacing: 8px;
+                        Text {
+                            text: "Rotation";
+                            color: root.document-loaded ? #eef1f6 : #777d87;
+                            font-size: 14px;
+                            font-weight: 600;
+                        }
+                        Rectangle { horizontal-stretch: 1; background: transparent; }
+                        Text {
+                            text: root.rotation-text;
+                            color: #9fa7b4;
+                            font-size: 13px;
+                        }
+                    }
+
+                    HorizontalLayout {
+                        spacing: 8px;
+                        ActionButton {
+                            text: "Rotate Left";
+                            enabled: root.document-loaded && !root.crop-mode && !root.curve-mode;
+                            clicked => { root.rotate-left-requested(); }
+                        }
+                        ActionButton {
+                            text: "Rotate Right";
+                            enabled: root.document-loaded && !root.crop-mode && !root.curve-mode;
+                            clicked => { root.rotate-right-requested(); }
+                        }
+                    }
+
+                    HorizontalLayout {
+                        spacing: 8px;
+                        Text {
+                            text: "Crop";
+                            color: root.document-loaded ? #eef1f6 : #777d87;
+                            font-size: 14px;
+                            font-weight: 600;
+                        }
+                        Rectangle { horizontal-stretch: 1; background: transparent; }
+                        Text {
+                            text: root.crop-text;
+                            color: #9fa7b4;
+                            font-size: 12px;
+                        }
+                    }
+
+                    if !root.crop-mode: ActionButton {
+                        text: "Crop Photo";
+                        enabled: root.document-loaded && !root.curve-mode;
+                        clicked => { root.crop-requested(); }
+                    }
+
+                    if root.crop-mode: HorizontalLayout {
+                        spacing: 6px;
+                        ActionButton {
+                            text: "Free";
+                            selected: root.crop-aspect-mode == 0;
+                            clicked => { root.crop-aspect-requested(-1); }
+                        }
+                        ActionButton {
+                            text: "Reset";
+                            clicked => { root.crop-aspect-requested(0); }
+                        }
+                    }
+
+                    if root.crop-mode: HorizontalLayout {
+                        spacing: 6px;
+                        ActionButton {
+                            text: "1:1";
+                            selected: root.crop-aspect-mode == 1;
+                            clicked => { root.crop-aspect-requested(1); }
+                        }
+                        ActionButton {
+                            text: "4:3";
+                            selected: root.crop-aspect-mode == 2;
+                            clicked => { root.crop-aspect-requested(4 / 3); }
+                        }
+                        ActionButton {
+                            text: "16:9";
+                            selected: root.crop-aspect-mode == 3;
+                            clicked => { root.crop-aspect-requested(16 / 9); }
+                        }
+                    }
+
+                    if root.crop-mode: HorizontalLayout {
+                        spacing: 8px;
+                        ActionButton {
+                            text: "Cancel";
+                            clicked => { root.crop-cancel-requested(); }
+                        }
+                        ActionButton {
+                            text: "Apply Crop";
+                            primary: true;
+                            clicked => { root.crop-apply-requested(); }
+                        }
+                    }
+
+                    Rectangle {
+                        height: 1px;
+                        background: #343840;
+                    }
+
+                    Text {
+                        text: "NAVIGATION";
+                        color: #828a97;
+                        font-size: 11px;
+                        font-weight: 700;
+                    }
+
+                    HorizontalLayout {
+                        spacing: 8px;
+                        ActionButton {
+                            text: "Fit";
+                            enabled: root.document-loaded && !root.crop-mode && !root.curve-mode;
+                            clicked => { root.fit-requested(); }
+                        }
+                        ActionButton {
+                            text: "100%";
+                            enabled: root.document-loaded && !root.crop-mode && !root.curve-mode;
+                            clicked => { root.actual-size-requested(); }
+                        }
+                    }
+
+                    Text {
+                        text: root.crop-mode
+                            ? "Drag inside: move crop\nDrag edges or corners: resize"
+                            : root.curve-mode
+                                ? "Drag white points in any direction\nOnly the endpoints are fixed"
+                                : "Mouse wheel: zoom\nDrag: pan the view";
+                        color: #737b88;
+                        font-size: 12px;
+                        wrap: word-wrap;
+                    }
+
+                    Rectangle { vertical-stretch: 1; background: transparent; }
+
+                }
+            }
+        }
+
+        Rectangle {
+            height: 30px;
+            background: #202329;
+            border-width: 0px;
+
+            HorizontalLayout {
+                padding-left: 12px;
+                padding-right: 12px;
+                spacing: 12px;
+
+                Text {
+                    text: root.status-text;
+                    color: #9ea5b0;
+                    vertical-alignment: center;
+                    overflow: elide;
+                    font-size: 12px;
+                    horizontal-stretch: 1;
+                }
+                Text {
+                    text: root.image-info;
+                    color: #747c88;
+                    vertical-alignment: center;
+                    font-size: 12px;
+                }
+                Text {
+                    text: root.zoom-text;
+                    color: #b1b7c2;
+                    vertical-alignment: center;
+                    font-size: 12px;
+                    min-width: 60px;
+                    horizontal-alignment: right;
+                }
+            }
+        }
+    }
+
+    shortcuts := FocusScope {
+        width: 0px;
+        height: 0px;
+
+        KeyBinding {
+            keys: @keys(Control + O);
+            activated => { root.open-requested(); }
+        }
+        KeyBinding {
+            keys: @keys(Control + S);
+            activated => { root.save-requested(); }
+        }
+        KeyBinding {
+            keys: @keys(Control + Shift + S);
+            activated => { root.save-as-requested(); }
+        }
+        KeyBinding {
+            keys: @keys(Control + E);
+            activated => { root.export-requested(); }
+        }
+        KeyBinding {
+            keys: @keys(Control + Z);
+            activated => { root.undo-requested(); }
+        }
+        KeyBinding {
+            keys: @keys(Control + Y);
+            activated => { root.redo-requested(); }
+        }
+        KeyBinding {
+            keys: @keys("0");
+            activated => { root.fit-requested(); }
+        }
+        KeyBinding {
+            keys: @keys("1");
+            activated => { root.actual-size-requested(); }
+        }
+    }
+}

@@ -1,0 +1,853 @@
+use std::path::PathBuf;
+
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+
+pub const PROJECT_SCHEMA_VERSION: u32 = 5;
+pub const MAX_HISTORY_LEN: usize = 200;
+const MIN_CROP_EXTENT: f32 = 0.01;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceFingerprint {
+    pub byte_len: u64,
+    pub modified_unix_ms: Option<u64>,
+    pub sample_blake3: String,
+    pub width: u32,
+    pub height: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceReference {
+    pub path: PathBuf,
+    pub fingerprint: SourceFingerprint,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct ViewState {
+    pub zoom: f32,
+    pub center_x: f32,
+    pub center_y: f32,
+}
+
+impl Default for ViewState {
+    fn default() -> Self {
+        Self {
+            zoom: 0.0,
+            center_x: 0.5,
+            center_y: 0.5,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct CropRect {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+}
+
+impl CropRect {
+    pub const FULL: Self = Self {
+        x: 0.0,
+        y: 0.0,
+        width: 1.0,
+        height: 1.0,
+    };
+
+    #[must_use]
+    pub fn rotated_right(self) -> Self {
+        Self {
+            x: 1.0 - self.y - self.height,
+            y: self.x,
+            width: self.height,
+            height: self.width,
+        }
+        .normalized()
+    }
+
+    #[must_use]
+    pub fn rotated_left(self) -> Self {
+        Self {
+            x: self.y,
+            y: 1.0 - self.x - self.width,
+            width: self.height,
+            height: self.width,
+        }
+        .normalized()
+    }
+
+    #[must_use]
+    pub fn normalized(self) -> Self {
+        let width = self.width.clamp(MIN_CROP_EXTENT, 1.0);
+        let height = self.height.clamp(MIN_CROP_EXTENT, 1.0);
+        Self {
+            x: self.x.clamp(0.0, 1.0 - width),
+            y: self.y.clamp(0.0, 1.0 - height),
+            width,
+            height,
+        }
+    }
+
+    #[must_use]
+    pub fn is_full(self) -> bool {
+        (self.x).abs() < f32::EPSILON
+            && (self.y).abs() < f32::EPSILON
+            && (self.width - 1.0).abs() < f32::EPSILON
+            && (self.height - 1.0).abs() < f32::EPSILON
+    }
+}
+
+impl Default for CropRect {
+    fn default() -> Self {
+        Self::FULL
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct ToneCurve {
+    #[serde(default = "default_shadow_input")]
+    pub shadow_input: f32,
+    pub shadows: f32,
+    #[serde(default = "default_midtone_input")]
+    pub midtone_input: f32,
+    #[serde(default = "default_midtones")]
+    pub midtones: f32,
+    #[serde(default = "default_highlight_input")]
+    pub highlight_input: f32,
+    pub highlights: f32,
+}
+
+const fn default_shadow_input() -> f32 {
+    0.25
+}
+
+const fn default_midtone_input() -> f32 {
+    0.5
+}
+
+const fn default_midtones() -> f32 {
+    0.5
+}
+
+const fn default_highlight_input() -> f32 {
+    0.75
+}
+
+impl ToneCurve {
+    pub const IDENTITY: Self = Self {
+        shadow_input: 0.25,
+        shadows: 0.25,
+        midtone_input: 0.5,
+        midtones: 0.5,
+        highlight_input: 0.75,
+        highlights: 0.75,
+    };
+
+    #[must_use]
+    pub fn is_identity(self) -> bool {
+        (self.shadow_input - self.shadows).abs() < f32::EPSILON
+            && (self.midtone_input - self.midtones).abs() < f32::EPSILON
+            && (self.highlight_input - self.highlights).abs() < f32::EPSILON
+    }
+
+    /// Samples the shape-preserving cubic Hermite curve through the five
+    /// control points. Values outside the display-referred 0..=1 interval are
+    /// preserved so extended-range linear scRGB data is not destroyed.
+    #[must_use]
+    pub fn sample(self, x: f32) -> f32 {
+        if !(0.0..=1.0).contains(&x) {
+            return x;
+        }
+        let inputs = [
+            0.0,
+            self.shadow_input,
+            self.midtone_input,
+            self.highlight_input,
+            1.0,
+        ];
+        let values = [0.0, self.shadows, self.midtones, self.highlights, 1.0];
+        let tangents = shape_preserving_tangents(inputs, values);
+        let segment = (0..4)
+            .find(|&segment| x <= inputs[segment + 1])
+            .unwrap_or(3);
+        let interval = inputs[segment + 1] - inputs[segment];
+        let local_x = (x - inputs[segment]) / interval;
+        let local_x2 = local_x * local_x;
+        let local_x3 = local_x2 * local_x;
+        let h00 = 2.0 * local_x3 - 3.0 * local_x2 + 1.0;
+        let h10 = local_x3 - 2.0 * local_x2 + local_x;
+        let h01 = -2.0 * local_x3 + 3.0 * local_x2;
+        let h11 = local_x3 - local_x2;
+        h00 * values[segment]
+            + h10 * interval * tangents[segment]
+            + h01 * values[segment + 1]
+            + h11 * interval * tangents[segment + 1]
+    }
+}
+
+impl Default for ToneCurve {
+    fn default() -> Self {
+        Self::IDENTITY
+    }
+}
+
+fn shape_preserving_tangents(inputs: [f32; 5], values: [f32; 5]) -> [f32; 5] {
+    let intervals = [
+        inputs[1] - inputs[0],
+        inputs[2] - inputs[1],
+        inputs[3] - inputs[2],
+        inputs[4] - inputs[3],
+    ];
+    let slopes = [
+        (values[1] - values[0]) / intervals[0],
+        (values[2] - values[1]) / intervals[1],
+        (values[3] - values[2]) / intervals[2],
+        (values[4] - values[3]) / intervals[3],
+    ];
+    let mut tangents = [slopes[0], 0.0, 0.0, 0.0, slopes[3]];
+    for point in 1..4 {
+        let before = slopes[point - 1];
+        let after = slopes[point];
+        tangents[point] = if before * after <= 0.0 {
+            0.0
+        } else {
+            let before_interval = intervals[point - 1];
+            let after_interval = intervals[point];
+            let before_weight = 2.0 * after_interval + before_interval;
+            let after_weight = after_interval + 2.0 * before_interval;
+            (before_weight + after_weight) / (before_weight / before + after_weight / after)
+        };
+    }
+    for segment in 0..4 {
+        if slopes[segment].abs() < f32::EPSILON {
+            tangents[segment] = 0.0;
+            tangents[segment + 1] = 0.0;
+            continue;
+        }
+        let a = tangents[segment] / slopes[segment];
+        let b = tangents[segment + 1] / slopes[segment];
+        let magnitude = a * a + b * b;
+        if magnitude > 9.0 {
+            let scale = 3.0 / magnitude.sqrt();
+            tangents[segment] = scale * a * slopes[segment];
+            tangents[segment + 1] = scale * b * slopes[segment];
+        }
+    }
+    tangents
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum Operation {
+    Rotate { quarter_turns: u8 },
+    Crop { rect: CropRect },
+    Exposure { ev: f32 },
+    ToneCurve { curve: ToneCurve },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum Command {
+    SetExposure {
+        before: f32,
+        after: f32,
+    },
+    SetCrop {
+        before: CropRect,
+        after: CropRect,
+    },
+    Rotate {
+        before: u8,
+        after: u8,
+        crop_before: CropRect,
+        crop_after: CropRect,
+    },
+    SetToneCurve {
+        before: ToneCurve,
+        after: ToneCurve,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct CommandHistory {
+    #[serde(default)]
+    undo: Vec<Command>,
+    #[serde(default)]
+    redo: Vec<Command>,
+}
+
+impl CommandHistory {
+    #[must_use]
+    pub fn can_undo(&self) -> bool {
+        !self.undo.is_empty()
+    }
+
+    #[must_use]
+    pub fn can_redo(&self) -> bool {
+        !self.redo.is_empty()
+    }
+
+    #[must_use]
+    pub fn undo_len(&self) -> usize {
+        self.undo.len()
+    }
+
+    #[must_use]
+    pub fn redo_len(&self) -> usize {
+        self.redo.len()
+    }
+
+    fn push(&mut self, command: Command) {
+        self.undo.push(command);
+        self.redo.clear();
+        if self.undo.len() > MAX_HISTORY_LEN {
+            let overflow = self.undo.len() - MAX_HISTORY_LEN;
+            self.undo.drain(0..overflow);
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProjectDocument {
+    pub schema_version: u32,
+    pub source: SourceReference,
+    #[serde(default = "default_operations")]
+    pub operations: Vec<Operation>,
+    #[serde(default)]
+    pub view: ViewState,
+    #[serde(default)]
+    pub history: CommandHistory,
+}
+
+fn default_operations() -> Vec<Operation> {
+    vec![
+        Operation::Rotate { quarter_turns: 0 },
+        Operation::Crop {
+            rect: CropRect::FULL,
+        },
+        Operation::Exposure { ev: 0.0 },
+        Operation::ToneCurve {
+            curve: ToneCurve::IDENTITY,
+        },
+    ]
+}
+
+#[derive(Debug, Error, PartialEq)]
+pub enum DocumentError {
+    #[error("unsupported project schema version {found}; newest supported version is {supported}")]
+    UnsupportedSchema { found: u32, supported: u32 },
+    #[error("exposure must be finite and between -5 and +5 EV")]
+    InvalidExposure,
+    #[error("rotation must be between 0 and 3 quarter turns")]
+    InvalidRotation,
+    #[error("crop rectangle must be finite, inside the image, and at least 1% wide and high")]
+    InvalidCrop,
+    #[error("tone curve points must be finite, inside the 0 to 1 interval, and ordered by input")]
+    InvalidToneCurve,
+}
+
+impl ProjectDocument {
+    #[must_use]
+    pub fn new(source: SourceReference) -> Self {
+        Self {
+            schema_version: PROJECT_SCHEMA_VERSION,
+            source,
+            operations: default_operations(),
+            view: ViewState::default(),
+            history: CommandHistory::default(),
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), DocumentError> {
+        if self.schema_version > PROJECT_SCHEMA_VERSION {
+            return Err(DocumentError::UnsupportedSchema {
+                found: self.schema_version,
+                supported: PROJECT_SCHEMA_VERSION,
+            });
+        }
+        for operation in &self.operations {
+            match *operation {
+                Operation::Rotate { quarter_turns } => validate_rotation(quarter_turns)?,
+                Operation::Crop { rect } => validate_crop(rect)?,
+                Operation::Exposure { ev } => validate_exposure(ev)?,
+                Operation::ToneCurve { curve } => validate_tone_curve(curve)?,
+            }
+        }
+        Ok(())
+    }
+
+    pub fn upgrade_to_latest(&mut self) -> Result<(), DocumentError> {
+        self.validate()?;
+        self.schema_version = PROJECT_SCHEMA_VERSION;
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn exposure_ev(&self) -> f32 {
+        self.operations
+            .iter()
+            .rev()
+            .find_map(|operation| match *operation {
+                Operation::Exposure { ev } => Some(ev),
+                _ => None,
+            })
+            .unwrap_or(0.0)
+    }
+
+    #[must_use]
+    pub fn rotation_quarter_turns(&self) -> u8 {
+        self.operations
+            .iter()
+            .rev()
+            .find_map(|operation| match *operation {
+                Operation::Rotate { quarter_turns } => Some(quarter_turns),
+                _ => None,
+            })
+            .unwrap_or(0)
+    }
+
+    #[must_use]
+    pub fn crop_rect(&self) -> CropRect {
+        self.operations
+            .iter()
+            .rev()
+            .find_map(|operation| match *operation {
+                Operation::Crop { rect } => Some(rect),
+                _ => None,
+            })
+            .unwrap_or_default()
+    }
+
+    #[must_use]
+    pub fn tone_curve(&self) -> ToneCurve {
+        self.operations
+            .iter()
+            .rev()
+            .find_map(|operation| match *operation {
+                Operation::ToneCurve { curve } => Some(curve),
+                _ => None,
+            })
+            .unwrap_or_default()
+    }
+
+    #[must_use]
+    pub fn output_dimensions(&self, source_width: u32, source_height: u32) -> (u32, u32) {
+        let (rotated_width, rotated_height) = if self.rotation_quarter_turns().is_multiple_of(2) {
+            (source_width, source_height)
+        } else {
+            (source_height, source_width)
+        };
+        let crop = self.crop_rect();
+        (
+            ((rotated_width as f32 * crop.width).round() as u32).max(1),
+            ((rotated_height as f32 * crop.height).round() as u32).max(1),
+        )
+    }
+
+    /// Updates the visible state without creating a history entry.
+    ///
+    /// The UI uses this during continuous slider movement, then calls
+    /// [`Self::commit_exposure`] once the edit transaction settles.
+    pub fn preview_exposure(&mut self, ev: f32) -> Result<(), DocumentError> {
+        validate_exposure(ev)?;
+        if let Some(Operation::Exposure { ev: current }) = self
+            .operations
+            .iter_mut()
+            .rev()
+            .find(|operation| matches!(operation, Operation::Exposure { .. }))
+        {
+            *current = ev;
+        } else {
+            self.operations.push(Operation::Exposure { ev });
+        }
+        Ok(())
+    }
+
+    pub fn commit_exposure(&mut self, before: f32, after: f32) -> Result<(), DocumentError> {
+        validate_exposure(before)?;
+        self.preview_exposure(after)?;
+        if (before - after).abs() > f32::EPSILON {
+            self.history.push(Command::SetExposure { before, after });
+        }
+        Ok(())
+    }
+
+    pub fn preview_crop(&mut self, rect: CropRect) -> Result<(), DocumentError> {
+        validate_crop(rect)?;
+        if let Some(Operation::Crop { rect: current }) = self
+            .operations
+            .iter_mut()
+            .rev()
+            .find(|operation| matches!(operation, Operation::Crop { .. }))
+        {
+            *current = rect;
+        } else {
+            self.operations.push(Operation::Crop { rect });
+        }
+        Ok(())
+    }
+
+    pub fn commit_crop(&mut self, before: CropRect, after: CropRect) -> Result<(), DocumentError> {
+        validate_crop(before)?;
+        self.preview_crop(after)?;
+        if before != after {
+            self.history.push(Command::SetCrop { before, after });
+        }
+        Ok(())
+    }
+
+    pub fn rotate_by(&mut self, quarter_turn_delta: i8) -> Result<(), DocumentError> {
+        let before = self.rotation_quarter_turns();
+        let crop_before = self.crop_rect();
+        let normalized_delta = quarter_turn_delta.rem_euclid(4) as u8;
+        let after = (before + normalized_delta) % 4;
+        let mut crop_after = crop_before;
+        for _ in 0..normalized_delta {
+            crop_after = crop_after.rotated_right();
+        }
+        self.preview_rotation(after)?;
+        self.preview_crop(crop_after)?;
+        if before != after {
+            self.history.push(Command::Rotate {
+                before,
+                after,
+                crop_before,
+                crop_after,
+            });
+        }
+        Ok(())
+    }
+
+    pub fn preview_tone_curve(&mut self, curve: ToneCurve) -> Result<(), DocumentError> {
+        validate_tone_curve(curve)?;
+        if let Some(Operation::ToneCurve { curve: current }) = self
+            .operations
+            .iter_mut()
+            .rev()
+            .find(|operation| matches!(operation, Operation::ToneCurve { .. }))
+        {
+            *current = curve;
+        } else {
+            self.operations.push(Operation::ToneCurve { curve });
+        }
+        Ok(())
+    }
+
+    pub fn commit_tone_curve(
+        &mut self,
+        before: ToneCurve,
+        after: ToneCurve,
+    ) -> Result<(), DocumentError> {
+        validate_tone_curve(before)?;
+        self.preview_tone_curve(after)?;
+        if before != after {
+            self.history.push(Command::SetToneCurve { before, after });
+        }
+        Ok(())
+    }
+
+    fn preview_rotation(&mut self, quarter_turns: u8) -> Result<(), DocumentError> {
+        validate_rotation(quarter_turns)?;
+        if let Some(Operation::Rotate {
+            quarter_turns: current,
+        }) = self
+            .operations
+            .iter_mut()
+            .rev()
+            .find(|operation| matches!(operation, Operation::Rotate { .. }))
+        {
+            *current = quarter_turns;
+        } else {
+            self.operations.push(Operation::Rotate { quarter_turns });
+        }
+        Ok(())
+    }
+
+    pub fn undo(&mut self) -> bool {
+        let Some(command) = self.history.undo.pop() else {
+            return false;
+        };
+        match command {
+            Command::SetExposure { before, .. } => {
+                let _ = self.preview_exposure(before);
+            }
+            Command::SetCrop { before, .. } => {
+                let _ = self.preview_crop(before);
+            }
+            Command::Rotate {
+                before,
+                crop_before,
+                ..
+            } => {
+                let _ = self.preview_rotation(before);
+                let _ = self.preview_crop(crop_before);
+            }
+            Command::SetToneCurve { before, .. } => {
+                let _ = self.preview_tone_curve(before);
+            }
+        }
+        self.history.redo.push(command);
+        true
+    }
+
+    pub fn redo(&mut self) -> bool {
+        let Some(command) = self.history.redo.pop() else {
+            return false;
+        };
+        match command {
+            Command::SetExposure { after, .. } => {
+                let _ = self.preview_exposure(after);
+            }
+            Command::SetCrop { after, .. } => {
+                let _ = self.preview_crop(after);
+            }
+            Command::Rotate {
+                after, crop_after, ..
+            } => {
+                let _ = self.preview_rotation(after);
+                let _ = self.preview_crop(crop_after);
+            }
+            Command::SetToneCurve { after, .. } => {
+                let _ = self.preview_tone_curve(after);
+            }
+        }
+        self.history.undo.push(command);
+        true
+    }
+}
+
+fn validate_rotation(quarter_turns: u8) -> Result<(), DocumentError> {
+    if quarter_turns <= 3 {
+        Ok(())
+    } else {
+        Err(DocumentError::InvalidRotation)
+    }
+}
+
+fn validate_crop(rect: CropRect) -> Result<(), DocumentError> {
+    let values = [rect.x, rect.y, rect.width, rect.height];
+    let epsilon = 0.000_01;
+    if values.into_iter().all(f32::is_finite)
+        && rect.x >= 0.0
+        && rect.y >= 0.0
+        && rect.width >= MIN_CROP_EXTENT
+        && rect.height >= MIN_CROP_EXTENT
+        && rect.x + rect.width <= 1.0 + epsilon
+        && rect.y + rect.height <= 1.0 + epsilon
+    {
+        Ok(())
+    } else {
+        Err(DocumentError::InvalidCrop)
+    }
+}
+
+fn validate_tone_curve(curve: ToneCurve) -> Result<(), DocumentError> {
+    const MIN_INPUT_GAP: f32 = 0.001;
+    if curve.shadow_input.is_finite()
+        && curve.shadows.is_finite()
+        && curve.midtone_input.is_finite()
+        && curve.midtones.is_finite()
+        && curve.highlight_input.is_finite()
+        && curve.highlights.is_finite()
+        && curve.shadow_input >= MIN_INPUT_GAP
+        && curve.midtone_input - curve.shadow_input >= MIN_INPUT_GAP
+        && curve.highlight_input - curve.midtone_input >= MIN_INPUT_GAP
+        && 1.0 - curve.highlight_input >= MIN_INPUT_GAP
+        && (0.0..=1.0).contains(&curve.shadows)
+        && (0.0..=1.0).contains(&curve.midtones)
+        && (0.0..=1.0).contains(&curve.highlights)
+    {
+        Ok(())
+    } else {
+        Err(DocumentError::InvalidToneCurve)
+    }
+}
+
+fn validate_exposure(ev: f32) -> Result<(), DocumentError> {
+    if ev.is_finite() && (-5.0..=5.0).contains(&ev) {
+        Ok(())
+    } else {
+        Err(DocumentError::InvalidExposure)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn document() -> ProjectDocument {
+        ProjectDocument::new(SourceReference {
+            path: PathBuf::from("/photos/example.jpg"),
+            fingerprint: SourceFingerprint {
+                byte_len: 42,
+                modified_unix_ms: Some(10),
+                sample_blake3: "abc".into(),
+                width: 100,
+                height: 50,
+            },
+        })
+    }
+
+    #[test]
+    fn exposure_transaction_is_undoable_and_redoable() {
+        let mut document = document();
+        document.preview_exposure(0.8).unwrap();
+        document.commit_exposure(0.0, 0.8).unwrap();
+
+        assert_eq!(document.exposure_ev(), 0.8);
+        assert!(document.undo());
+        assert_eq!(document.exposure_ev(), 0.0);
+        assert!(document.redo());
+        assert_eq!(document.exposure_ev(), 0.8);
+    }
+
+    #[test]
+    fn new_edit_clears_redo_history() {
+        let mut document = document();
+        document.commit_exposure(0.0, 1.0).unwrap();
+        assert!(document.undo());
+        document.commit_exposure(0.0, -1.0).unwrap();
+        assert!(!document.history.can_redo());
+    }
+
+    #[test]
+    fn history_is_bounded() {
+        let mut document = document();
+        for index in 0..(MAX_HISTORY_LEN + 20) {
+            let before = document.exposure_ev();
+            let after = ((index % 80) as f32 / 10.0) - 4.0;
+            document.commit_exposure(before, after).unwrap();
+        }
+        assert_eq!(document.history.undo_len(), MAX_HISTORY_LEN);
+    }
+
+    #[test]
+    fn rejects_invalid_exposure() {
+        let mut document = document();
+        assert_eq!(
+            document.preview_exposure(f32::NAN),
+            Err(DocumentError::InvalidExposure)
+        );
+        assert_eq!(
+            document.preview_exposure(5.1),
+            Err(DocumentError::InvalidExposure)
+        );
+    }
+
+    #[test]
+    fn crop_and_rotation_are_undoable() {
+        let mut document = document();
+        let crop = CropRect {
+            x: 0.1,
+            y: 0.2,
+            width: 0.6,
+            height: 0.5,
+        };
+        document.commit_crop(CropRect::FULL, crop).unwrap();
+        document.rotate_by(1).unwrap();
+
+        assert_eq!(document.rotation_quarter_turns(), 1);
+        assert_eq!(document.crop_rect(), crop.rotated_right());
+        assert_eq!(document.output_dimensions(100, 50), (25, 60));
+
+        assert!(document.undo());
+        assert_eq!(document.rotation_quarter_turns(), 0);
+        assert_eq!(document.crop_rect(), crop);
+        assert!(document.undo());
+        assert_eq!(document.crop_rect(), CropRect::FULL);
+        assert!(document.redo());
+        assert_eq!(document.crop_rect(), crop);
+    }
+
+    #[test]
+    fn rejects_invalid_crop_and_rotation() {
+        let mut document = document();
+        assert_eq!(
+            document.preview_crop(CropRect {
+                x: 0.9,
+                y: 0.0,
+                width: 0.2,
+                height: 1.0,
+            }),
+            Err(DocumentError::InvalidCrop)
+        );
+        assert_eq!(
+            document.preview_rotation(4),
+            Err(DocumentError::InvalidRotation)
+        );
+    }
+
+    #[test]
+    fn tone_curve_is_shape_preserving_and_undoable() {
+        let mut document = document();
+        let curve = ToneCurve {
+            shadow_input: 0.2,
+            shadows: 0.12,
+            midtone_input: 0.55,
+            midtones: 0.42,
+            highlight_input: 0.82,
+            highlights: 0.88,
+        };
+        document
+            .commit_tone_curve(ToneCurve::IDENTITY, curve)
+            .unwrap();
+        assert_eq!(document.tone_curve(), curve);
+        assert_eq!(curve.sample(0.2), 0.12);
+        assert_eq!(curve.sample(0.55), 0.42);
+        assert_eq!(curve.sample(0.82), 0.88);
+        let mut previous = 0.0;
+        for index in 1..=1000 {
+            let value = curve.sample(index as f32 / 1000.0);
+            assert!(value >= previous);
+            previous = value;
+        }
+        assert!(document.undo());
+        assert_eq!(document.tone_curve(), ToneCurve::IDENTITY);
+        assert!(document.redo());
+        assert_eq!(document.tone_curve(), curve);
+    }
+
+    #[test]
+    fn tone_curve_points_can_cross_without_segment_overshoot() {
+        let curve = ToneCurve {
+            shadow_input: 0.15,
+            shadows: 0.9,
+            midtone_input: 0.45,
+            midtones: 0.1,
+            highlight_input: 0.9,
+            highlights: 0.8,
+        };
+        for index in 0..=1000 {
+            let value = curve.sample(index as f32 / 1000.0);
+            assert!((0.0..=1.0).contains(&value));
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_tone_curve() {
+        let mut document = document();
+        assert_eq!(
+            document.preview_tone_curve(ToneCurve {
+                shadow_input: 0.25,
+                shadows: 1.1,
+                midtone_input: 0.5,
+                midtones: 0.5,
+                highlight_input: 0.75,
+                highlights: 0.8,
+            }),
+            Err(DocumentError::InvalidToneCurve)
+        );
+        assert_eq!(
+            document.preview_tone_curve(ToneCurve {
+                shadow_input: 0.6,
+                shadows: 0.2,
+                midtone_input: 0.5,
+                midtones: 0.5,
+                highlight_input: 0.75,
+                highlights: 0.8,
+            }),
+            Err(DocumentError::InvalidToneCurve)
+        );
+    }
+}

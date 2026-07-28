@@ -1,0 +1,28 @@
+[package]
+name = "focusless-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+build = "build.rs"
+
+[[bin]]
+name = "focusless-edit"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+crossbeam-channel.workspace = true
+directories.workspace = true
+focusless-core = { path = "../focusless-core" }
+focusless-engine-vips = { path = "../focusless-engine-vips" }
+focusless-storage = { path = "../focusless-storage" }
+rfd.workspace = true
+slint.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-appender.workspace = true
+tracing-subscriber.workspace = true
+
+[build-dependencies]
+slint-build = "1.17.1"

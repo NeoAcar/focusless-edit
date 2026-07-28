@@ -1,0 +1,17 @@
+[package]
+name = "focusless-engine-vips"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+crossbeam-channel.workspace = true
+focusless-core = { path = "../focusless-core" }
+libvips.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+

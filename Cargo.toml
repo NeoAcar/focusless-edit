@@ -1,0 +1,42 @@
+[workspace]
+members = [
+    "crates/focusless-app",
+    "crates/focusless-core",
+    "crates/focusless-engine-vips",
+    "crates/focusless-storage",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+rust-version = "1.97"
+
+[workspace.dependencies]
+anyhow = "1.0.100"
+blake3 = "1.8.2"
+crossbeam-channel = "0.5.15"
+directories = "6.0.0"
+libvips = "2.3.0"
+pathdiff = "0.2.3"
+rfd = { version = "0.16.0", default-features = false, features = ["tokio", "xdg-portal"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+slint = { version = "1.17.1", default-features = false, features = [
+    "backend-winit",
+    "compat-1-2",
+    "renderer-femtovg",
+    "std",
+] }
+tempfile = "3.24.0"
+thiserror = "2.0.17"
+tokio = { version = "1.53.1", features = ["rt-multi-thread"] }
+tracing = "0.1.44"
+tracing-appender = "0.2.4"
+tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

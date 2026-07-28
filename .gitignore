@@ -1,0 +1,7 @@
+/target/
+/.idea/
+/.vscode/
+*.focusless.tmp
+*.focusless.bak
+*.log
+/20250802_192259.jpg
