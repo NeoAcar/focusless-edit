@@ -3,5 +3,7 @@
 /.vscode/
 *.focusless.tmp
 *.focusless.bak
+*.focusless
 *.log
 /20250802_192259.jpg
+/focusless/

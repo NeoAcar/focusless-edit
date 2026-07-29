@@ -18,7 +18,7 @@ use std::{
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded, select, unbounded};
 use focusless_core::{
     CropRect, ExportFormat, ExportRequest, Operation, PreviewRequest, RenderError, RenderResult,
-    ToneCurve, Viewport,
+    ToneCurve, Viewport, WhiteBalance,
 };
 use libvips::{VipsApp, VipsImage, ops};
 use tracing::{debug, error};
@@ -458,6 +458,18 @@ fn apply_operations(image: &VipsImage, operations: &[Operation]) -> Result<VipsI
         current = crop_image(&current, crop)?;
     }
 
+    let white_balance = operations
+        .iter()
+        .rev()
+        .find_map(|operation| match *operation {
+            Operation::WhiteBalance { adjustment } => Some(adjustment),
+            _ => None,
+        })
+        .unwrap_or_default();
+    if !white_balance.is_identity() {
+        current = apply_white_balance_linear(&current, white_balance)?;
+    }
+
     let exposure_ev = operations
         .iter()
         .rev()
@@ -480,7 +492,352 @@ fn apply_operations(image: &VipsImage, operations: &[Operation]) -> Result<VipsI
     if !tone_curve.is_identity() {
         current = apply_tone_curve_linear(&current, tone_curve)?;
     }
+    let saturation = operations
+        .iter()
+        .rev()
+        .find_map(|operation| match *operation {
+            Operation::Saturation { amount } => Some(amount),
+            _ => None,
+        })
+        .unwrap_or(0.0);
+    if saturation.abs() > f32::EPSILON {
+        current = apply_saturation_oklab(&current, saturation)?;
+    }
+    let sharpness = operations
+        .iter()
+        .rev()
+        .find_map(|operation| match *operation {
+            Operation::Sharpness { amount } => Some(amount),
+            _ => None,
+        })
+        .unwrap_or(0.0);
+    if sharpness > f32::EPSILON {
+        current = apply_sharpness_oklab(&current, sharpness)?;
+    }
     Ok(current)
+}
+
+fn apply_white_balance_linear(
+    image: &VipsImage,
+    adjustment: WhiteBalance,
+) -> Result<VipsImage, RenderError> {
+    let bands = image.get_bands();
+    let has_alpha = image.image_hasalpha();
+    let color = if has_alpha {
+        ops::extract_band_with_opts(image, 0, &ops::ExtractBandOptions { n: bands - 1 })
+            .map_err(vips_error)?
+    } else {
+        ops::copy(image).map_err(vips_error)?
+    };
+    if color.get_bands() != 3 {
+        return Err(RenderError::Engine(format!(
+            "white balance requires three color bands, got {}",
+            color.get_bands()
+        )));
+    }
+    let alpha = if has_alpha {
+        Some(ops::extract_band(image, bands - 1).map_err(vips_error)?)
+    } else {
+        None
+    };
+
+    let balanced = recombine_three_channels(&color, white_balance_rgb_matrix(adjustment)?)?;
+    if let Some(alpha) = alpha {
+        ops::bandjoin(&mut [balanced, alpha]).map_err(vips_error)
+    } else {
+        Ok(balanced)
+    }
+}
+
+const LINEAR_RGB_TO_LMS: [[f32; 3]; 3] = [
+    [0.412_221_46, 0.536_332_55, 0.051_445_995],
+    [0.211_903_5, 0.680_699_5, 0.107_396_96],
+    [0.088_302_46, 0.281_718_85, 0.629_978_7],
+];
+const LMS_ROOT_TO_OKLAB: [[f32; 3]; 3] = [
+    [0.210_454_26, 0.793_617_8, -0.004_072_047],
+    [1.977_998_5, -2.428_592_2, 0.450_593_7],
+    [0.025_904_037, 0.782_771_77, -0.808_675_77],
+];
+const OKLAB_TO_LMS_ROOT: [[f32; 3]; 3] = [
+    [1.0, 0.396_337_78, 0.215_803_76],
+    [1.0, -0.105_561_346, -0.063_854_17],
+    [1.0, -0.089_484_18, -1.291_485_5],
+];
+const LMS_TO_LINEAR_RGB: [[f32; 3]; 3] = [
+    [4.076_741_7, -3.307_711_6, 0.230_969_94],
+    [-1.268_438, 2.609_757_4, -0.341_319_4],
+    [-0.004_196_086_3, -0.703_418_6, 1.707_614_7],
+];
+
+fn apply_saturation_oklab(image: &VipsImage, amount: f32) -> Result<VipsImage, RenderError> {
+    let (color, alpha) = split_color_and_alpha(image, "saturation")?;
+    let oklab = linear_rgb_to_oklab(&color)?;
+    let chroma_scale = 1.0 + f64::from(amount) / 100.0;
+    let adjusted_oklab = ops::linear(
+        &oklab,
+        &mut [1.0, chroma_scale, chroma_scale],
+        &mut [0.0, 0.0, 0.0],
+    )
+    .map_err(vips_error)?;
+    let saturated = oklab_to_linear_rgb(&adjusted_oklab)?;
+    join_alpha(saturated, alpha)
+}
+
+fn apply_sharpness_oklab(image: &VipsImage, amount: f32) -> Result<VipsImage, RenderError> {
+    const RADIUS_SIGMA: f64 = 1.0;
+    const DETAIL_THRESHOLD: f64 = 0.003;
+
+    let (color, alpha) = split_color_and_alpha(image, "sharpness")?;
+    let oklab = linear_rgb_to_oklab(&color)?;
+    let lightness = ops::extract_band(&oklab, 0).map_err(vips_error)?;
+    let chroma = ops::extract_band_with_opts(&oklab, 1, &ops::ExtractBandOptions { n: 2 })
+        .map_err(vips_error)?;
+    let blurred = ops::gaussblur(&lightness, RADIUS_SIGMA).map_err(vips_error)?;
+    let detail = ops::subtract(&lightness, &blurred).map_err(vips_error)?;
+    let detail_magnitude = ops::abs(&detail).map_err(vips_error)?;
+    let significant = ops::relational_const(
+        &detail_magnitude,
+        ops::OperationRelational::Moreeq,
+        &mut [DETAIL_THRESHOLD],
+    )
+    .map_err(vips_error)?;
+    let scaled_detail =
+        ops::linear(&detail, &mut [f64::from(amount) / 100.0], &mut [0.0]).map_err(vips_error)?;
+    let sharpened_lightness = ops::add(&lightness, &scaled_detail).map_err(vips_error)?;
+    let adjusted_lightness =
+        ops::ifthenelse(&significant, &sharpened_lightness, &lightness).map_err(vips_error)?;
+    let adjusted_oklab = ops::bandjoin(&mut [adjusted_lightness, chroma]).map_err(vips_error)?;
+    let sharpened = oklab_to_linear_rgb(&adjusted_oklab)?;
+    join_alpha(sharpened, alpha)
+}
+
+fn split_color_and_alpha(
+    image: &VipsImage,
+    operation_name: &str,
+) -> Result<(VipsImage, Option<VipsImage>), RenderError> {
+    let bands = image.get_bands();
+    let has_alpha = image.image_hasalpha();
+    let color = if has_alpha {
+        ops::extract_band_with_opts(image, 0, &ops::ExtractBandOptions { n: bands - 1 })
+            .map_err(vips_error)?
+    } else {
+        ops::copy(image).map_err(vips_error)?
+    };
+    if color.get_bands() != 3 {
+        return Err(RenderError::Engine(format!(
+            "{operation_name} requires three color bands, got {}",
+            color.get_bands()
+        )));
+    }
+    let alpha = if has_alpha {
+        Some(ops::extract_band(image, bands - 1).map_err(vips_error)?)
+    } else {
+        None
+    };
+    Ok((color, alpha))
+}
+
+fn join_alpha(color: VipsImage, alpha: Option<VipsImage>) -> Result<VipsImage, RenderError> {
+    if let Some(alpha) = alpha {
+        ops::bandjoin(&mut [color, alpha]).map_err(vips_error)
+    } else {
+        Ok(color)
+    }
+}
+
+fn linear_rgb_to_oklab(color: &VipsImage) -> Result<VipsImage, RenderError> {
+    let lms = recombine_three_channels(color, LINEAR_RGB_TO_LMS)?;
+    let lms_absolute = ops::abs(&lms).map_err(vips_error)?;
+    let lms_root = ops::math2_const(&lms_absolute, ops::OperationMath2::Pow, &mut [1.0 / 3.0])
+        .map_err(vips_error)?;
+    let negative = ops::relational_const(&lms, ops::OperationRelational::Less, &mut [0.0])
+        .map_err(vips_error)?;
+    let negative_root = ops::linear(&lms_root, &mut [-1.0], &mut [0.0]).map_err(vips_error)?;
+    let signed_root = ops::ifthenelse(&negative, &negative_root, &lms_root).map_err(vips_error)?;
+
+    recombine_three_channels(&signed_root, LMS_ROOT_TO_OKLAB)
+}
+
+fn oklab_to_linear_rgb(oklab: &VipsImage) -> Result<VipsImage, RenderError> {
+    let lms_root = recombine_three_channels(oklab, OKLAB_TO_LMS_ROOT)?;
+    let squared = ops::multiply(&lms_root, &lms_root).map_err(vips_error)?;
+    let cubed = ops::multiply(&squared, &lms_root).map_err(vips_error)?;
+    recombine_three_channels(&cubed, LMS_TO_LINEAR_RGB)
+}
+
+fn recombine_three_channels(
+    image: &VipsImage,
+    coefficients: [[f32; 3]; 3],
+) -> Result<VipsImage, RenderError> {
+    let mut bytes = Vec::with_capacity(9 * size_of::<f32>());
+    for row in coefficients {
+        for coefficient in row {
+            bytes.extend_from_slice(&coefficient.to_ne_bytes());
+        }
+    }
+    let matrix = VipsImage::new_from_memory_copy(&bytes, 3, 3, 1, ops::BandFormat::Float)
+        .map_err(vips_error)?;
+    ops::recomb(image, &matrix).map_err(vips_error)
+}
+
+fn white_balance_rgb_matrix(adjustment: WhiteBalance) -> Result<[[f32; 3]; 3], RenderError> {
+    const D65_XY: (f64, f64) = (0.3127, 0.3290);
+    const D65_KELVIN: f64 = 6504.0;
+    const MIRED_RANGE: f64 = 120.0;
+    const TINT_DUV_RANGE: f64 = 0.02;
+    const CAT16: [[f64; 3]; 3] = [
+        [0.401_288, 0.650_173, -0.051_461],
+        [-0.250_268, 1.204_414, 0.045_854],
+        [-0.002_079, 0.048_952, 0.953_127],
+    ];
+    const RGB_TO_XYZ: [[f64; 3]; 3] = [
+        [0.412_456_4, 0.357_576_1, 0.180_437_5],
+        [0.212_672_9, 0.715_152_2, 0.072_175_0],
+        [0.019_333_9, 0.119_192_0, 0.950_304_1],
+    ];
+    const XYZ_TO_RGB: [[f64; 3]; 3] = [
+        [3.240_454_2, -1.537_138_5, -0.498_531_4],
+        [-0.969_266, 1.876_010_8, 0.041_556],
+        [0.055_643_4, -0.204_025_9, 1.057_225_2],
+    ];
+
+    let base_mired = 1_000_000.0 / D65_KELVIN;
+    let target_mired = base_mired + f64::from(adjustment.temperature) * MIRED_RANGE / 100.0;
+    let target_kelvin = 1_000_000.0 / target_mired;
+    let target_xy = temperature_tint_xy(
+        D65_XY,
+        D65_KELVIN,
+        target_kelvin,
+        -f64::from(adjustment.tint) * TINT_DUV_RANGE / 100.0,
+    );
+    let source_white = xy_to_xyz(D65_XY);
+    let target_white = xy_to_xyz(target_xy);
+    let source_cone = matrix_vector(CAT16, source_white);
+    let target_cone = matrix_vector(CAT16, target_white);
+    if source_cone
+        .into_iter()
+        .any(|value| value.abs() < f64::EPSILON)
+    {
+        return Err(RenderError::Engine(
+            "CAT16 source white produced a zero cone response".into(),
+        ));
+    }
+    let scale = [
+        [target_cone[0] / source_cone[0], 0.0, 0.0],
+        [0.0, target_cone[1] / source_cone[1], 0.0],
+        [0.0, 0.0, target_cone[2] / source_cone[2]],
+    ];
+    let cat_inverse = inverse_3x3(CAT16)
+        .ok_or_else(|| RenderError::Engine("CAT16 matrix could not be inverted".into()))?;
+    let adaptation = matrix_multiply(matrix_multiply(cat_inverse, scale), CAT16);
+    let rgb_matrix = matrix_multiply(matrix_multiply(XYZ_TO_RGB, adaptation), RGB_TO_XYZ);
+    Ok(rgb_matrix.map(|row| row.map(|value| value as f32)))
+}
+
+fn temperature_tint_xy(
+    base_white_xy: (f64, f64),
+    base_kelvin: f64,
+    kelvin: f64,
+    duv: f64,
+) -> (f64, f64) {
+    let kelvin = kelvin.clamp(1_667.0, 25_000.0);
+    let base_locus_uv = xy_to_uv(planckian_xy(base_kelvin));
+    let target_locus_uv = xy_to_uv(planckian_xy(kelvin));
+    let base_white_uv = xy_to_uv(base_white_xy);
+    let shifted_uv = (
+        base_white_uv.0 + target_locus_uv.0 - base_locus_uv.0,
+        base_white_uv.1 + target_locus_uv.1 - base_locus_uv.1,
+    );
+    if duv.abs() < f64::EPSILON {
+        return uv_to_xy(shifted_uv);
+    }
+    let mired = 1_000_000.0 / kelvin;
+    let delta = 0.1;
+    let before = planckian_xy(1_000_000.0 / (mired - delta));
+    let after = planckian_xy(1_000_000.0 / (mired + delta));
+    let before_uv = xy_to_uv(before);
+    let after_uv = xy_to_uv(after);
+    let tangent = (after_uv.0 - before_uv.0, after_uv.1 - before_uv.1);
+    let length = tangent.0.hypot(tangent.1);
+    let normal = (-tangent.1 / length, tangent.0 / length);
+    uv_to_xy((shifted_uv.0 + duv * normal.0, shifted_uv.1 + duv * normal.1))
+}
+
+fn planckian_xy(kelvin: f64) -> (f64, f64) {
+    let x = if kelvin <= 4_000.0 {
+        -0.266_123_9e9 / kelvin.powi(3) - 0.234_358e6 / kelvin.powi(2)
+            + 0.877_695_6e3 / kelvin
+            + 0.179_910
+    } else {
+        -3.025_846_9e9 / kelvin.powi(3)
+            + 2.107_037_9e6 / kelvin.powi(2)
+            + 0.222_634_7e3 / kelvin
+            + 0.240_390
+    };
+    let y = if kelvin <= 2_222.0 {
+        -1.106_381_4 * x.powi(3) - 1.348_110_2 * x.powi(2) + 2.185_558_32 * x - 0.202_196_83
+    } else if kelvin <= 4_000.0 {
+        -0.954_947_6 * x.powi(3) - 1.374_185_93 * x.powi(2) + 2.091_370_15 * x - 0.167_488_67
+    } else {
+        3.081_758 * x.powi(3) - 5.873_386_7 * x.powi(2) + 3.751_129_97 * x - 0.370_014_83
+    };
+    (x, y)
+}
+
+fn xy_to_uv((x, y): (f64, f64)) -> (f64, f64) {
+    let denominator = -2.0 * x + 12.0 * y + 3.0;
+    (4.0 * x / denominator, 9.0 * y / denominator)
+}
+
+fn uv_to_xy((u, v): (f64, f64)) -> (f64, f64) {
+    let denominator = 6.0 * u - 16.0 * v + 12.0;
+    (9.0 * u / denominator, 4.0 * v / denominator)
+}
+
+fn xy_to_xyz((x, y): (f64, f64)) -> [f64; 3] {
+    [x / y, 1.0, (1.0 - x - y) / y]
+}
+
+fn matrix_vector(matrix: [[f64; 3]; 3], vector: [f64; 3]) -> [f64; 3] {
+    matrix.map(|row| row[0] * vector[0] + row[1] * vector[1] + row[2] * vector[2])
+}
+
+fn matrix_multiply(left: [[f64; 3]; 3], right: [[f64; 3]; 3]) -> [[f64; 3]; 3] {
+    std::array::from_fn(|row| {
+        std::array::from_fn(|column| {
+            (0..3)
+                .map(|index| left[row][index] * right[index][column])
+                .sum()
+        })
+    })
+}
+
+fn inverse_3x3(matrix: [[f64; 3]; 3]) -> Option<[[f64; 3]; 3]> {
+    let determinant = matrix[0][0] * (matrix[1][1] * matrix[2][2] - matrix[1][2] * matrix[2][1])
+        - matrix[0][1] * (matrix[1][0] * matrix[2][2] - matrix[1][2] * matrix[2][0])
+        + matrix[0][2] * (matrix[1][0] * matrix[2][1] - matrix[1][1] * matrix[2][0]);
+    if determinant.abs() < f64::EPSILON {
+        return None;
+    }
+    let inverse_determinant = 1.0 / determinant;
+    Some([
+        [
+            (matrix[1][1] * matrix[2][2] - matrix[1][2] * matrix[2][1]) * inverse_determinant,
+            (matrix[0][2] * matrix[2][1] - matrix[0][1] * matrix[2][2]) * inverse_determinant,
+            (matrix[0][1] * matrix[1][2] - matrix[0][2] * matrix[1][1]) * inverse_determinant,
+        ],
+        [
+            (matrix[1][2] * matrix[2][0] - matrix[1][0] * matrix[2][2]) * inverse_determinant,
+            (matrix[0][0] * matrix[2][2] - matrix[0][2] * matrix[2][0]) * inverse_determinant,
+            (matrix[0][2] * matrix[1][0] - matrix[0][0] * matrix[1][2]) * inverse_determinant,
+        ],
+        [
+            (matrix[1][0] * matrix[2][1] - matrix[1][1] * matrix[2][0]) * inverse_determinant,
+            (matrix[0][1] * matrix[2][0] - matrix[0][0] * matrix[2][1]) * inverse_determinant,
+            (matrix[0][0] * matrix[1][1] - matrix[0][1] * matrix[1][0]) * inverse_determinant,
+        ],
+    ])
 }
 
 fn crop_image(image: &VipsImage, crop: CropRect) -> Result<VipsImage, RenderError> {
@@ -770,6 +1127,56 @@ mod tests {
         );
         assert_eq!(curved.rgba8[7], 128, "tone curve must preserve alpha");
 
+        let balanced = engine
+            .render_preview(&PreviewRequest {
+                generation: 10,
+                source_path: source_path.clone(),
+                operations: vec![Operation::WhiteBalance {
+                    adjustment: WhiteBalance {
+                        temperature: 65.0,
+                        tint: 0.0,
+                    },
+                }],
+                viewport: Viewport::fit(2, 2),
+            })
+            .unwrap();
+        assert_eq!(balanced.rgba8[7], 128, "white balance must preserve alpha");
+        assert!(
+            balanced.rgba8[0] > pixels[0],
+            "warming should raise the red component for this source pixel"
+        );
+        assert!(
+            balanced.rgba8[2] < pixels[2],
+            "warming should lower the blue component for this source pixel"
+        );
+
+        let desaturated = engine
+            .render_preview(&PreviewRequest {
+                generation: 11,
+                source_path: source_path.clone(),
+                operations: vec![Operation::Saturation { amount: -100.0 }],
+                viewport: Viewport::fit(2, 2),
+            })
+            .unwrap();
+        assert!(
+            channel_range(&desaturated.rgba8[0..3]) <= 1,
+            "-100 saturation must produce a neutral pixel"
+        );
+        assert_eq!(desaturated.rgba8[7], 128, "saturation must preserve alpha");
+
+        let saturated = engine
+            .render_preview(&PreviewRequest {
+                generation: 12,
+                source_path: source_path.clone(),
+                operations: vec![Operation::Saturation { amount: 100.0 }],
+                viewport: Viewport::fit(2, 2),
+            })
+            .unwrap();
+        assert!(
+            channel_range(&saturated.rgba8[0..3]) > channel_range(&pixels[0..3]),
+            "+100 saturation must increase chroma for a colored pixel"
+        );
+
         for (name, format) in [
             ("out.jpg", ExportFormat::Jpeg { quality: 92 }),
             ("out.png", ExportFormat::Png),
@@ -791,7 +1198,15 @@ mod tests {
                                     height: 1.0,
                                 },
                             },
+                            Operation::WhiteBalance {
+                                adjustment: WhiteBalance {
+                                    temperature: 18.0,
+                                    tint: -7.0,
+                                },
+                            },
                             Operation::Exposure { ev: 0.5 },
+                            Operation::Saturation { amount: 24.0 },
+                            Operation::Sharpness { amount: 145.0 },
                         ],
                         format,
                     },
@@ -839,6 +1254,116 @@ mod tests {
             .unwrap();
 
         assert_eq!((result.width, result.height), (1, 4));
+
+        let source_path = directory.path().join("sharpness.png");
+        let mut pixels = Vec::with_capacity(9 * 3 * 4);
+        for y in 0..3 {
+            for x in 0..9 {
+                let value = if x < 4 { 64 } else { 192 };
+                let alpha = if x == 4 && y == 1 { 128 } else { 255 };
+                pixels.extend_from_slice(&[value, value, value, alpha]);
+            }
+        }
+        let image =
+            VipsImage::new_from_memory_copy(&pixels, 9, 3, 4, ops::BandFormat::Uchar).unwrap();
+        ops::pngsave(&image, source_path.to_str().unwrap()).unwrap();
+
+        let baseline = engine
+            .render_preview(&PreviewRequest {
+                generation: 20,
+                source_path: source_path.clone(),
+                operations: vec![],
+                viewport: Viewport::fit(9, 3),
+            })
+            .unwrap();
+        let sharpened = engine
+            .render_preview(&PreviewRequest {
+                generation: 21,
+                source_path,
+                operations: vec![Operation::Sharpness { amount: 300.0 }],
+                viewport: Viewport::fit(9, 3),
+            })
+            .unwrap();
+
+        let dark_edge = (9 + 3) * 4;
+        let bright_edge = (9 + 4) * 4;
+        assert!(sharpened.rgba8[dark_edge] < baseline.rgba8[dark_edge]);
+        assert!(sharpened.rgba8[bright_edge] > baseline.rgba8[bright_edge]);
+        assert_eq!(
+            &sharpened.rgba8[dark_edge..dark_edge + 3],
+            &[
+                sharpened.rgba8[dark_edge],
+                sharpened.rgba8[dark_edge],
+                sharpened.rgba8[dark_edge],
+            ],
+            "luminance-only sharpening must not color a neutral edge"
+        );
+        assert_eq!(
+            sharpened.rgba8[bright_edge + 3],
+            128,
+            "sharpness must preserve alpha"
+        );
+    }
+
+    #[test]
+    fn cat16_white_balance_has_expected_neutral_axis_behavior() {
+        let identity = white_balance_rgb_matrix(WhiteBalance::IDENTITY).unwrap();
+        for (row, values) in identity.iter().enumerate() {
+            for (column, value) in values.iter().enumerate() {
+                let expected = if row == column { 1.0 } else { 0.0 };
+                assert!(
+                    (*value - expected).abs() < 2.0e-6,
+                    "identity coefficient ({row}, {column}) was {value}"
+                );
+            }
+        }
+
+        let neutral = [0.18_f32; 3];
+        let warm = apply_test_matrix(
+            white_balance_rgb_matrix(WhiteBalance {
+                temperature: 100.0,
+                tint: 0.0,
+            })
+            .unwrap(),
+            neutral,
+        );
+        let cool = apply_test_matrix(
+            white_balance_rgb_matrix(WhiteBalance {
+                temperature: -100.0,
+                tint: 0.0,
+            })
+            .unwrap(),
+            neutral,
+        );
+        assert!(warm[0] > warm[1] && warm[1] > warm[2], "{warm:?}");
+        assert!(cool[2] > cool[1] && cool[1] > cool[0], "{cool:?}");
+
+        let magenta = apply_test_matrix(
+            white_balance_rgb_matrix(WhiteBalance {
+                temperature: 0.0,
+                tint: 100.0,
+            })
+            .unwrap(),
+            neutral,
+        );
+        assert!(magenta[1] < (magenta[0] + magenta[2]) * 0.5, "{magenta:?}");
+
+        for adjusted in [warm, cool, magenta] {
+            let luminance =
+                0.212_672_9 * adjusted[0] + 0.715_152_2 * adjusted[1] + 0.072_175 * adjusted[2];
+            assert!(
+                (luminance - 0.18).abs() < 2.0e-5,
+                "CAT16 must preserve the reference-white luminance, got {luminance}"
+            );
+        }
+    }
+
+    fn apply_test_matrix(matrix: [[f32; 3]; 3], value: [f32; 3]) -> [f32; 3] {
+        matrix.map(|row| row[0] * value[0] + row[1] * value[1] + row[2] * value[2])
+    }
+
+    fn channel_range(channels: &[u8]) -> u8 {
+        channels.iter().max().unwrap() - channels.iter().min().unwrap()
     }
 
     fn expected_srgb_exposure(sample: u8, ev: f64) -> u8 {

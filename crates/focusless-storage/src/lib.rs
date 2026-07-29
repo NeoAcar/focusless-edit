@@ -249,10 +249,15 @@ mod tests {
                 Operation::Crop {
                     rect: focusless_core::CropRect::FULL,
                 },
+                Operation::WhiteBalance {
+                    adjustment: focusless_core::WhiteBalance::IDENTITY,
+                },
                 Operation::Exposure { ev: 0.0 },
                 Operation::ToneCurve {
                     curve: focusless_core::ToneCurve::IDENTITY,
                 },
+                Operation::Saturation { amount: 0.0 },
+                Operation::Sharpness { amount: 0.0 },
             ]
         );
         assert_eq!(restored.view, ViewState::default());
@@ -339,6 +344,93 @@ mod tests {
         let restored = load_project(&project_path).unwrap();
         assert_eq!(restored.schema_version, PROJECT_SCHEMA_VERSION);
         assert_eq!(restored.tone_curve(), focusless_core::ToneCurve::IDENTITY);
+    }
+
+    #[test]
+    fn version_five_project_gets_identity_white_balance_in_render_order() {
+        let directory = tempdir().unwrap();
+        let project_path = directory.path().join("version-five.focusless");
+        let image_path = directory.path().join("image.jpg");
+        let mut document = ProjectDocument::new(source(image_path));
+        document.schema_version = 5;
+        document
+            .operations
+            .retain(|operation| !matches!(operation, Operation::WhiteBalance { .. }));
+        fs::write(&project_path, serde_json::to_vec_pretty(&document).unwrap()).unwrap();
+
+        let restored = load_project(&project_path).unwrap();
+        assert_eq!(restored.schema_version, PROJECT_SCHEMA_VERSION);
+        assert_eq!(
+            restored.white_balance(),
+            focusless_core::WhiteBalance::IDENTITY
+        );
+        let white_balance_index = restored
+            .operations
+            .iter()
+            .position(|operation| matches!(operation, Operation::WhiteBalance { .. }))
+            .unwrap();
+        let exposure_index = restored
+            .operations
+            .iter()
+            .position(|operation| matches!(operation, Operation::Exposure { .. }))
+            .unwrap();
+        assert!(white_balance_index < exposure_index);
+    }
+
+    #[test]
+    fn version_six_project_gets_neutral_saturation_after_tone_curve() {
+        let directory = tempdir().unwrap();
+        let project_path = directory.path().join("version-six.focusless");
+        let image_path = directory.path().join("image.jpg");
+        let mut document = ProjectDocument::new(source(image_path));
+        document.schema_version = 6;
+        document
+            .operations
+            .retain(|operation| !matches!(operation, Operation::Saturation { .. }));
+        fs::write(&project_path, serde_json::to_vec_pretty(&document).unwrap()).unwrap();
+
+        let restored = load_project(&project_path).unwrap();
+        assert_eq!(restored.schema_version, PROJECT_SCHEMA_VERSION);
+        assert_eq!(restored.saturation(), 0.0);
+        let curve_index = restored
+            .operations
+            .iter()
+            .position(|operation| matches!(operation, Operation::ToneCurve { .. }))
+            .unwrap();
+        let saturation_index = restored
+            .operations
+            .iter()
+            .position(|operation| matches!(operation, Operation::Saturation { .. }))
+            .unwrap();
+        assert!(curve_index < saturation_index);
+    }
+
+    #[test]
+    fn version_seven_project_gets_disabled_sharpness_after_saturation() {
+        let directory = tempdir().unwrap();
+        let project_path = directory.path().join("version-seven.focusless");
+        let image_path = directory.path().join("image.jpg");
+        let mut document = ProjectDocument::new(source(image_path));
+        document.schema_version = 7;
+        document
+            .operations
+            .retain(|operation| !matches!(operation, Operation::Sharpness { .. }));
+        fs::write(&project_path, serde_json::to_vec_pretty(&document).unwrap()).unwrap();
+
+        let restored = load_project(&project_path).unwrap();
+        assert_eq!(restored.schema_version, PROJECT_SCHEMA_VERSION);
+        assert_eq!(restored.sharpness(), 0.0);
+        let saturation_index = restored
+            .operations
+            .iter()
+            .position(|operation| matches!(operation, Operation::Saturation { .. }))
+            .unwrap();
+        let sharpness_index = restored
+            .operations
+            .iter()
+            .position(|operation| matches!(operation, Operation::Sharpness { .. }))
+            .unwrap();
+        assert!(saturation_index < sharpness_index);
     }
 
     #[test]

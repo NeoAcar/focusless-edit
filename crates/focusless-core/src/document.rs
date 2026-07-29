@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub const PROJECT_SCHEMA_VERSION: u32 = 5;
+pub const PROJECT_SCHEMA_VERSION: u32 = 8;
 pub const MAX_HISTORY_LEN: usize = 200;
 const MIN_CROP_EXTENT: f32 = 0.01;
 
@@ -101,6 +101,30 @@ impl CropRect {
 impl Default for CropRect {
     fn default() -> Self {
         Self::FULL
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct WhiteBalance {
+    pub temperature: f32,
+    pub tint: f32,
+}
+
+impl WhiteBalance {
+    pub const IDENTITY: Self = Self {
+        temperature: 0.0,
+        tint: 0.0,
+    };
+
+    #[must_use]
+    pub fn is_identity(self) -> bool {
+        self.temperature.abs() < f32::EPSILON && self.tint.abs() < f32::EPSILON
+    }
+}
+
+impl Default for WhiteBalance {
+    fn default() -> Self {
+        Self::IDENTITY
     }
 }
 
@@ -242,14 +266,29 @@ fn shape_preserving_tangents(inputs: [f32; 5], values: [f32; 5]) -> [f32; 5] {
 pub enum Operation {
     Rotate { quarter_turns: u8 },
     Crop { rect: CropRect },
+    WhiteBalance { adjustment: WhiteBalance },
     Exposure { ev: f32 },
     ToneCurve { curve: ToneCurve },
+    Saturation { amount: f32 },
+    Sharpness { amount: f32 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Command {
     SetExposure {
+        before: f32,
+        after: f32,
+    },
+    SetWhiteBalance {
+        before: WhiteBalance,
+        after: WhiteBalance,
+    },
+    SetSaturation {
+        before: f32,
+        after: f32,
+    },
+    SetSharpness {
         before: f32,
         after: f32,
     },
@@ -326,10 +365,15 @@ fn default_operations() -> Vec<Operation> {
         Operation::Crop {
             rect: CropRect::FULL,
         },
+        Operation::WhiteBalance {
+            adjustment: WhiteBalance::IDENTITY,
+        },
         Operation::Exposure { ev: 0.0 },
         Operation::ToneCurve {
             curve: ToneCurve::IDENTITY,
         },
+        Operation::Saturation { amount: 0.0 },
+        Operation::Sharpness { amount: 0.0 },
     ]
 }
 
@@ -339,6 +383,12 @@ pub enum DocumentError {
     UnsupportedSchema { found: u32, supported: u32 },
     #[error("exposure must be finite and between -5 and +5 EV")]
     InvalidExposure,
+    #[error("temperature and tint must be finite and between -100 and +100")]
+    InvalidWhiteBalance,
+    #[error("saturation must be finite and between -100 and +100")]
+    InvalidSaturation,
+    #[error("sharpness must be finite and between 0 and 300")]
+    InvalidSharpness,
     #[error("rotation must be between 0 and 3 quarter turns")]
     InvalidRotation,
     #[error("crop rectangle must be finite, inside the image, and at least 1% wide and high")]
@@ -370,8 +420,11 @@ impl ProjectDocument {
             match *operation {
                 Operation::Rotate { quarter_turns } => validate_rotation(quarter_turns)?,
                 Operation::Crop { rect } => validate_crop(rect)?,
+                Operation::WhiteBalance { adjustment } => validate_white_balance(adjustment)?,
                 Operation::Exposure { ev } => validate_exposure(ev)?,
                 Operation::ToneCurve { curve } => validate_tone_curve(curve)?,
+                Operation::Saturation { amount } => validate_saturation(amount)?,
+                Operation::Sharpness { amount } => validate_sharpness(amount)?,
             }
         }
         Ok(())
@@ -379,6 +432,52 @@ impl ProjectDocument {
 
     pub fn upgrade_to_latest(&mut self) -> Result<(), DocumentError> {
         self.validate()?;
+        if self.schema_version < 6
+            && !self
+                .operations
+                .iter()
+                .any(|operation| matches!(operation, Operation::WhiteBalance { .. }))
+        {
+            let index = self
+                .operations
+                .iter()
+                .position(|operation| matches!(operation, Operation::Exposure { .. }))
+                .unwrap_or(self.operations.len());
+            self.operations.insert(
+                index,
+                Operation::WhiteBalance {
+                    adjustment: WhiteBalance::IDENTITY,
+                },
+            );
+        }
+        if self.schema_version < 7
+            && !self
+                .operations
+                .iter()
+                .any(|operation| matches!(operation, Operation::Saturation { .. }))
+        {
+            let index = self
+                .operations
+                .iter()
+                .rposition(|operation| matches!(operation, Operation::ToneCurve { .. }))
+                .map_or(self.operations.len(), |index| index + 1);
+            self.operations
+                .insert(index, Operation::Saturation { amount: 0.0 });
+        }
+        if self.schema_version < 8
+            && !self
+                .operations
+                .iter()
+                .any(|operation| matches!(operation, Operation::Sharpness { .. }))
+        {
+            let index = self
+                .operations
+                .iter()
+                .rposition(|operation| matches!(operation, Operation::Saturation { .. }))
+                .map_or(self.operations.len(), |index| index + 1);
+            self.operations
+                .insert(index, Operation::Sharpness { amount: 0.0 });
+        }
         self.schema_version = PROJECT_SCHEMA_VERSION;
         Ok(())
     }
@@ -393,6 +492,18 @@ impl ProjectDocument {
                 _ => None,
             })
             .unwrap_or(0.0)
+    }
+
+    #[must_use]
+    pub fn white_balance(&self) -> WhiteBalance {
+        self.operations
+            .iter()
+            .rev()
+            .find_map(|operation| match *operation {
+                Operation::WhiteBalance { adjustment } => Some(adjustment),
+                _ => None,
+            })
+            .unwrap_or_default()
     }
 
     #[must_use]
@@ -429,6 +540,30 @@ impl ProjectDocument {
                 _ => None,
             })
             .unwrap_or_default()
+    }
+
+    #[must_use]
+    pub fn saturation(&self) -> f32 {
+        self.operations
+            .iter()
+            .rev()
+            .find_map(|operation| match *operation {
+                Operation::Saturation { amount } => Some(amount),
+                _ => None,
+            })
+            .unwrap_or(0.0)
+    }
+
+    #[must_use]
+    pub fn sharpness(&self) -> f32 {
+        self.operations
+            .iter()
+            .rev()
+            .find_map(|operation| match *operation {
+                Operation::Sharpness { amount } => Some(amount),
+                _ => None,
+            })
+            .unwrap_or(0.0)
     }
 
     #[must_use]
@@ -469,6 +604,85 @@ impl ProjectDocument {
         self.preview_exposure(after)?;
         if (before - after).abs() > f32::EPSILON {
             self.history.push(Command::SetExposure { before, after });
+        }
+        Ok(())
+    }
+
+    pub fn preview_white_balance(&mut self, adjustment: WhiteBalance) -> Result<(), DocumentError> {
+        validate_white_balance(adjustment)?;
+        if let Some(Operation::WhiteBalance {
+            adjustment: current,
+        }) = self
+            .operations
+            .iter_mut()
+            .rev()
+            .find(|operation| matches!(operation, Operation::WhiteBalance { .. }))
+        {
+            *current = adjustment;
+        } else {
+            self.operations.push(Operation::WhiteBalance { adjustment });
+        }
+        Ok(())
+    }
+
+    pub fn commit_white_balance(
+        &mut self,
+        before: WhiteBalance,
+        after: WhiteBalance,
+    ) -> Result<(), DocumentError> {
+        validate_white_balance(before)?;
+        self.preview_white_balance(after)?;
+        if before != after {
+            self.history
+                .push(Command::SetWhiteBalance { before, after });
+        }
+        Ok(())
+    }
+
+    pub fn preview_saturation(&mut self, amount: f32) -> Result<(), DocumentError> {
+        validate_saturation(amount)?;
+        if let Some(Operation::Saturation { amount: current }) = self
+            .operations
+            .iter_mut()
+            .rev()
+            .find(|operation| matches!(operation, Operation::Saturation { .. }))
+        {
+            *current = amount;
+        } else {
+            self.operations.push(Operation::Saturation { amount });
+        }
+        Ok(())
+    }
+
+    pub fn commit_saturation(&mut self, before: f32, after: f32) -> Result<(), DocumentError> {
+        validate_saturation(before)?;
+        self.preview_saturation(after)?;
+        if (before - after).abs() > f32::EPSILON {
+            self.history.push(Command::SetSaturation { before, after });
+        }
+        Ok(())
+    }
+
+    pub fn preview_sharpness(&mut self, amount: f32) -> Result<(), DocumentError> {
+        validate_sharpness(amount)?;
+        if let Some(Operation::Sharpness { amount: current }) = self
+            .operations
+            .iter_mut()
+            .rev()
+            .find(|operation| matches!(operation, Operation::Sharpness { .. }))
+        {
+            *current = amount;
+        } else {
+            self.operations.push(Operation::Sharpness { amount });
+        }
+        Ok(())
+    }
+
+    pub fn commit_sharpness(&mut self, before: f32, after: f32) -> Result<(), DocumentError> {
+        validate_sharpness(before)?;
+        self.preview_sharpness(after)?;
+        if (before - after).abs() > f32::EPSILON {
+            self.history.push(Command::SetSharpness { before, after });
         }
         Ok(())
     }
@@ -572,6 +786,15 @@ impl ProjectDocument {
             Command::SetExposure { before, .. } => {
                 let _ = self.preview_exposure(before);
             }
+            Command::SetWhiteBalance { before, .. } => {
+                let _ = self.preview_white_balance(before);
+            }
+            Command::SetSaturation { before, .. } => {
+                let _ = self.preview_saturation(before);
+            }
+            Command::SetSharpness { before, .. } => {
+                let _ = self.preview_sharpness(before);
+            }
             Command::SetCrop { before, .. } => {
                 let _ = self.preview_crop(before);
             }
@@ -598,6 +821,15 @@ impl ProjectDocument {
         match command {
             Command::SetExposure { after, .. } => {
                 let _ = self.preview_exposure(after);
+            }
+            Command::SetWhiteBalance { after, .. } => {
+                let _ = self.preview_white_balance(after);
+            }
+            Command::SetSaturation { after, .. } => {
+                let _ = self.preview_saturation(after);
+            }
+            Command::SetSharpness { after, .. } => {
+                let _ = self.preview_sharpness(after);
             }
             Command::SetCrop { after, .. } => {
                 let _ = self.preview_crop(after);
@@ -664,6 +896,34 @@ fn validate_tone_curve(curve: ToneCurve) -> Result<(), DocumentError> {
     }
 }
 
+fn validate_white_balance(adjustment: WhiteBalance) -> Result<(), DocumentError> {
+    if adjustment.temperature.is_finite()
+        && adjustment.tint.is_finite()
+        && (-100.0..=100.0).contains(&adjustment.temperature)
+        && (-100.0..=100.0).contains(&adjustment.tint)
+    {
+        Ok(())
+    } else {
+        Err(DocumentError::InvalidWhiteBalance)
+    }
+}
+
+fn validate_saturation(amount: f32) -> Result<(), DocumentError> {
+    if amount.is_finite() && (-100.0..=100.0).contains(&amount) {
+        Ok(())
+    } else {
+        Err(DocumentError::InvalidSaturation)
+    }
+}
+
+fn validate_sharpness(amount: f32) -> Result<(), DocumentError> {
+    if amount.is_finite() && (0.0..=300.0).contains(&amount) {
+        Ok(())
+    } else {
+        Err(DocumentError::InvalidSharpness)
+    }
+}
+
 fn validate_exposure(ev: f32) -> Result<(), DocumentError> {
     if ev.is_finite() && (-5.0..=5.0).contains(&ev) {
         Ok(())
@@ -703,6 +963,51 @@ mod tests {
     }
 
     #[test]
+    fn white_balance_transaction_is_undoable_and_redoable() {
+        let mut document = document();
+        let adjusted = WhiteBalance {
+            temperature: 42.0,
+            tint: -17.0,
+        };
+        document.preview_white_balance(adjusted).unwrap();
+        document
+            .commit_white_balance(WhiteBalance::IDENTITY, adjusted)
+            .unwrap();
+
+        assert_eq!(document.white_balance(), adjusted);
+        assert!(document.undo());
+        assert_eq!(document.white_balance(), WhiteBalance::IDENTITY);
+        assert!(document.redo());
+        assert_eq!(document.white_balance(), adjusted);
+    }
+
+    #[test]
+    fn saturation_transaction_is_undoable_and_redoable() {
+        let mut document = document();
+        document.preview_saturation(35.0).unwrap();
+        document.commit_saturation(0.0, 35.0).unwrap();
+
+        assert_eq!(document.saturation(), 35.0);
+        assert!(document.undo());
+        assert_eq!(document.saturation(), 0.0);
+        assert!(document.redo());
+        assert_eq!(document.saturation(), 35.0);
+    }
+
+    #[test]
+    fn sharpness_transaction_is_undoable_and_redoable() {
+        let mut document = document();
+        document.preview_sharpness(240.0).unwrap();
+        document.commit_sharpness(0.0, 240.0).unwrap();
+
+        assert_eq!(document.sharpness(), 240.0);
+        assert!(document.undo());
+        assert_eq!(document.sharpness(), 0.0);
+        assert!(document.redo());
+        assert_eq!(document.sharpness(), 240.0);
+    }
+
+    #[test]
     fn new_edit_clears_redo_history() {
         let mut document = document();
         document.commit_exposure(0.0, 1.0).unwrap();
@@ -732,6 +1037,55 @@ mod tests {
         assert_eq!(
             document.preview_exposure(5.1),
             Err(DocumentError::InvalidExposure)
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_white_balance() {
+        let mut document = document();
+        assert_eq!(
+            document.preview_white_balance(WhiteBalance {
+                temperature: f32::NAN,
+                tint: 0.0,
+            }),
+            Err(DocumentError::InvalidWhiteBalance)
+        );
+        assert_eq!(
+            document.preview_white_balance(WhiteBalance {
+                temperature: 0.0,
+                tint: 100.1,
+            }),
+            Err(DocumentError::InvalidWhiteBalance)
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_saturation() {
+        let mut document = document();
+        assert_eq!(
+            document.preview_saturation(f32::NAN),
+            Err(DocumentError::InvalidSaturation)
+        );
+        assert_eq!(
+            document.preview_saturation(-100.1),
+            Err(DocumentError::InvalidSaturation)
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_sharpness() {
+        let mut document = document();
+        assert_eq!(
+            document.preview_sharpness(f32::NAN),
+            Err(DocumentError::InvalidSharpness)
+        );
+        assert_eq!(
+            document.preview_sharpness(-0.1),
+            Err(DocumentError::InvalidSharpness)
+        );
+        assert_eq!(
+            document.preview_sharpness(300.1),
+            Err(DocumentError::InvalidSharpness)
         );
     }
 

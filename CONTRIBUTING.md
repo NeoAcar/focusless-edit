@@ -3,8 +3,9 @@
 ## Getting started
 
 1. Install the Ubuntu dependencies listed in the README.
-2. Run `cargo test --workspace`.
-3. Make the change in a small, single-purpose branch.
+2. Read [the development setup guide](docs/development-setup.md).
+3. Run `cargo test --workspace --locked`.
+4. Make the change in a small, single-purpose branch.
 
 ## Architecture rules
 

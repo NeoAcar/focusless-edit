@@ -8,6 +8,9 @@ The project currently contains its first working vertical slice:
 
 - Import JPEG, PNG, and WebP images
 - Fit, 100% view, zoom, and pan
+- Live Temperature and Tint white-balance adjustment
+- Perceptual Saturation adjustment from `-100` to `+100`
+- Luminance-only Sharpness adjustment from `0` to `300`
 - Live exposure adjustment from `-5 EV` to `+5 EV`
 - Interactive five-point tone curve drawn directly over the photo
 - Non-destructive 90-degree rotation
@@ -33,6 +36,10 @@ The UI, document model, persistence, and image engine live in separate crates.
 See the [architecture document](docs/architecture.md) for details and the
 [performance notes](docs/performance.md) for the large-image baseline.
 
+New developers and AI collaborators should follow the complete
+[development setup and handoff guide](docs/development-setup.md). Repository
+rules for coding agents are in [AGENTS.md](AGENTS.md).
+
 ## Ubuntu 24.04 setup
 
 ```bash
@@ -40,7 +47,7 @@ sudo apt update
 sudo apt install -y \
   build-essential pkg-config libvips-dev icc-profiles-free \
   libfontconfig1-dev libxkbcommon-dev libxkbcommon-x11-dev \
-  libwayland-dev libgl1-mesa-dev
+  libwayland-dev libgl1-mesa-dev zenity
 ```
 
 If Rust is not installed:
@@ -52,10 +59,25 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 The repository's `rust-toolchain.toml` selects the required toolchain and
 components automatically.
 
+Clone, verify, and build:
+
+```bash
+git clone https://github.com/NeoAcar/focusless-edit.git
+cd focusless-edit
+cargo test --workspace --locked
+cargo build --workspace --release --locked
+```
+
 ## Run
 
 ```bash
 cargo run -p focusless-app
+```
+
+Run the optimized build:
+
+```bash
+./target/release/focusless-edit
 ```
 
 Import a photo or project directly:
@@ -87,13 +109,16 @@ directory. Unsaved work uses a recovery project below the XDG data directory.
 | Pan | Drag the photo |
 | Move crop | Drag inside the crop frame |
 | Resize crop | Drag a crop-frame edge or corner |
-| Shape tone curve | Drag any blue control point vertically |
+| Shape tone curve | Drag any white control point |
 
 The crop tool includes Free, 1:1, 4:3, and 16:9 modes plus a full-image reset.
 Crop and rotation are stored non-destructively in the project and applied to
-full-resolution exports. The tone curve works in linear RGB with fixed
-endpoints, three two-dimensional control points, shape-preserving
-interpolation, and a live full-image preview.
+full-resolution exports. Temperature and Tint use CAT16 chromatic adaptation
+in linear RGB and preserve alpha. Saturation scales OKLab chroma while
+preserving perceptual lightness and hue. Sharpness uses a thresholded unsharp
+mask on OKLab lightness to avoid color halos. The tone curve works in linear
+RGB with fixed endpoints, three two-dimensional control points,
+shape-preserving interpolation, and a live full-image preview.
 
 ## Quality checks
 

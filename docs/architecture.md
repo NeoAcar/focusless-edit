@@ -47,7 +47,7 @@ CPU pool for image computation.
 
 `ProjectDocument` persists:
 
-- Schema version (currently version 5; version 1–4 projects migrate on load)
+- Schema version (currently version 8; version 1–7 projects migrate on load)
 - Source photo path and sampled BLAKE3 fingerprint
 - Ordered non-destructive operation list
 - Zoom and normalized center coordinates
@@ -60,9 +60,11 @@ synchronization cannot block the UI.
 
 Geometry and tonal operations use a stable render order: EXIF orientation,
 ICC conversion to the working space, quarter-turn rotation, normalized crop,
-then exposure and the tone curve. A crop rectangle is stored as normalized coordinates so it
-remains independent of source resolution. Rotating an existing crop transforms
-the rectangle with the image and records both changes as one undoable command.
+white balance, exposure, the tone curve, then saturation. A crop rectangle is
+stored as normalized coordinates so it remains independent of source
+resolution. Sharpness runs last, before preview resizing or output conversion.
+Rotating an existing crop transforms the rectangle with the image and records
+both changes as one undoable command.
 
 The color pipeline converts an embedded source profile to sRGB with LittleCMS,
 using relative colorimetric intent and black-point compensation. An untagged
@@ -73,6 +75,13 @@ also occurs in this linear working space. Preview and export convert back to
 display-referred sRGB, and exported JPEG, PNG, and WebP files embed the sRGB ICC
 profile.
 
+Temperature is mapped symmetrically in reciprocal color temperature (mired)
+around D65, while Tint moves perpendicular to the Planckian locus in CIE 1960
+UCS. The target white is applied with full CAT16 chromatic adaptation through
+linear sRGB and XYZ matrices. The transform preserves the reference-white
+luminance, leaves alpha separate, and retains extended-range floating-point
+channel values until output conversion.
+
 The tone curve is a shape-preserving piecewise cubic Hermite spline over five
 points. Its endpoints stay at `(0, 0)` and `(1, 1)`; users may move the three
 interior points in both dimensions. Interior input positions remain ordered so
@@ -80,6 +89,18 @@ the result is a function, while output values may cross. Per-segment tangent
 limiting prevents interpolation overshoot. The renderer applies a 16-bit
 lookup table to the linear RGB channels, preserves alpha, and leaves
 extended-range values outside `0..1` unchanged.
+
+Saturation converts linear sRGB to OKLab, scales only the `a` and `b` chroma
+axes, then converts back to linear sRGB. The `-100..+100` control maps to a
+`0..2` chroma multiplier, so `-100` is neutral gray, `0` is identity, and
+`+100` doubles chroma. Lightness and hue remain unchanged in OKLab, alpha stays
+separate, and no intermediate gamut clipping is performed.
+
+Sharpness applies a full-resolution unsharp mask only to OKLab lightness:
+`L' = L + gain × (L - GaussianBlur(L, 1 px))`. The `0..300` control maps to a
+`0..3` gain. Detail below a fixed `0.003` OKLab-lightness threshold is left
+unchanged to avoid amplifying low-level noise. Chroma and alpha remain
+separate, which prevents colored sharpening halos.
 
 Crop editing temporarily renders the complete rotated photo and draws the
 interactive frame in Slint. Apply creates one history command; Cancel restores

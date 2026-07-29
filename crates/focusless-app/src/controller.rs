@@ -11,7 +11,7 @@ use anyhow::{Context, Result};
 use directories::ProjectDirs;
 use focusless_core::{
     CropRect, ExportFormat, ExportRequest, Operation, PreviewRequest, ProjectDocument,
-    SourceReference, ToneCurve, ViewState, Viewport,
+    SourceReference, ToneCurve, ViewState, Viewport, WhiteBalance,
 };
 use focusless_engine_vips::{EngineEvent, EngineWorker, ImageInfo};
 use focusless_storage::{SourceStatus, fingerprint_source, inspect_source, load_project};
@@ -51,6 +51,9 @@ pub struct Controller {
     newest_generation: u64,
     effective_zoom: f32,
     exposure_edit_start: Option<f32>,
+    white_balance_edit_start: Option<WhiteBalance>,
+    saturation_edit_start: Option<f32>,
+    sharpness_edit_start: Option<f32>,
     crop_edit_start: Option<CropRect>,
     crop_saved_view: Option<ViewState>,
     crop_aspect_ratio: Option<f32>,
@@ -83,6 +86,9 @@ impl Controller {
             newest_generation: 0,
             effective_zoom: 1.0,
             exposure_edit_start: None,
+            white_balance_edit_start: None,
+            saturation_edit_start: None,
+            sharpness_edit_start: None,
             crop_edit_start: None,
             crop_saved_view: None,
             crop_aspect_ratio: None,
@@ -124,6 +130,12 @@ impl Controller {
                     .pick_file();
                 if let Some(path) = file {
                     controller.borrow_mut().begin_open(&ui, path);
+                } else if !file_dialog_backend_available() {
+                    controller.borrow().show_error_text(
+                        &ui,
+                        "File dialog is unavailable",
+                        "Install Zenity with: sudo apt install -y zenity",
+                    );
                 }
             });
         }
@@ -169,6 +181,125 @@ impl Controller {
                 if let Some(ui) = weak_ui.upgrade() {
                     ui.set_status_text("Cancelling export…".into());
                 }
+            });
+        }
+
+        {
+            let controller = Rc::clone(controller);
+            let weak_ui = weak_ui.clone();
+            ui.on_white_balance_preview(move |temperature, tint| {
+                let Some(ui) = weak_ui.upgrade() else {
+                    return;
+                };
+                controller.borrow_mut().preview_white_balance(
+                    &ui,
+                    WhiteBalance {
+                        temperature: temperature.clamp(-100.0, 100.0),
+                        tint: tint.clamp(-100.0, 100.0),
+                    },
+                );
+            });
+        }
+
+        {
+            let controller = Rc::clone(controller);
+            let weak_ui = weak_ui.clone();
+            ui.on_white_balance_commit(move |temperature, tint| {
+                let Some(ui) = weak_ui.upgrade() else {
+                    return;
+                };
+                controller.borrow_mut().commit_white_balance(
+                    &ui,
+                    WhiteBalance {
+                        temperature: temperature.clamp(-100.0, 100.0),
+                        tint: tint.clamp(-100.0, 100.0),
+                    },
+                );
+            });
+        }
+
+        {
+            let controller = Rc::clone(controller);
+            let weak_ui = weak_ui.clone();
+            ui.on_reset_white_balance_requested(move || {
+                let Some(ui) = weak_ui.upgrade() else {
+                    return;
+                };
+                controller.borrow_mut().reset_white_balance(&ui);
+            });
+        }
+
+        {
+            let controller = Rc::clone(controller);
+            let weak_ui = weak_ui.clone();
+            ui.on_saturation_preview(move |amount| {
+                let Some(ui) = weak_ui.upgrade() else {
+                    return;
+                };
+                controller
+                    .borrow_mut()
+                    .preview_saturation(&ui, amount.clamp(-100.0, 100.0));
+            });
+        }
+
+        {
+            let controller = Rc::clone(controller);
+            let weak_ui = weak_ui.clone();
+            ui.on_saturation_commit(move |amount| {
+                let Some(ui) = weak_ui.upgrade() else {
+                    return;
+                };
+                controller
+                    .borrow_mut()
+                    .commit_saturation(&ui, amount.clamp(-100.0, 100.0));
+            });
+        }
+
+        {
+            let controller = Rc::clone(controller);
+            let weak_ui = weak_ui.clone();
+            ui.on_reset_saturation_requested(move || {
+                let Some(ui) = weak_ui.upgrade() else {
+                    return;
+                };
+                controller.borrow_mut().reset_saturation(&ui);
+            });
+        }
+
+        {
+            let controller = Rc::clone(controller);
+            let weak_ui = weak_ui.clone();
+            ui.on_sharpness_preview(move |amount| {
+                let Some(ui) = weak_ui.upgrade() else {
+                    return;
+                };
+                controller
+                    .borrow_mut()
+                    .preview_sharpness(&ui, amount.clamp(0.0, 300.0));
+            });
+        }
+
+        {
+            let controller = Rc::clone(controller);
+            let weak_ui = weak_ui.clone();
+            ui.on_sharpness_commit(move |amount| {
+                let Some(ui) = weak_ui.upgrade() else {
+                    return;
+                };
+                controller
+                    .borrow_mut()
+                    .commit_sharpness(&ui, amount.clamp(0.0, 300.0));
+            });
+        }
+
+        {
+            let controller = Rc::clone(controller);
+            let weak_ui = weak_ui.clone();
+            ui.on_reset_sharpness_requested(move || {
+                let Some(ui) = weak_ui.upgrade() else {
+                    return;
+                };
+                controller.borrow_mut().reset_sharpness(&ui);
             });
         }
 
@@ -639,6 +770,9 @@ impl Controller {
         self.project_path = project_path;
         self.image_info = Some(info);
         self.exposure_edit_start = None;
+        self.white_balance_edit_start = None;
+        self.saturation_edit_start = None;
+        self.sharpness_edit_start = None;
         self.crop_edit_start = None;
         self.crop_saved_view = None;
         self.crop_aspect_ratio = None;
@@ -660,6 +794,11 @@ impl Controller {
         );
         ui.set_exposure(document.exposure_ev());
         ui.set_exposure_text(format_exposure(document.exposure_ev()).into());
+        self.set_white_balance_ui(ui, document.white_balance());
+        ui.set_saturation(document.saturation());
+        ui.set_saturation_text(format_adjustment(document.saturation()).into());
+        ui.set_sharpness(document.sharpness());
+        ui.set_sharpness_text(format_nonnegative_adjustment(document.sharpness()).into());
         ui.set_crop_mode(false);
         ui.set_curve_mode(false);
         self.set_curve_ui(ui, document.tone_curve());
@@ -670,6 +809,179 @@ impl Controller {
         self.update_history_ui(ui);
         self.queue_preview(ui);
         info!(path = %opened_source.display(), "document opened");
+    }
+
+    fn preview_white_balance(&mut self, ui: &AppWindow, adjustment: WhiteBalance) {
+        if self.crop_edit_start.is_some() || self.curve_edit_start.is_some() {
+            return;
+        }
+        let Some(document) = self.document.as_mut() else {
+            return;
+        };
+        if self.white_balance_edit_start.is_none() {
+            self.white_balance_edit_start = Some(document.white_balance());
+        }
+        if let Err(error) = document.preview_white_balance(adjustment) {
+            self.show_error(ui, "Could not apply white balance", &error);
+            return;
+        }
+        self.set_white_balance_ui(ui, adjustment);
+        self.mark_changed();
+        self.queue_preview(ui);
+    }
+
+    fn commit_white_balance(&mut self, ui: &AppWindow, adjustment: WhiteBalance) {
+        if self.crop_edit_start.is_some() || self.curve_edit_start.is_some() {
+            return;
+        }
+        let Some(document) = self.document.as_mut() else {
+            return;
+        };
+        let before = self
+            .white_balance_edit_start
+            .take()
+            .unwrap_or_else(|| document.white_balance());
+        if let Err(error) = document.commit_white_balance(before, adjustment) {
+            self.show_error(ui, "Could not commit white balance", &error);
+            return;
+        }
+        self.set_white_balance_ui(ui, adjustment);
+        self.mark_changed();
+        self.update_history_ui(ui);
+    }
+
+    fn reset_white_balance(&mut self, ui: &AppWindow) {
+        if self.crop_edit_start.is_some() || self.curve_edit_start.is_some() {
+            return;
+        }
+        let Some(document) = self.document.as_mut() else {
+            return;
+        };
+        let before = document.white_balance();
+        if document
+            .commit_white_balance(before, WhiteBalance::IDENTITY)
+            .is_ok()
+        {
+            self.white_balance_edit_start = None;
+            self.set_white_balance_ui(ui, WhiteBalance::IDENTITY);
+            self.mark_changed();
+            self.update_history_ui(ui);
+            self.queue_preview(ui);
+        }
+    }
+
+    fn preview_saturation(&mut self, ui: &AppWindow, amount: f32) {
+        if self.crop_edit_start.is_some() || self.curve_edit_start.is_some() {
+            return;
+        }
+        let Some(document) = self.document.as_mut() else {
+            return;
+        };
+        if self.saturation_edit_start.is_none() {
+            self.saturation_edit_start = Some(document.saturation());
+        }
+        if let Err(error) = document.preview_saturation(amount) {
+            self.show_error(ui, "Could not apply saturation", &error);
+            return;
+        }
+        ui.set_saturation_text(format_adjustment(amount).into());
+        self.mark_changed();
+        self.queue_preview(ui);
+    }
+
+    fn commit_saturation(&mut self, ui: &AppWindow, amount: f32) {
+        if self.crop_edit_start.is_some() || self.curve_edit_start.is_some() {
+            return;
+        }
+        let Some(document) = self.document.as_mut() else {
+            return;
+        };
+        let before = self
+            .saturation_edit_start
+            .take()
+            .unwrap_or_else(|| document.saturation());
+        if let Err(error) = document.commit_saturation(before, amount) {
+            self.show_error(ui, "Could not commit saturation", &error);
+            return;
+        }
+        ui.set_saturation_text(format_adjustment(amount).into());
+        self.mark_changed();
+        self.update_history_ui(ui);
+    }
+
+    fn reset_saturation(&mut self, ui: &AppWindow) {
+        if self.crop_edit_start.is_some() || self.curve_edit_start.is_some() {
+            return;
+        }
+        let Some(document) = self.document.as_mut() else {
+            return;
+        };
+        let before = document.saturation();
+        if document.commit_saturation(before, 0.0).is_ok() {
+            self.saturation_edit_start = None;
+            ui.set_saturation(0.0);
+            ui.set_saturation_text(format_adjustment(0.0).into());
+            self.mark_changed();
+            self.update_history_ui(ui);
+            self.queue_preview(ui);
+        }
+    }
+
+    fn preview_sharpness(&mut self, ui: &AppWindow, amount: f32) {
+        if self.crop_edit_start.is_some() || self.curve_edit_start.is_some() {
+            return;
+        }
+        let Some(document) = self.document.as_mut() else {
+            return;
+        };
+        if self.sharpness_edit_start.is_none() {
+            self.sharpness_edit_start = Some(document.sharpness());
+        }
+        if let Err(error) = document.preview_sharpness(amount) {
+            self.show_error(ui, "Could not apply sharpness", &error);
+            return;
+        }
+        ui.set_sharpness_text(format_nonnegative_adjustment(amount).into());
+        self.mark_changed();
+        self.queue_preview(ui);
+    }
+
+    fn commit_sharpness(&mut self, ui: &AppWindow, amount: f32) {
+        if self.crop_edit_start.is_some() || self.curve_edit_start.is_some() {
+            return;
+        }
+        let Some(document) = self.document.as_mut() else {
+            return;
+        };
+        let before = self
+            .sharpness_edit_start
+            .take()
+            .unwrap_or_else(|| document.sharpness());
+        if let Err(error) = document.commit_sharpness(before, amount) {
+            self.show_error(ui, "Could not commit sharpness", &error);
+            return;
+        }
+        ui.set_sharpness_text(format_nonnegative_adjustment(amount).into());
+        self.mark_changed();
+        self.update_history_ui(ui);
+    }
+
+    fn reset_sharpness(&mut self, ui: &AppWindow) {
+        if self.crop_edit_start.is_some() || self.curve_edit_start.is_some() {
+            return;
+        }
+        let Some(document) = self.document.as_mut() else {
+            return;
+        };
+        let before = document.sharpness();
+        if document.commit_sharpness(before, 0.0).is_ok() {
+            self.sharpness_edit_start = None;
+            ui.set_sharpness(0.0);
+            ui.set_sharpness_text(format_nonnegative_adjustment(0.0).into());
+            self.mark_changed();
+            self.update_history_ui(ui);
+            self.queue_preview(ui);
+        }
     }
 
     fn preview_exposure(&mut self, ui: &AppWindow, value: f32) {
@@ -1009,11 +1321,22 @@ impl Controller {
             return;
         };
         self.exposure_edit_start = None;
+        self.white_balance_edit_start = None;
+        self.saturation_edit_start = None;
+        self.sharpness_edit_start = None;
         if document.undo() {
             let exposure = document.exposure_ev();
+            let white_balance = document.white_balance();
+            let saturation = document.saturation();
+            let sharpness = document.sharpness();
             let curve = document.tone_curve();
             ui.set_exposure(exposure);
             ui.set_exposure_text(format_exposure(exposure).into());
+            self.set_white_balance_ui(ui, white_balance);
+            ui.set_saturation(saturation);
+            ui.set_saturation_text(format_adjustment(saturation).into());
+            ui.set_sharpness(sharpness);
+            ui.set_sharpness_text(format_nonnegative_adjustment(sharpness).into());
             self.set_curve_ui(ui, curve);
             self.update_transform_ui(ui);
             self.update_image_info(ui);
@@ -1031,11 +1354,22 @@ impl Controller {
             return;
         };
         self.exposure_edit_start = None;
+        self.white_balance_edit_start = None;
+        self.saturation_edit_start = None;
+        self.sharpness_edit_start = None;
         if document.redo() {
             let exposure = document.exposure_ev();
+            let white_balance = document.white_balance();
+            let saturation = document.saturation();
+            let sharpness = document.sharpness();
             let curve = document.tone_curve();
             ui.set_exposure(exposure);
             ui.set_exposure_text(format_exposure(exposure).into());
+            self.set_white_balance_ui(ui, white_balance);
+            ui.set_saturation(saturation);
+            ui.set_saturation_text(format_adjustment(saturation).into());
+            ui.set_sharpness(sharpness);
+            ui.set_sharpness_text(format_nonnegative_adjustment(sharpness).into());
             self.set_curve_ui(ui, curve);
             self.update_transform_ui(ui);
             self.update_image_info(ui);
@@ -1127,6 +1461,13 @@ impl Controller {
             self.project_path.clone()
         };
         let Some(path) = path else {
+            if !file_dialog_backend_available() {
+                self.show_error_text(
+                    ui,
+                    "File dialog is unavailable",
+                    "Install Zenity with: sudo apt install -y zenity",
+                );
+            }
             return;
         };
 
@@ -1165,6 +1506,13 @@ impl Controller {
             .set_file_name(format!("{default_stem}-edited.jpg"))
             .save_file();
         let Some(mut destination) = destination else {
+            if !file_dialog_backend_available() {
+                self.show_error_text(
+                    ui,
+                    "File dialog is unavailable",
+                    "Install Zenity with: sudo apt install -y zenity",
+                );
+            }
             return;
         };
         if destination.extension().is_none() {
@@ -1289,6 +1637,13 @@ impl Controller {
         ui.set_curve_text(format_curve(curve).into());
     }
 
+    fn set_white_balance_ui(&self, ui: &AppWindow, adjustment: WhiteBalance) {
+        ui.set_temperature(adjustment.temperature);
+        ui.set_tint(adjustment.tint);
+        ui.set_temperature_text(format_adjustment(adjustment.temperature).into());
+        ui.set_tint_text(format_adjustment(adjustment.tint).into());
+    }
+
     fn update_transform_ui(&self, ui: &AppWindow) {
         let Some(document) = self.document.as_ref() else {
             return;
@@ -1370,6 +1725,23 @@ fn has_extension(path: &Path, expected: &str) -> bool {
         .is_some_and(|extension| extension.eq_ignore_ascii_case(expected))
 }
 
+fn file_dialog_backend_available() -> bool {
+    if !cfg!(target_os = "linux") {
+        return true;
+    }
+    let zenity_available = std::env::var_os("PATH").is_some_and(|path| {
+        std::env::split_paths(&path).any(|directory| directory.join("zenity").is_file())
+    });
+    let data_directories =
+        std::env::var_os("XDG_DATA_DIRS").unwrap_or_else(|| "/usr/local/share:/usr/share".into());
+    let portal_available = std::env::split_paths(&data_directories).any(|directory| {
+        directory
+            .join("dbus-1/services/org.freedesktop.portal.Desktop.service")
+            .is_file()
+    });
+    zenity_available || portal_available
+}
+
 fn ensure_project_extension(mut path: PathBuf) -> PathBuf {
     if !has_extension(&path, "focusless") {
         path.set_extension("focusless");
@@ -1393,6 +1765,18 @@ fn format_exposure(value: f32) -> String {
     } else {
         format!("{value:.1} EV")
     }
+}
+
+fn format_adjustment(value: f32) -> String {
+    if value > 0.0 {
+        format!("+{value:.0}")
+    } else {
+        format!("{value:.0}")
+    }
+}
+
+fn format_nonnegative_adjustment(value: f32) -> String {
+    format!("{value:.0}")
 }
 
 fn format_crop(crop: CropRect) -> String {

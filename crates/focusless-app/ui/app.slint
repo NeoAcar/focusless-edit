@@ -1,4 +1,4 @@
-import { Palette, Slider } from "std-widgets.slint";
+import { Palette, ScrollView, Slider } from "std-widgets.slint";
 
 component ActionButton inherits Rectangle {
     in property <string> text;
@@ -51,6 +51,10 @@ export component AppWindow inherits Window {
     background: #17191d;
 
     in-out property <image> preview-image;
+    in-out property <float> temperature: 0;
+    in-out property <float> tint: 0;
+    in-out property <float> saturation: 0;
+    in-out property <float> sharpness: 0;
     in-out property <float> exposure: 0;
     in-out property <float> crop-x: 0;
     in-out property <float> crop-y: 0;
@@ -63,6 +67,10 @@ export component AppWindow inherits Window {
     in-out property <float> curve-highlight-input: 0.75;
     in-out property <float> curve-highlights: 0.75;
     in property <string> exposure-text: "0.0 EV";
+    in property <string> temperature-text: "0";
+    in property <string> tint-text: "0";
+    in property <string> saturation-text: "0";
+    in property <string> sharpness-text: "0";
     in property <string> curve-text: "Identity";
     in property <string> curve-path: "M 0 1 L 1 0";
     in property <string> rotation-text: "0°";
@@ -101,6 +109,15 @@ export component AppWindow inherits Window {
     callback exposure-preview(value: float);
     callback exposure-commit(value: float);
     callback reset-exposure-requested;
+    callback white-balance-preview(temperature: float, tint: float);
+    callback white-balance-commit(temperature: float, tint: float);
+    callback reset-white-balance-requested;
+    callback saturation-preview(amount: float);
+    callback saturation-commit(amount: float);
+    callback reset-saturation-requested;
+    callback sharpness-preview(amount: float);
+    callback sharpness-commit(amount: float);
+    callback reset-sharpness-requested;
     callback curve-requested;
     callback curve-preview(point: int, input: float, value: float);
     callback curve-commit-requested;
@@ -672,16 +689,126 @@ export component AppWindow inherits Window {
                 background: #1d2025;
                 border-width: 0px;
 
-                VerticalLayout {
-                    padding: 18px;
-                    spacing: 14px;
-                    alignment: start;
+                adjustments-scroll := ScrollView {
+                    width: parent.width;
+                    height: parent.height;
+                    viewport-width: self.visible-width;
+                    viewport-height: max(self.visible-height, adjustments-content.preferred-height);
+                    horizontal-scrollbar-policy: ScrollBarPolicy.always-off;
+
+                    adjustments-content := VerticalLayout {
+                        width: adjustments-scroll.visible-width;
+                        height: self.preferred-height;
+                        padding: 18px;
+                        spacing: 14px;
+                        alignment: start;
 
                     Text {
                         text: "ADJUSTMENTS";
                         color: #828a97;
                         font-size: 11px;
                         font-weight: 700;
+                    }
+
+                    Rectangle {
+                        height: 1px;
+                        background: #343840;
+                    }
+
+                    Text {
+                        text: "WHITE BALANCE";
+                        color: #828a97;
+                        font-size: 11px;
+                        font-weight: 700;
+                    }
+
+                    HorizontalLayout {
+                        spacing: 8px;
+                        Text {
+                            text: "Temperature";
+                            color: root.document-loaded ? #eef1f6 : #777d87;
+                            font-size: 14px;
+                            font-weight: 600;
+                        }
+                        Rectangle { horizontal-stretch: 1; background: transparent; }
+                        Text {
+                            text: root.temperature-text;
+                            color: #9fa7b4;
+                            font-size: 13px;
+                            horizontal-alignment: right;
+                        }
+                    }
+
+                    Slider {
+                        minimum: -100;
+                        maximum: 100;
+                        step: 1;
+                        value <=> root.temperature;
+                        enabled: root.document-loaded && !root.crop-mode && !root.curve-mode;
+                        changed(value) => { root.white-balance-preview(value, root.tint); }
+                        released(value) => { root.white-balance-commit(value, root.tint); }
+                    }
+
+                    HorizontalLayout {
+                        Text {
+                            text: "Cooler";
+                            color: #6f7682;
+                            font-size: 11px;
+                        }
+                        Rectangle { horizontal-stretch: 1; background: transparent; }
+                        Text {
+                            text: "Warmer";
+                            color: #6f7682;
+                            font-size: 11px;
+                        }
+                    }
+
+                    HorizontalLayout {
+                        spacing: 8px;
+                        Text {
+                            text: "Tint";
+                            color: root.document-loaded ? #eef1f6 : #777d87;
+                            font-size: 14px;
+                            font-weight: 600;
+                        }
+                        Rectangle { horizontal-stretch: 1; background: transparent; }
+                        Text {
+                            text: root.tint-text;
+                            color: #9fa7b4;
+                            font-size: 13px;
+                            horizontal-alignment: right;
+                        }
+                    }
+
+                    Slider {
+                        minimum: -100;
+                        maximum: 100;
+                        step: 1;
+                        value <=> root.tint;
+                        enabled: root.document-loaded && !root.crop-mode && !root.curve-mode;
+                        changed(value) => { root.white-balance-preview(root.temperature, value); }
+                        released(value) => { root.white-balance-commit(root.temperature, value); }
+                    }
+
+                    HorizontalLayout {
+                        Text {
+                            text: "Green";
+                            color: #6f7682;
+                            font-size: 11px;
+                        }
+                        Rectangle { horizontal-stretch: 1; background: transparent; }
+                        Text {
+                            text: "Magenta";
+                            color: #6f7682;
+                            font-size: 11px;
+                        }
+                    }
+
+                    ActionButton {
+                        text: "Reset White Balance";
+                        enabled: root.document-loaded && !root.crop-mode && !root.curve-mode
+                            && (abs(root.temperature) > 0.001 || abs(root.tint) > 0.001);
+                        clicked => { root.reset-white-balance-requested(); }
                     }
 
                     Rectangle {
@@ -779,6 +906,102 @@ export component AppWindow inherits Window {
                             primary: true;
                             clicked => { root.curve-done-requested(); }
                         }
+                    }
+
+                    HorizontalLayout {
+                        spacing: 8px;
+                        Text {
+                            text: "Saturation";
+                            color: root.document-loaded ? #eef1f6 : #777d87;
+                            font-size: 14px;
+                            font-weight: 600;
+                        }
+                        Rectangle { horizontal-stretch: 1; background: transparent; }
+                        Text {
+                            text: root.saturation-text;
+                            color: #9fa7b4;
+                            font-size: 13px;
+                            horizontal-alignment: right;
+                        }
+                    }
+
+                    Slider {
+                        minimum: -100;
+                        maximum: 100;
+                        step: 1;
+                        value <=> root.saturation;
+                        enabled: root.document-loaded && !root.crop-mode && !root.curve-mode;
+                        changed(value) => { root.saturation-preview(value); }
+                        released(value) => { root.saturation-commit(value); }
+                    }
+
+                    HorizontalLayout {
+                        Text {
+                            text: "-100";
+                            color: #6f7682;
+                            font-size: 11px;
+                        }
+                        Rectangle { horizontal-stretch: 1; background: transparent; }
+                        Text {
+                            text: "+100";
+                            color: #6f7682;
+                            font-size: 11px;
+                        }
+                    }
+
+                    ActionButton {
+                        text: "Reset Saturation";
+                        enabled: root.document-loaded && !root.crop-mode
+                            && !root.curve-mode && abs(root.saturation) > 0.001;
+                        clicked => { root.reset-saturation-requested(); }
+                    }
+
+                    HorizontalLayout {
+                        spacing: 8px;
+                        Text {
+                            text: "Sharpness";
+                            color: root.document-loaded ? #eef1f6 : #777d87;
+                            font-size: 14px;
+                            font-weight: 600;
+                        }
+                        Rectangle { horizontal-stretch: 1; background: transparent; }
+                        Text {
+                            text: root.sharpness-text;
+                            color: #9fa7b4;
+                            font-size: 13px;
+                            horizontal-alignment: right;
+                        }
+                    }
+
+                    Slider {
+                        minimum: 0;
+                        maximum: 300;
+                        step: 1;
+                        value <=> root.sharpness;
+                        enabled: root.document-loaded && !root.crop-mode && !root.curve-mode;
+                        changed(value) => { root.sharpness-preview(value); }
+                        released(value) => { root.sharpness-commit(value); }
+                    }
+
+                    HorizontalLayout {
+                        Text {
+                            text: "0";
+                            color: #6f7682;
+                            font-size: 11px;
+                        }
+                        Rectangle { horizontal-stretch: 1; background: transparent; }
+                        Text {
+                            text: "300";
+                            color: #6f7682;
+                            font-size: 11px;
+                        }
+                    }
+
+                    ActionButton {
+                        text: "Reset Sharpness";
+                        enabled: root.document-loaded && !root.crop-mode
+                            && !root.curve-mode && root.sharpness > 0.001;
+                        clicked => { root.reset-sharpness-requested(); }
                     }
 
                     Rectangle {
@@ -927,8 +1150,7 @@ export component AppWindow inherits Window {
                         wrap: word-wrap;
                     }
 
-                    Rectangle { vertical-stretch: 1; background: transparent; }
-
+                    }
                 }
             }
         }
