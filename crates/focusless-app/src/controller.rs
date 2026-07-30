@@ -26,6 +26,7 @@ use crate::{
 
 const AUTOSAVE_DELAY: Duration = Duration::from_millis(500);
 const UI_TICK: Duration = Duration::from_millis(16);
+const PROCESSING_INDICATOR_DELAY: Duration = Duration::from_millis(180);
 const MIN_CANVAS_SIZE: u32 = 64;
 const MAX_CANVAS_SIZE: u32 = 4096;
 const MIN_CROP_EXTENT: f32 = 0.01;
@@ -55,6 +56,7 @@ pub struct Controller {
     white_balance_edit_start: Option<WhiteBalance>,
     saturation_edit_start: Option<f32>,
     sharpness_edit_start: Option<f32>,
+    rotation_edit_start: Option<f32>,
     crop_edit_start: Option<CropRect>,
     crop_saved_view: Option<ViewState>,
     crop_aspect_ratio: Option<f32>,
@@ -62,6 +64,7 @@ pub struct Controller {
     frame_edit_start: Option<(f32, FrameColor)>,
     autosave_due: Option<Instant>,
     last_canvas_size: (u32, u32),
+    render_requested_at: Option<Instant>,
     exporting: bool,
     _timer: Option<Timer>,
 }
@@ -92,6 +95,7 @@ impl Controller {
             white_balance_edit_start: None,
             saturation_edit_start: None,
             sharpness_edit_start: None,
+            rotation_edit_start: None,
             crop_edit_start: None,
             crop_saved_view: None,
             crop_aspect_ratio: None,
@@ -99,6 +103,7 @@ impl Controller {
             frame_edit_start: None,
             autosave_due: None,
             last_canvas_size: (0, 0),
+            render_requested_at: None,
             exporting: false,
             _timer: None,
         }));
@@ -163,6 +168,17 @@ impl Controller {
                     return;
                 };
                 controller.borrow_mut().save(&ui, true);
+            });
+        }
+
+        {
+            let controller = Rc::clone(controller);
+            let weak_ui = weak_ui.clone();
+            ui.on_restore_original_requested(move || {
+                let Some(ui) = weak_ui.upgrade() else {
+                    return;
+                };
+                controller.borrow_mut().restore_original(&ui);
             });
         }
 
@@ -353,7 +369,7 @@ impl Controller {
                 };
                 controller
                     .borrow_mut()
-                    .preview_exposure(&ui, value.clamp(-5.0, 5.0));
+                    .preview_exposure(&ui, value.clamp(-3.0, 3.0));
             });
         }
 
@@ -366,7 +382,7 @@ impl Controller {
                 };
                 controller
                     .borrow_mut()
-                    .commit_exposure(&ui, value.clamp(-5.0, 5.0));
+                    .commit_exposure(&ui, value.clamp(-3.0, 3.0));
             });
         }
 
@@ -444,22 +460,37 @@ impl Controller {
         {
             let controller = Rc::clone(controller);
             let weak_ui = weak_ui.clone();
-            ui.on_rotate_left_requested(move || {
+            ui.on_rotation_preview(move |degrees| {
                 let Some(ui) = weak_ui.upgrade() else {
                     return;
                 };
-                controller.borrow_mut().rotate(&ui, -1);
+                controller
+                    .borrow_mut()
+                    .preview_rotation(&ui, degrees.clamp(-45.0, 45.0));
             });
         }
 
         {
             let controller = Rc::clone(controller);
             let weak_ui = weak_ui.clone();
-            ui.on_rotate_right_requested(move || {
+            ui.on_rotation_commit(move |degrees| {
                 let Some(ui) = weak_ui.upgrade() else {
                     return;
                 };
-                controller.borrow_mut().rotate(&ui, 1);
+                controller
+                    .borrow_mut()
+                    .commit_rotation(&ui, degrees.clamp(-45.0, 45.0));
+            });
+        }
+
+        {
+            let controller = Rc::clone(controller);
+            let weak_ui = weak_ui.clone();
+            ui.on_reset_rotation_requested(move || {
+                let Some(ui) = weak_ui.upgrade() else {
+                    return;
+                };
+                controller.borrow_mut().reset_rotation(&ui);
             });
         }
 
@@ -721,6 +752,13 @@ impl Controller {
             self.handle_save_event(ui, event);
         }
 
+        if self
+            .render_requested_at
+            .is_some_and(|started| started.elapsed() >= PROCESSING_INDICATOR_DELAY)
+        {
+            ui.set_rendering(true);
+        }
+
         if self.document.is_some() {
             let canvas_size = self.canvas_size(ui);
             if canvas_size != self.last_canvas_size
@@ -756,6 +794,7 @@ impl Controller {
                     result.height,
                 );
                 ui.set_preview_image(Image::from_rgba8(buffer));
+                self.render_requested_at = None;
                 ui.set_rendering(false);
                 self.effective_zoom = result.effective_zoom;
                 self.update_zoom_text(ui);
@@ -765,6 +804,7 @@ impl Controller {
                 }
             }
             EngineEvent::PreviewReady(Err(error)) => {
+                self.render_requested_at = None;
                 ui.set_rendering(false);
                 self.show_error(ui, "Could not render preview", &error);
             }
@@ -870,6 +910,7 @@ impl Controller {
         self.white_balance_edit_start = None;
         self.saturation_edit_start = None;
         self.sharpness_edit_start = None;
+        self.rotation_edit_start = None;
         self.crop_edit_start = None;
         self.crop_saved_view = None;
         self.crop_aspect_ratio = None;
@@ -1289,6 +1330,50 @@ impl Controller {
         }
     }
 
+    fn restore_original(&mut self, ui: &AppWindow) {
+        if self.crop_edit_start.is_some() || self.curve_edit_start.is_some() {
+            return;
+        }
+        let Some(document) = self.document.as_mut() else {
+            return;
+        };
+        let history_len = document.history.undo_len();
+        document.restore_original();
+        if document.history.undo_len() == history_len {
+            return;
+        }
+        document.view = ViewState::default();
+        self.exposure_edit_start = None;
+        self.contrast_edit_start = None;
+        self.white_balance_edit_start = None;
+        self.saturation_edit_start = None;
+        self.sharpness_edit_start = None;
+        self.rotation_edit_start = None;
+        self.frame_edit_start = None;
+
+        ui.set_exposure(0.0);
+        ui.set_exposure_text(format_exposure(0.0).into());
+        ui.set_contrast(0.0);
+        ui.set_contrast_text(format_adjustment(0.0).into());
+        self.set_white_balance_ui(ui, WhiteBalance::IDENTITY);
+        ui.set_saturation(0.0);
+        ui.set_saturation_text(format_adjustment(0.0).into());
+        ui.set_sharpness(0.0);
+        ui.set_sharpness_text(format_nonnegative_adjustment(0.0).into());
+        self.set_curve_ui(ui, ToneCurve::IDENTITY);
+        ui.set_frame_width(0.0);
+        ui.set_frame_width_text("0%".into());
+        ui.set_frame_color_r(255);
+        ui.set_frame_color_g(255);
+        ui.set_frame_color_b(255);
+        self.update_transform_ui(ui);
+        self.update_image_info(ui);
+        self.mark_changed();
+        self.update_history_ui(ui);
+        self.queue_preview(ui);
+        ui.set_status_text("Restored original photo".into());
+    }
+
     fn start_curve(&mut self, ui: &AppWindow) {
         if self.curve_edit_start.is_some() || self.crop_edit_start.is_some() {
             return;
@@ -1393,15 +1478,39 @@ impl Controller {
         self.update_history_ui(ui);
     }
 
-    fn rotate(&mut self, ui: &AppWindow, quarter_turn_delta: i8) {
+    fn preview_rotation(&mut self, ui: &AppWindow, degrees: f32) {
         if self.crop_edit_start.is_some() || self.curve_edit_start.is_some() {
             return;
         }
         let Some(document) = self.document.as_mut() else {
             return;
         };
-        if let Err(error) = document.rotate_by(quarter_turn_delta) {
-            self.show_error(ui, "Could not rotate photo", &error);
+        if self.rotation_edit_start.is_none() {
+            self.rotation_edit_start = Some(document.straighten_degrees());
+        }
+        if let Err(error) = document.preview_straighten(degrees) {
+            self.show_error(ui, "Could not preview rotation", &error);
+            return;
+        }
+        document.view = ViewState::default();
+        self.update_transform_ui(ui);
+        self.update_image_info(ui);
+        self.queue_preview(ui);
+    }
+
+    fn commit_rotation(&mut self, ui: &AppWindow, degrees: f32) {
+        if self.crop_edit_start.is_some() || self.curve_edit_start.is_some() {
+            return;
+        }
+        let Some(document) = self.document.as_mut() else {
+            return;
+        };
+        let before = self
+            .rotation_edit_start
+            .take()
+            .unwrap_or_else(|| document.straighten_degrees());
+        if let Err(error) = document.commit_straighten(before, degrees) {
+            self.show_error(ui, "Could not commit rotation", &error);
             return;
         }
         document.view = ViewState::default();
@@ -1410,6 +1519,18 @@ impl Controller {
         self.mark_changed();
         self.update_history_ui(ui);
         self.queue_preview(ui);
+    }
+
+    fn reset_rotation(&mut self, ui: &AppWindow) {
+        let before = self
+            .document
+            .as_ref()
+            .map_or(0.0, ProjectDocument::straighten_degrees);
+        if before.abs() <= f32::EPSILON {
+            return;
+        }
+        self.rotation_edit_start = Some(before);
+        self.commit_rotation(ui, 0.0);
     }
 
     fn start_crop(&mut self, ui: &AppWindow) {
@@ -1495,11 +1616,8 @@ impl Controller {
         } else {
             self.crop_aspect_ratio = Some(target_aspect);
             ui.set_crop_aspect_mode(aspect_mode(target_aspect));
-            let (width, height) = if document.rotation_quarter_turns().is_multiple_of(2) {
-                (info.width as f32, info.height as f32)
-            } else {
-                (info.height as f32, info.width as f32)
-            };
+            let (width, height) = document.geometry_dimensions(info.width, info.height);
+            let (width, height) = (width as f32, height as f32);
             let image_aspect = width / height;
             let (crop_width, crop_height) = if target_aspect <= image_aspect {
                 (target_aspect / image_aspect, 1.0)
@@ -1574,6 +1692,7 @@ impl Controller {
         self.white_balance_edit_start = None;
         self.saturation_edit_start = None;
         self.sharpness_edit_start = None;
+        self.rotation_edit_start = None;
         self.frame_edit_start = None;
         if document.undo() {
             let exposure = document.exposure_ev();
@@ -1618,6 +1737,7 @@ impl Controller {
         self.white_balance_edit_start = None;
         self.saturation_edit_start = None;
         self.sharpness_edit_start = None;
+        self.rotation_edit_start = None;
         self.frame_edit_start = None;
         if document.redo() {
             let exposure = document.exposure_ev();
@@ -1819,7 +1939,7 @@ impl Controller {
         self.last_canvas_size = (width, height);
         self.generation = self.generation.wrapping_add(1);
         self.newest_generation = self.generation;
-        ui.set_rendering(true);
+        self.render_requested_at = Some(Instant::now());
         let crop_mode = self.crop_edit_start.is_some();
         let operations = if crop_mode {
             document
@@ -1919,9 +2039,9 @@ impl Controller {
         let Some(document) = self.document.as_ref() else {
             return;
         };
-        ui.set_rotation_text(
-            format!("{}°", u16::from(document.rotation_quarter_turns()) * 90).into(),
-        );
+        let degrees = document.straighten_degrees();
+        ui.set_rotation_angle(degrees);
+        ui.set_rotation_text(format!("{degrees:+.1}°").into());
         self.set_crop_ui(ui, document.crop_rect());
     }
 
@@ -1940,11 +2060,8 @@ impl Controller {
         let (Some(document), Some(info)) = (self.document.as_ref(), self.image_info) else {
             return;
         };
-        let (width, height) = if document.rotation_quarter_turns().is_multiple_of(2) {
-            (info.width as f32, info.height as f32)
-        } else {
-            (info.height as f32, info.width as f32)
-        };
+        let (width, height) = document.geometry_dimensions(info.width, info.height);
+        let (width, height) = (width as f32, height as f32);
         let scale_factor = ui.window().scale_factor();
         let photo_width = width * self.effective_zoom / scale_factor;
         let photo_height = height * self.effective_zoom / scale_factor;
@@ -1960,11 +2077,8 @@ impl Controller {
         let target_aspect = self.crop_aspect_ratio?;
         let document = self.document.as_ref()?;
         let info = self.image_info?;
-        let (width, height) = if document.rotation_quarter_turns().is_multiple_of(2) {
-            (info.width as f32, info.height as f32)
-        } else {
-            (info.height as f32, info.width as f32)
-        };
+        let (width, height) = document.geometry_dimensions(info.width, info.height);
+        let (width, height) = (width as f32, height as f32);
         Some(target_aspect / (width / height))
     }
 

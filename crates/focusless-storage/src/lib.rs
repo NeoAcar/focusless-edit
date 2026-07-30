@@ -294,6 +294,7 @@ mod tests {
             restored.operations,
             vec![
                 Operation::Rotate { quarter_turns: 0 },
+                Operation::Straighten { degrees: 0.0 },
                 Operation::Crop {
                     rect: focusless_core::CropRect::FULL,
                 },
@@ -561,6 +562,35 @@ mod tests {
 
         assert_eq!(restored.schema_version, PROJECT_SCHEMA_VERSION);
         assert_eq!(restored.white_balance(), adjustment);
+    }
+
+    #[test]
+    fn version_eleven_project_gets_neutral_straighten_after_rotation() {
+        let directory = tempdir().unwrap();
+        let project_path = directory.path().join("version-eleven.focusless");
+        let image_path = directory.path().join("image.jpg");
+        let mut document = ProjectDocument::new(source(image_path));
+        document.schema_version = 11;
+        document
+            .operations
+            .retain(|operation| !matches!(operation, Operation::Straighten { .. }));
+        fs::write(&project_path, serde_json::to_vec_pretty(&document).unwrap()).unwrap();
+
+        let restored = load_project(&project_path).unwrap();
+
+        assert_eq!(restored.schema_version, PROJECT_SCHEMA_VERSION);
+        assert_eq!(restored.straighten_degrees(), 0.0);
+        let rotate_index = restored
+            .operations
+            .iter()
+            .position(|operation| matches!(operation, Operation::Rotate { .. }))
+            .unwrap();
+        let straighten_index = restored
+            .operations
+            .iter()
+            .position(|operation| matches!(operation, Operation::Straighten { .. }))
+            .unwrap();
+        assert_eq!(straighten_index, rotate_index + 1);
     }
 
     #[test]

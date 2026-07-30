@@ -3,10 +3,11 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub const PROJECT_SCHEMA_VERSION: u32 = 11;
+pub const PROJECT_SCHEMA_VERSION: u32 = 12;
 pub const MAX_HISTORY_LEN: usize = 200;
 const MIN_CROP_EXTENT: f32 = 0.01;
 const MAX_FRAME_WIDTH_PCT: f32 = 50.0;
+const MAX_STRAIGHTEN_DEGREES: f32 = 45.0;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SourceFingerprint {
@@ -288,6 +289,7 @@ fn shape_preserving_tangents(inputs: [f32; 5], values: [f32; 5]) -> [f32; 5] {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Operation {
     Rotate { quarter_turns: u8 },
+    Straighten { degrees: f32 },
     Crop { rect: CropRect },
     WhiteBalance { adjustment: WhiteBalance },
     Exposure { ev: f32 },
@@ -298,7 +300,7 @@ pub enum Operation {
     Frame { width_pct: f32, color: FrameColor },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Command {
     SetExposure {
@@ -331,6 +333,10 @@ pub enum Command {
         crop_before: CropRect,
         crop_after: CropRect,
     },
+    SetStraighten {
+        before: f32,
+        after: f32,
+    },
     SetToneCurve {
         before: ToneCurve,
         after: ToneCurve,
@@ -340,6 +346,10 @@ pub enum Command {
         before_color: FrameColor,
         after_width_pct: f32,
         after_color: FrameColor,
+    },
+    RestoreOriginal {
+        before: Vec<Operation>,
+        after: Vec<Operation>,
     },
 }
 
@@ -397,6 +407,7 @@ pub struct ProjectDocument {
 fn default_operations() -> Vec<Operation> {
     vec![
         Operation::Rotate { quarter_turns: 0 },
+        Operation::Straighten { degrees: 0.0 },
         Operation::Crop {
             rect: CropRect::FULL,
         },
@@ -433,6 +444,8 @@ pub enum DocumentError {
     InvalidSharpness,
     #[error("rotation must be between 0 and 3 quarter turns")]
     InvalidRotation,
+    #[error("straighten angle must be finite and between -45 and +45 degrees")]
+    InvalidStraighten,
     #[error("crop rectangle must be finite, inside the image, and at least 1% wide and high")]
     InvalidCrop,
     #[error("tone curve points must be finite, inside the 0 to 1 interval, and ordered by input")]
@@ -463,6 +476,7 @@ impl ProjectDocument {
         for operation in &self.operations {
             match *operation {
                 Operation::Rotate { quarter_turns } => validate_rotation(quarter_turns)?,
+                Operation::Straighten { degrees } => validate_straighten(degrees)?,
                 Operation::Crop { rect } => validate_crop(rect)?,
                 Operation::WhiteBalance { adjustment } => validate_white_balance(adjustment)?,
                 Operation::Exposure { ev } => validate_exposure(ev)?,
@@ -548,6 +562,20 @@ impl ProjectDocument {
                 width_pct: 0.0,
                 color: FrameColor::WHITE,
             });
+        }
+        if self.schema_version < 12
+            && !self
+                .operations
+                .iter()
+                .any(|operation| matches!(operation, Operation::Straighten { .. }))
+        {
+            let index = self
+                .operations
+                .iter()
+                .position(|operation| matches!(operation, Operation::Rotate { .. }))
+                .map_or(0, |index| index + 1);
+            self.operations
+                .insert(index, Operation::Straighten { degrees: 0.0 });
         }
         self.schema_version = PROJECT_SCHEMA_VERSION;
         Ok(())
@@ -662,12 +690,30 @@ impl ProjectDocument {
     }
 
     #[must_use]
-    pub fn output_dimensions(&self, source_width: u32, source_height: u32) -> (u32, u32) {
+    pub fn straighten_degrees(&self) -> f32 {
+        self.operations
+            .iter()
+            .rev()
+            .find_map(|operation| match *operation {
+                Operation::Straighten { degrees } => Some(degrees),
+                _ => None,
+            })
+            .unwrap_or(0.0)
+    }
+
+    #[must_use]
+    pub fn geometry_dimensions(&self, source_width: u32, source_height: u32) -> (u32, u32) {
         let (rotated_width, rotated_height) = if self.rotation_quarter_turns().is_multiple_of(2) {
             (source_width, source_height)
         } else {
             (source_height, source_width)
         };
+        straightened_dimensions(rotated_width, rotated_height, self.straighten_degrees())
+    }
+
+    #[must_use]
+    pub fn output_dimensions(&self, source_width: u32, source_height: u32) -> (u32, u32) {
+        let (rotated_width, rotated_height) = self.geometry_dimensions(source_width, source_height);
         let crop = self.crop_rect();
         let cropped_w = ((rotated_width as f32 * crop.width).round() as u32).max(1);
         let cropped_h = ((rotated_height as f32 * crop.height).round() as u32).max(1);
@@ -902,6 +948,45 @@ impl ProjectDocument {
         Ok(())
     }
 
+    pub fn preview_straighten(&mut self, degrees: f32) -> Result<(), DocumentError> {
+        validate_straighten(degrees)?;
+        if let Some(Operation::Straighten { degrees: current }) = self
+            .operations
+            .iter_mut()
+            .rev()
+            .find(|operation| matches!(operation, Operation::Straighten { .. }))
+        {
+            *current = degrees;
+        } else {
+            let index = self
+                .operations
+                .iter()
+                .position(|operation| matches!(operation, Operation::Rotate { .. }))
+                .map_or(0, |index| index + 1);
+            self.operations
+                .insert(index, Operation::Straighten { degrees });
+        }
+        Ok(())
+    }
+
+    pub fn commit_straighten(&mut self, before: f32, after: f32) -> Result<(), DocumentError> {
+        validate_straighten(before)?;
+        self.preview_straighten(after)?;
+        if (before - after).abs() > f32::EPSILON {
+            self.history.push(Command::SetStraighten { before, after });
+        }
+        Ok(())
+    }
+
+    pub fn restore_original(&mut self) {
+        let after = default_operations();
+        if self.operations != after {
+            let before = std::mem::replace(&mut self.operations, after.clone());
+            self.history
+                .push(Command::RestoreOriginal { before, after });
+        }
+    }
+
     pub fn preview_tone_curve(&mut self, curve: ToneCurve) -> Result<(), DocumentError> {
         validate_tone_curve(curve)?;
         if let Some(Operation::ToneCurve { curve: current }) = self
@@ -951,7 +1036,7 @@ impl ProjectDocument {
         let Some(command) = self.history.undo.pop() else {
             return false;
         };
-        match command {
+        match command.clone() {
             Command::SetExposure { before, .. } => {
                 let _ = self.preview_exposure(before);
             }
@@ -978,6 +1063,9 @@ impl ProjectDocument {
                 let _ = self.preview_rotation(before);
                 let _ = self.preview_crop(crop_before);
             }
+            Command::SetStraighten { before, .. } => {
+                let _ = self.preview_straighten(before);
+            }
             Command::SetToneCurve { before, .. } => {
                 let _ = self.preview_tone_curve(before);
             }
@@ -988,6 +1076,9 @@ impl ProjectDocument {
             } => {
                 let _ = self.preview_frame(before_width_pct, before_color);
             }
+            Command::RestoreOriginal { before, .. } => {
+                self.operations = before;
+            }
         }
         self.history.redo.push(command);
         true
@@ -997,7 +1088,7 @@ impl ProjectDocument {
         let Some(command) = self.history.redo.pop() else {
             return false;
         };
-        match command {
+        match command.clone() {
             Command::SetExposure { after, .. } => {
                 let _ = self.preview_exposure(after);
             }
@@ -1022,6 +1113,9 @@ impl ProjectDocument {
                 let _ = self.preview_rotation(after);
                 let _ = self.preview_crop(crop_after);
             }
+            Command::SetStraighten { after, .. } => {
+                let _ = self.preview_straighten(after);
+            }
             Command::SetToneCurve { after, .. } => {
                 let _ = self.preview_tone_curve(after);
             }
@@ -1031,6 +1125,9 @@ impl ProjectDocument {
                 ..
             } => {
                 let _ = self.preview_frame(after_width_pct, after_color);
+            }
+            Command::RestoreOriginal { after, .. } => {
+                self.operations = after;
             }
         }
         self.history.undo.push(command);
@@ -1043,6 +1140,60 @@ fn validate_rotation(quarter_turns: u8) -> Result<(), DocumentError> {
         Ok(())
     } else {
         Err(DocumentError::InvalidRotation)
+    }
+}
+
+fn validate_straighten(degrees: f32) -> Result<(), DocumentError> {
+    if degrees.is_finite() && (-MAX_STRAIGHTEN_DEGREES..=MAX_STRAIGHTEN_DEGREES).contains(&degrees)
+    {
+        Ok(())
+    } else {
+        Err(DocumentError::InvalidStraighten)
+    }
+}
+
+fn straightened_dimensions(width: u32, height: u32, degrees: f32) -> (u32, u32) {
+    if degrees.abs() <= f32::EPSILON {
+        return (width, height);
+    }
+    let radians = f64::from(degrees.abs()).to_radians();
+    let (cropped_width, cropped_height) = largest_rotated_rect(
+        f64::from(width),
+        f64::from(height),
+        radians.sin(),
+        radians.cos(),
+    );
+    (
+        cropped_width.round().max(1.0) as u32,
+        cropped_height.round().max(1.0) as u32,
+    )
+}
+
+fn largest_rotated_rect(width: f64, height: f64, sine: f64, cosine: f64) -> (f64, f64) {
+    let width_is_longer = width >= height;
+    let (long_side, short_side) = if width_is_longer {
+        (width, height)
+    } else {
+        (height, width)
+    };
+    let (cropped_long, cropped_short) =
+        if short_side <= 2.0 * sine * cosine * long_side || (sine - cosine).abs() < f64::EPSILON {
+            let half_short = 0.5 * short_side;
+            (
+                half_short / sine.max(f64::EPSILON),
+                half_short / cosine.max(f64::EPSILON),
+            )
+        } else {
+            let cosine_double = cosine * cosine - sine * sine;
+            (
+                (long_side * cosine - short_side * sine) / cosine_double,
+                (short_side * cosine - long_side * sine) / cosine_double,
+            )
+        };
+    if width_is_longer {
+        (cropped_long, cropped_short)
+    } else {
+        (cropped_short, cropped_long)
     }
 }
 
@@ -1501,5 +1652,73 @@ mod tests {
 
         assert_eq!(document.schema_version, PROJECT_SCHEMA_VERSION);
         assert_eq!(document.white_balance(), adjustment);
+    }
+
+    #[test]
+    fn schema_v11_migrates_with_neutral_straighten() {
+        let mut document = document();
+        document.schema_version = 11;
+        document
+            .operations
+            .retain(|operation| !matches!(operation, Operation::Straighten { .. }));
+
+        document.upgrade_to_latest().unwrap();
+
+        assert_eq!(document.schema_version, PROJECT_SCHEMA_VERSION);
+        assert_eq!(document.straighten_degrees(), 0.0);
+        let rotate_index = document
+            .operations
+            .iter()
+            .position(|operation| matches!(operation, Operation::Rotate { .. }))
+            .unwrap();
+        let straighten_index = document
+            .operations
+            .iter()
+            .position(|operation| matches!(operation, Operation::Straighten { .. }))
+            .unwrap();
+        let crop_index = document
+            .operations
+            .iter()
+            .position(|operation| matches!(operation, Operation::Crop { .. }))
+            .unwrap();
+        assert!(rotate_index < straighten_index && straighten_index < crop_index);
+    }
+
+    #[test]
+    fn straighten_and_restore_original_are_undoable() {
+        let mut document = document();
+        document.preview_exposure(1.0).unwrap();
+        document.commit_exposure(0.0, 1.0).unwrap();
+        document.preview_straighten(12.5).unwrap();
+        document.commit_straighten(0.0, 12.5).unwrap();
+        let straightened = document.output_dimensions(100, 50);
+        assert!(straightened.0 < 100 && straightened.1 < 50);
+
+        document.restore_original();
+        assert_eq!(document.exposure_ev(), 0.0);
+        assert_eq!(document.straighten_degrees(), 0.0);
+        assert!(document.undo());
+        assert_eq!(document.exposure_ev(), 1.0);
+        assert_eq!(document.straighten_degrees(), 12.5);
+        assert!(document.redo());
+        assert_eq!(document.exposure_ev(), 0.0);
+        assert_eq!(document.straighten_degrees(), 0.0);
+    }
+
+    #[test]
+    fn rejects_invalid_straighten() {
+        let mut document = document();
+        assert_eq!(
+            document.preview_straighten(f32::NAN),
+            Err(DocumentError::InvalidStraighten)
+        );
+        assert_eq!(
+            document.preview_straighten(45.1),
+            Err(DocumentError::InvalidStraighten)
+        );
+        assert_eq!(
+            document.preview_straighten(-45.1),
+            Err(DocumentError::InvalidStraighten)
+        );
     }
 }

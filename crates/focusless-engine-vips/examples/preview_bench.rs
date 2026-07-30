@@ -6,7 +6,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use focusless_core::{FrameColor, Operation, PreviewRequest, Viewport};
+use focusless_core::{
+    CropRect, FrameColor, Operation, PreviewRequest, ToneCurve, Viewport, WhiteBalance,
+};
 use focusless_engine_vips::{EngineEvent, EngineWorker};
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -14,10 +16,14 @@ fn main() -> Result<(), Box<dyn Error>> {
     let source = arguments
         .next()
         .map(PathBuf::from)
-        .ok_or("usage: preview_bench <image> [--frame-sequence]")?;
-    let frame_sequence = arguments
-        .next()
+        .ok_or("usage: preview_bench <image> [--frame-sequence|--adjustment-sequence]")?;
+    let mode = arguments.next();
+    let frame_sequence = mode
+        .as_deref()
         .is_some_and(|value| value == "--frame-sequence");
+    let adjustment_sequence = mode
+        .as_deref()
+        .is_some_and(|value| value == "--adjustment-sequence");
     let engine = EngineWorker::start();
     let started = Instant::now();
     engine.request_preview(PreviewRequest {
@@ -39,7 +45,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         let frame_started = Instant::now();
         engine.request_preview(PreviewRequest {
             generation: 2,
-            source_path: source,
+            source_path: source.clone(),
             operations: vec![
                 Operation::Exposure { ev: 0.75 },
                 Operation::Frame {
@@ -57,6 +63,70 @@ fn main() -> Result<(), Box<dyn Error>> {
             framed.rgba8.len(),
             frame_started.elapsed().as_millis()
         );
+    }
+    if adjustment_sequence {
+        let cases = [
+            (
+                "white_balance",
+                vec![Operation::WhiteBalance {
+                    adjustment: WhiteBalance {
+                        temperature: 35.0,
+                        tint: -12.0,
+                    },
+                }],
+            ),
+            ("exposure", vec![Operation::Exposure { ev: 1.25 }]),
+            ("contrast", vec![Operation::Contrast { amount: 40.0 }]),
+            (
+                "tone_curve",
+                vec![Operation::ToneCurve {
+                    curve: ToneCurve {
+                        shadows: 0.18,
+                        midtones: 0.56,
+                        highlights: 0.84,
+                        ..ToneCurve::IDENTITY
+                    },
+                }],
+            ),
+            ("saturation", vec![Operation::Saturation { amount: 45.0 }]),
+            ("sharpness", vec![Operation::Sharpness { amount: 120.0 }]),
+            (
+                "crop",
+                vec![Operation::Crop {
+                    rect: CropRect {
+                        x: 0.1,
+                        y: 0.1,
+                        width: 0.8,
+                        height: 0.8,
+                    },
+                }],
+            ),
+            ("rotation", vec![Operation::Straighten { degrees: 12.0 }]),
+            (
+                "frame",
+                vec![Operation::Frame {
+                    width_pct: 20.0,
+                    color: FrameColor::BLACK,
+                }],
+            ),
+        ];
+        for (index, (name, operations)) in cases.into_iter().enumerate() {
+            let feature_started = Instant::now();
+            engine.request_preview(PreviewRequest {
+                generation: index as u64 + 2,
+                source_path: source.clone(),
+                operations,
+                viewport: Viewport::fit(1920, 1080),
+            });
+            let result = wait_for_preview(&engine, feature_started)?;
+            println!(
+                "feature_preview={} size={}x{} elapsed_ms={}",
+                name,
+                result.width,
+                result.height,
+                feature_started.elapsed().as_millis()
+            );
+        }
     }
     Ok(())
 }

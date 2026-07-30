@@ -31,26 +31,32 @@ deliberate tradeoff for controlled RAM usage. Future measurements with real
 photos should track preview latency, disk writes, and close-zoom tile behavior
 together.
 
-## 100 MP frame interaction
+## 100 MP interactive adjustments
 
 Measured on July 31, 2026, on Windows 11 Pro with 31.2 GiB RAM, an AMD Ryzen 7
 6800H, and libvips 8.18.2. Values are medians from three release-mode runs:
 
 - Source: synthetic `10000 × 10000` JPEG, 100 MP
-- Base operation: `+0.75 EV`
 - Output viewport: `1920 × 1080` RGBA8
-- Initial preview render time: `942 ms`
-- Frame-only preview render time: `34 ms`
-- Whole two-preview process wall time: `1.136 s`
-- Peak resident memory: `502.7 MiB`
-- Previous frame-only path median: approximately `746 ms`
-- Frame-only latency reduction: approximately `95%` (`21.9×` faster)
+- Initial color-managed proxy preview: `1110 ms`
+- White balance: `56 ms`
+- Exposure: `50 ms`
+- Contrast: `197 ms`
+- Tone curve: `84 ms`
+- Saturation: `154 ms`
+- Sharpness: `181 ms`
+- Crop: `44 ms`
+- Straighten rotation: `125 ms`
+- Frame: `63 ms`
+- Whole ten-preview process wall time: `2.123 s`
+- Peak resident memory: `491.4 MiB`
 
-The optimized fit-preview path materializes the frame-independent, linear
-viewport image. Frame slider updates reuse those pixels, resize the photo to
-the exact framed fit geometry, and composite the frame in linear light.
-Full-resolution export continues to render the canonical pipeline from the
-source.
+The fit-preview path materializes one color-managed, 32-bit float linear proxy
+at 1.5 times the fitted display resolution. Every interactive operation reuses
+that source proxy. Sharpness radius scales with the proxy, while zoomed
+previews and full-resolution exports continue to evaluate the canonical
+pipeline from the source. The proxy changes latency only; exported pixels and
+embedded color profiles are unchanged.
 
 Reproduce the measurement in PowerShell:
 
@@ -59,5 +65,5 @@ Reproduce the measurement in PowerShell:
   .local\focusless-bench-100mp.jpg 10000 10000 --bands 3
 cargo build -p focusless-engine-vips --example preview_bench --release --locked
 .\target\release\examples\preview_bench.exe `
-  .local\focusless-bench-100mp.jpg --frame-sequence
+  .local\focusless-bench-100mp.jpg --adjustment-sequence
 ```

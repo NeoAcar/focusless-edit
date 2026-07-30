@@ -12,9 +12,9 @@ The project currently contains its first working vertical slice:
 - Perceptual Contrast adjustment from `-100` to `+100`
 - Perceptual Saturation adjustment from `-100` to `+100`
 - Luminance-only Sharpness adjustment from `0` to `300`
-- Live exposure adjustment from `-5 EV` to `+5 EV`
+- Live exposure adjustment from `-3 EV` to `+3 EV`
 - Interactive five-point tone curve drawn directly over the photo
-- Non-destructive 90-degree rotation
+- Non-destructive ±45-degree straighten dial
 - Interactive crop with move, edge/corner resize, Free mode, and aspect presets
 - Adjustable export frame with five neutral color presets
 - Persistent undo/redo history
@@ -135,10 +135,10 @@ directory. Unsaved work uses a recovery project below the XDG data directory.
 | Shape tone curve | Drag any white control point |
 
 The crop tool includes Free, 1:1, 4:3, and 16:9 modes plus a full-image reset.
-Crop and rotation are stored non-destructively in the project and applied to
-full-resolution exports. Temperature and Tint use CAT16 chromatic adaptation
-in linear RGB and preserve alpha. Contrast reshapes OKLab lightness while
-leaving chroma and extended-range values intact. Saturation scales OKLab
+Crop and straighten rotation are stored non-destructively in the project and
+applied to full-resolution exports. Temperature and Tint use CAT16 chromatic
+adaptation in linear RGB and preserve alpha. Contrast reshapes OKLab
+lightness while leaving chroma and extended-range values intact. Saturation scales OKLab
 chroma while preserving perceptual lightness and hue. Sharpness uses a
 thresholded unsharp mask on OKLab lightness to avoid color halos. The tone
 curve works in linear RGB with fixed endpoints, three two-dimensional control

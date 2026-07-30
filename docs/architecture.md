@@ -33,9 +33,9 @@ The workspace contains four production crates:
 1. The UI changes an adjustment or the viewport.
 2. The controller creates a `PreviewRequest` with an increasing `generation`.
 3. Only the newest request that has not started reaches the libvips worker.
-4. For fit previews, the worker materializes the frame-independent linear
-   viewport image. Frame-only changes reuse those pixels; other edits compute
-   the visible source region at the requested screen dimensions.
+4. For fit previews, the worker materializes one color-managed linear source
+   proxy and every interactive operation reuses it. Zoomed previews compute
+   the visible source region from the full-resolution pipeline.
 5. An RGBA8 pixel buffer returns to the UI thread.
 6. The controller displays the result only when its generation is still the
    newest.
@@ -48,7 +48,7 @@ CPU pool for image computation.
 
 `ProjectDocument` persists:
 
-- Schema version (currently version 11; version 1–10 projects migrate on load)
+- Schema version (currently version 12; version 1–11 projects migrate on load)
 - Source photo path and sampled BLAKE3 fingerprint
 - Ordered non-destructive operation list
 - Zoom and normalized center coordinates
@@ -60,8 +60,9 @@ renames it. Automatic and manual saves run on a storage worker so slow disk
 synchronization cannot block the UI.
 
 Geometry and tonal operations use a stable render order: EXIF orientation,
-ICC conversion to the working space, quarter-turn rotation, normalized crop,
-white balance, exposure, contrast, the tone curve, then saturation. A crop
+ICC conversion to the working space, quarter-turn rotation, auto-cropped
+straighten rotation, normalized crop, white balance, exposure, contrast, the
+tone curve, then saturation. A crop
 rectangle is stored as normalized coordinates so it remains independent of
 source resolution. Sharpness follows the tonal operations, and the frame is
 added last before preview resizing or output conversion. Rotating an existing
@@ -111,10 +112,14 @@ separate, which prevents colored sharpening halos.
 
 The frame width is a percentage of the shorter cropped image dimension. Its
 sRGB color preset is decoded to linear light before an opaque border is added
-after sharpening. Preview rendering caches the frame-independent libvips
-pipeline and materialized fit-preview pixels, so changing frame width or color
-does not repeat source decoding, ICC conversion, or the tonal operations.
+after sharpening. Preview rendering caches the color-managed linear source
+proxy, so frame changes do not repeat source decoding or ICC conversion.
 Export still evaluates the complete full-resolution pipeline.
+
+Straighten rotation is limited to `-45..+45` degrees. Resampling uses
+premultiplied alpha in linear light, then crops to the largest centered
+axis-aligned rectangle without empty corners. One drag gesture creates one
+undoable command.
 
 Crop editing temporarily renders the complete rotated photo and draws the
 interactive frame in Slint. Apply creates one history command; Cancel restores

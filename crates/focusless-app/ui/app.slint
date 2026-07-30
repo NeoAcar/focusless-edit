@@ -36,6 +36,36 @@ component ActionButton inherits Rectangle {
     }
 }
 
+component ResetButton inherits Rectangle {
+    in property <bool> enabled: true;
+    callback clicked;
+
+    width: 48px;
+    height: 24px;
+    border-radius: 12px;
+    border-width: 1px;
+    border-color: enabled ? #3b4049 : #30343b;
+    background: !enabled ? transparent
+        : touch.pressed ? #3a4049
+        : touch.has-hover ? #30353d
+        : transparent;
+    opacity: enabled ? 1 : 0.38;
+
+    Text {
+        text: "Reset";
+        color: #c9ced7;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+        font-size: 11px;
+    }
+
+    touch := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+}
+
 component Divider inherits Rectangle {
     width: 1px;
     height: 24px;
@@ -45,9 +75,9 @@ component Divider inherits Rectangle {
 export component AppWindow inherits Window {
     title: document-loaded ? file-name + " — Focusless Edit" : "Focusless Edit";
     preferred-width: 1180px;
-    preferred-height: 760px;
+    preferred-height: 640px;
     min-width: 900px;
-    min-height: 700px;
+    min-height: 560px;
     background: #17191d;
 
     in-out property <image> preview-image;
@@ -57,6 +87,7 @@ export component AppWindow inherits Window {
     in-out property <float> sharpness: 0;
     in-out property <float> exposure: 0;
     in-out property <float> contrast: 0;
+    in-out property <float> rotation-angle: 0;
     in-out property <float> crop-x: 0;
     in-out property <float> crop-y: 0;
     in-out property <float> crop-width: 1;
@@ -105,6 +136,7 @@ export component AppWindow inherits Window {
     callback open-requested;
     callback save-requested;
     callback save-as-requested;
+    callback restore-original-requested;
     callback export-requested;
     callback cancel-export-requested;
     callback undo-requested;
@@ -133,8 +165,9 @@ export component AppWindow inherits Window {
     callback curve-commit-requested;
     callback curve-reset-requested;
     callback curve-done-requested;
-    callback rotate-left-requested;
-    callback rotate-right-requested;
+    callback rotation-preview(degrees: float);
+    callback rotation-commit(degrees: float);
+    callback reset-rotation-requested;
     callback crop-requested;
     callback crop-gesture(
         kind: int,
@@ -189,6 +222,12 @@ export component AppWindow inherits Window {
                     enabled: root.document-loaded && !root.crop-mode;
                     clicked => { root.save-as-requested(); }
                 }
+                ActionButton {
+                    text: "Restore Original";
+                    min-width: 112px;
+                    enabled: root.document-loaded && !root.crop-mode && !root.curve-mode;
+                    clicked => { root.restore-original-requested(); }
+                }
                 Divider {}
                 ActionButton {
                     text: "Undo";
@@ -235,45 +274,52 @@ export component AppWindow inherits Window {
         HorizontalLayout {
             spacing: 0px;
 
-            canvas := Rectangle {
+            VerticalLayout {
                 horizontal-stretch: 1;
                 vertical-stretch: 1;
-                background: #101216;
-                clip: true;
+                spacing: 0px;
 
-                if root.document-loaded: Image {
-                    source: root.preview-image;
-                    image-fit: fill;
-                    width: parent.width;
-                    height: parent.height;
-                }
+                canvas := Rectangle {
+                    horizontal-stretch: 1;
+                    vertical-stretch: 1;
+                    min-width: 0px;
+                    min-height: 0px;
+                    background: #101216;
+                    clip: true;
 
-                if !root.document-loaded: VerticalLayout {
-                    alignment: center;
-                    spacing: 10px;
-                    Text {
-                        text: "FOCUSLESS EDIT";
-                        color: #e6e9ef;
-                        horizontal-alignment: center;
-                        font-size: 22px;
-                        font-weight: 700;
+                    if root.document-loaded: Image {
+                        source: root.preview-image;
+                        image-fit: fill;
+                        width: parent.width;
+                        height: parent.height;
                     }
-                    Text {
-                        text: "Open a JPEG, PNG, or WebP photo";
-                        color: #7f8795;
-                        horizontal-alignment: center;
-                        font-size: 14px;
+
+                    if !root.document-loaded: VerticalLayout {
+                        alignment: center;
+                        spacing: 10px;
+                        Text {
+                            text: "FOCUSLESS EDIT";
+                            color: #e6e9ef;
+                            horizontal-alignment: center;
+                            font-size: 22px;
+                            font-weight: 700;
+                        }
+                        Text {
+                            text: "Open a JPEG, PNG, or WebP photo";
+                            color: #7f8795;
+                            horizontal-alignment: center;
+                            font-size: 14px;
+                        }
+                        Rectangle {
+                            height: 8px;
+                            background: transparent;
+                        }
+                        ActionButton {
+                            text: "Import Photo";
+                            primary: true;
+                            clicked => { root.open-requested(); }
+                        }
                     }
-                    Rectangle {
-                        height: 8px;
-                        background: transparent;
-                    }
-                    ActionButton {
-                        text: "Import Photo";
-                        primary: true;
-                        clicked => { root.open-requested(); }
-                    }
-                }
 
                 if root.rendering && root.document-loaded: Rectangle {
                     x: parent.width - self.width - 16px;
@@ -698,6 +744,83 @@ export component AppWindow inherits Window {
                 }
             }
 
+                if root.document-loaded: Rectangle {
+                    height: 68px;
+                    background: #171a1f;
+                    border-width: 0px;
+                    clip: true;
+
+                    Text {
+                        y: 5px;
+                        width: parent.width;
+                        text: root.rotation-text;
+                        color: #d9dde5;
+                        horizontal-alignment: center;
+                        font-size: 12px;
+                        font-weight: 600;
+                    }
+
+                    ticks := Rectangle {
+                        y: 27px;
+                        width: parent.width;
+                        height: 35px;
+                        background: transparent;
+                        clip: true;
+
+                        for tick[index] in 91: Rectangle {
+                            x: parent.width / 2
+                                + (index - 45) * 7px
+                                - root.rotation-angle * 7px
+                                - self.width / 2;
+                            y: parent.height - self.height;
+                            width: Math.mod(index, 10) == 0 ? 2px : 1px;
+                            height: Math.mod(index, 10) == 0 ? 23px
+                                : Math.mod(index, 5) == 0 ? 17px
+                                : 10px;
+                            border-radius: 1px;
+                            background: Math.mod(index, 10) == 0 ? #ffffff : #b7bdc8;
+                            opacity: Math.mod(index, 10) == 0 ? 1 : 0.78;
+                        }
+                    }
+
+                    Rectangle {
+                        x: parent.width / 2 - 1px;
+                        y: 24px;
+                        width: 2px;
+                        height: 40px;
+                        border-radius: 1px;
+                        background: #ffffff;
+                    }
+
+                    rotation-touch := TouchArea {
+                        private property <length> drag-start-x;
+                        private property <float> drag-start-angle;
+                        enabled: root.document-loaded && !root.crop-mode && !root.curve-mode;
+                        mouse-cursor: ew-resize;
+                        pointer-event(event) => {
+                            if event.kind == PointerEventKind.down {
+                                self.drag-start-x = self.mouse-x;
+                                self.drag-start-angle = root.rotation-angle;
+                            } else if event.kind == PointerEventKind.up {
+                                root.rotation-commit(root.rotation-angle);
+                            }
+                        }
+                        moved => {
+                            if self.pressed {
+                                root.rotation-preview(max(
+                                    -45,
+                                    min(
+                                        45,
+                                        self.drag-start-angle
+                                            - (self.mouse-x - self.drag-start-x) / 7px,
+                                    ),
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+
             Rectangle {
                 width: 292px;
                 background: #1d2025;
@@ -729,11 +852,20 @@ export component AppWindow inherits Window {
                         background: #343840;
                     }
 
-                    Text {
-                        text: "WHITE BALANCE";
-                        color: #828a97;
-                        font-size: 11px;
-                        font-weight: 700;
+                    HorizontalLayout {
+                        Text {
+                            text: "WHITE BALANCE";
+                            color: #828a97;
+                            font-size: 11px;
+                            font-weight: 700;
+                            vertical-alignment: center;
+                        }
+                        Rectangle { horizontal-stretch: 1; background: transparent; }
+                        ResetButton {
+                            enabled: root.document-loaded && !root.crop-mode && !root.curve-mode
+                                && (abs(root.temperature) > 0.001 || abs(root.tint) > 0.001);
+                            clicked => { root.reset-white-balance-requested(); }
+                        }
                     }
 
                     HorizontalLayout {
@@ -818,13 +950,6 @@ export component AppWindow inherits Window {
                         }
                     }
 
-                    ActionButton {
-                        text: "Reset White Balance";
-                        enabled: root.document-loaded && !root.crop-mode && !root.curve-mode
-                            && (abs(root.temperature) > 0.001 || abs(root.tint) > 0.001);
-                        clicked => { root.reset-white-balance-requested(); }
-                    }
-
                     Rectangle {
                         height: 1px;
                         background: #343840;
@@ -845,11 +970,16 @@ export component AppWindow inherits Window {
                             font-size: 13px;
                             horizontal-alignment: right;
                         }
+                        ResetButton {
+                            enabled: root.document-loaded && !root.crop-mode
+                                && !root.curve-mode && abs(root.exposure) > 0.001;
+                            clicked => { root.reset-exposure-requested(); }
+                        }
                     }
 
                     exposure-slider := Slider {
-                        minimum: -5;
-                        maximum: 5;
+                        minimum: -3;
+                        maximum: 3;
                         step: 0.1;
                         value <=> root.exposure;
                         enabled: root.document-loaded && !root.crop-mode && !root.curve-mode;
@@ -859,23 +989,16 @@ export component AppWindow inherits Window {
 
                     HorizontalLayout {
                         Text {
-                            text: "-5";
+                            text: "-3";
                             color: #6f7682;
                             font-size: 11px;
                         }
                         Rectangle { horizontal-stretch: 1; background: transparent; }
                         Text {
-                            text: "+5";
+                            text: "+3";
                             color: #6f7682;
                             font-size: 11px;
                         }
-                    }
-
-                    ActionButton {
-                        text: "Reset Exposure";
-                        enabled: root.document-loaded && !root.crop-mode
-                            && !root.curve-mode && abs(root.exposure) > 0.001;
-                        clicked => { root.reset-exposure-requested(); }
                     }
 
                     Rectangle {
@@ -897,6 +1020,11 @@ export component AppWindow inherits Window {
                             color: #9fa7b4;
                             font-size: 13px;
                             horizontal-alignment: right;
+                        }
+                        ResetButton {
+                            enabled: root.document-loaded && !root.crop-mode
+                                && !root.curve-mode && abs(root.contrast) > 0.001;
+                            clicked => { root.reset-contrast-requested(); }
                         }
                     }
 
@@ -924,13 +1052,6 @@ export component AppWindow inherits Window {
                         }
                     }
 
-                    ActionButton {
-                        text: "Reset Contrast";
-                        enabled: root.document-loaded && !root.crop-mode
-                            && !root.curve-mode && abs(root.contrast) > 0.001;
-                        clicked => { root.reset-contrast-requested(); }
-                    }
-
                     Rectangle {
                         height: 1px;
                         background: #343840;
@@ -953,6 +1074,15 @@ export component AppWindow inherits Window {
                             overflow: elide;
                             max-width: 150px;
                         }
+                        if root.curve-mode: ResetButton {
+                            enabled: abs(root.curve-shadow-input - 0.25) > 0.001
+                                || abs(root.curve-shadows - 0.25) > 0.001
+                                || abs(root.curve-midtone-input - 0.5) > 0.001
+                                || abs(root.curve-midtones - 0.5) > 0.001
+                                || abs(root.curve-highlight-input - 0.75) > 0.001
+                                || abs(root.curve-highlights - 0.75) > 0.001;
+                            clicked => { root.curve-reset-requested(); }
+                        }
                     }
 
                     if !root.curve-mode: ActionButton {
@@ -963,16 +1093,6 @@ export component AppWindow inherits Window {
 
                     if root.curve-mode: HorizontalLayout {
                         spacing: 6px;
-                        ActionButton {
-                            text: "Reset";
-                            enabled: abs(root.curve-shadow-input - 0.25) > 0.001
-                                || abs(root.curve-shadows - 0.25) > 0.001
-                                || abs(root.curve-midtone-input - 0.5) > 0.001
-                                || abs(root.curve-midtones - 0.5) > 0.001
-                                || abs(root.curve-highlight-input - 0.75) > 0.001
-                                || abs(root.curve-highlights - 0.75) > 0.001;
-                            clicked => { root.curve-reset-requested(); }
-                        }
                         ActionButton {
                             text: "Done";
                             primary: true;
@@ -994,6 +1114,11 @@ export component AppWindow inherits Window {
                             color: #9fa7b4;
                             font-size: 13px;
                             horizontal-alignment: right;
+                        }
+                        ResetButton {
+                            enabled: root.document-loaded && !root.crop-mode
+                                && !root.curve-mode && abs(root.saturation) > 0.001;
+                            clicked => { root.reset-saturation-requested(); }
                         }
                     }
 
@@ -1021,13 +1146,6 @@ export component AppWindow inherits Window {
                         }
                     }
 
-                    ActionButton {
-                        text: "Reset Saturation";
-                        enabled: root.document-loaded && !root.crop-mode
-                            && !root.curve-mode && abs(root.saturation) > 0.001;
-                        clicked => { root.reset-saturation-requested(); }
-                    }
-
                     HorizontalLayout {
                         spacing: 8px;
                         Text {
@@ -1042,6 +1160,11 @@ export component AppWindow inherits Window {
                             color: #9fa7b4;
                             font-size: 13px;
                             horizontal-alignment: right;
+                        }
+                        ResetButton {
+                            enabled: root.document-loaded && !root.crop-mode
+                                && !root.curve-mode && root.sharpness > 0.001;
+                            clicked => { root.reset-sharpness-requested(); }
                         }
                     }
 
@@ -1067,13 +1190,6 @@ export component AppWindow inherits Window {
                             color: #6f7682;
                             font-size: 11px;
                         }
-                    }
-
-                    ActionButton {
-                        text: "Reset Sharpness";
-                        enabled: root.document-loaded && !root.crop-mode
-                            && !root.curve-mode && root.sharpness > 0.001;
-                        clicked => { root.reset-sharpness-requested(); }
                     }
 
                     Rectangle {
@@ -1102,19 +1218,10 @@ export component AppWindow inherits Window {
                             color: #9fa7b4;
                             font-size: 13px;
                         }
-                    }
-
-                    HorizontalLayout {
-                        spacing: 8px;
-                        ActionButton {
-                            text: "Rotate Left";
-                            enabled: root.document-loaded && !root.crop-mode && !root.curve-mode;
-                            clicked => { root.rotate-left-requested(); }
-                        }
-                        ActionButton {
-                            text: "Rotate Right";
-                            enabled: root.document-loaded && !root.crop-mode && !root.curve-mode;
-                            clicked => { root.rotate-right-requested(); }
+                        ResetButton {
+                            enabled: root.document-loaded && !root.crop-mode
+                                && !root.curve-mode && abs(root.rotation-angle) > 0.001;
+                            clicked => { root.reset-rotation-requested(); }
                         }
                     }
 
@@ -1147,8 +1254,7 @@ export component AppWindow inherits Window {
                             selected: root.crop-aspect-mode == 0;
                             clicked => { root.crop-aspect-requested(-1); }
                         }
-                        ActionButton {
-                            text: "Reset";
+                        ResetButton {
                             clicked => { root.crop-aspect-requested(0); }
                         }
                     }
@@ -1211,6 +1317,11 @@ export component AppWindow inherits Window {
                             color: #9fa7b4;
                             font-size: 13px;
                             horizontal-alignment: right;
+                        }
+                        ResetButton {
+                            enabled: root.document-loaded && !root.crop-mode && !root.curve-mode
+                                && root.frame-width > 0.001;
+                            clicked => { root.reset-frame-requested(); }
                         }
                     }
 
@@ -1329,22 +1440,7 @@ export component AppWindow inherits Window {
                             }
                         }
 
-                        // Current preview swatch
-                        Rectangle {
-                            horizontal-stretch: 1;
-                            height: 32px;
-                            border-radius: 6px;
-                            background: Colors.rgb(root.frame-color-r, root.frame-color-g, root.frame-color-b);
-                            border-width: 1px;
-                            border-color: #555b65;
-                        }
-                    }
-
-                    ActionButton {
-                        text: "Reset Frame";
-                        enabled: root.document-loaded && !root.crop-mode && !root.curve-mode
-                            && root.frame-width > 0.001;
-                        clicked => { root.reset-frame-requested(); }
+                        Rectangle { horizontal-stretch: 1; background: transparent; }
                     }
 
                     Rectangle {

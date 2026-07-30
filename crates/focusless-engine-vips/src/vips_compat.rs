@@ -131,6 +131,18 @@ pub mod ops {
         image.copy()
     }
 
+    pub fn premultiply(image: &VipsImage) -> Result<VipsImage> {
+        image.premultiply()
+    }
+
+    pub fn rotate(image: &VipsImage, angle: f64) -> Result<VipsImage> {
+        image.rotate(angle)
+    }
+
+    pub fn unpremultiply(image: &VipsImage) -> Result<VipsImage> {
+        image.unpremultiply()
+    }
+
     pub fn embed_with_opts(
         image: &VipsImage,
         x: i32,
