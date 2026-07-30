@@ -10,7 +10,7 @@ use std::{
 use anyhow::{Context, Result};
 use directories::ProjectDirs;
 use focusless_core::{
-    CropRect, ExportFormat, ExportRequest, Operation, PreviewRequest, ProjectDocument,
+    CropRect, ExportFormat, ExportRequest, FrameColor, Operation, PreviewRequest, ProjectDocument,
     SourceReference, ToneCurve, ViewState, Viewport, WhiteBalance,
 };
 use focusless_engine_vips::{EngineEvent, EngineWorker, ImageInfo};
@@ -51,6 +51,7 @@ pub struct Controller {
     newest_generation: u64,
     effective_zoom: f32,
     exposure_edit_start: Option<f32>,
+    contrast_edit_start: Option<f32>,
     white_balance_edit_start: Option<WhiteBalance>,
     saturation_edit_start: Option<f32>,
     sharpness_edit_start: Option<f32>,
@@ -58,6 +59,7 @@ pub struct Controller {
     crop_saved_view: Option<ViewState>,
     crop_aspect_ratio: Option<f32>,
     curve_edit_start: Option<ToneCurve>,
+    frame_edit_start: Option<(f32, FrameColor)>,
     autosave_due: Option<Instant>,
     last_canvas_size: (u32, u32),
     exporting: bool,
@@ -86,6 +88,7 @@ impl Controller {
             newest_generation: 0,
             effective_zoom: 1.0,
             exposure_edit_start: None,
+            contrast_edit_start: None,
             white_balance_edit_start: None,
             saturation_edit_start: None,
             sharpness_edit_start: None,
@@ -93,6 +96,7 @@ impl Controller {
             crop_saved_view: None,
             crop_aspect_ratio: None,
             curve_edit_start: None,
+            frame_edit_start: None,
             autosave_due: None,
             last_canvas_size: (0, 0),
             exporting: false,
@@ -300,6 +304,43 @@ impl Controller {
                     return;
                 };
                 controller.borrow_mut().reset_sharpness(&ui);
+            });
+        }
+
+        {
+            let controller = Rc::clone(controller);
+            let weak_ui = weak_ui.clone();
+            ui.on_contrast_preview(move |amount| {
+                let Some(ui) = weak_ui.upgrade() else {
+                    return;
+                };
+                controller
+                    .borrow_mut()
+                    .preview_contrast(&ui, amount.clamp(-100.0, 100.0));
+            });
+        }
+
+        {
+            let controller = Rc::clone(controller);
+            let weak_ui = weak_ui.clone();
+            ui.on_contrast_commit(move |amount| {
+                let Some(ui) = weak_ui.upgrade() else {
+                    return;
+                };
+                controller
+                    .borrow_mut()
+                    .commit_contrast(&ui, amount.clamp(-100.0, 100.0));
+            });
+        }
+
+        {
+            let controller = Rc::clone(controller);
+            let weak_ui = weak_ui.clone();
+            ui.on_reset_contrast_requested(move || {
+                let Some(ui) = weak_ui.upgrade() else {
+                    return;
+                };
+                controller.borrow_mut().reset_contrast(&ui);
             });
         }
 
@@ -544,6 +585,61 @@ impl Controller {
                 controller.borrow_mut().pan(&ui, delta_x, delta_y);
             });
         }
+
+        {
+            let controller = Rc::clone(controller);
+            let weak_ui = weak_ui.clone();
+            ui.on_frame_width_preview(move |width_pct| {
+                let Some(ui) = weak_ui.upgrade() else {
+                    return;
+                };
+                controller
+                    .borrow_mut()
+                    .preview_frame(&ui, width_pct.clamp(0.0, 50.0));
+            });
+        }
+
+        {
+            let controller = Rc::clone(controller);
+            let weak_ui = weak_ui.clone();
+            ui.on_frame_width_commit(move |width_pct| {
+                let Some(ui) = weak_ui.upgrade() else {
+                    return;
+                };
+                controller
+                    .borrow_mut()
+                    .commit_frame(&ui, width_pct.clamp(0.0, 50.0));
+            });
+        }
+
+        {
+            let controller = Rc::clone(controller);
+            let weak_ui = weak_ui.clone();
+            ui.on_frame_color_changed(move |r, g, b| {
+                let Some(ui) = weak_ui.upgrade() else {
+                    return;
+                };
+                controller.borrow_mut().change_frame_color(
+                    &ui,
+                    FrameColor {
+                        r: r.clamp(0, 255) as u8,
+                        g: g.clamp(0, 255) as u8,
+                        b: b.clamp(0, 255) as u8,
+                    },
+                );
+            });
+        }
+
+        {
+            let controller = Rc::clone(controller);
+            let weak_ui = weak_ui.clone();
+            ui.on_reset_frame_requested(move || {
+                let Some(ui) = weak_ui.upgrade() else {
+                    return;
+                };
+                controller.borrow_mut().reset_frame(&ui);
+            });
+        }
     }
 
     fn start_tick(controller: &Rc<RefCell<Self>>, ui: &AppWindow) {
@@ -770,6 +866,7 @@ impl Controller {
         self.project_path = project_path;
         self.image_info = Some(info);
         self.exposure_edit_start = None;
+        self.contrast_edit_start = None;
         self.white_balance_edit_start = None;
         self.saturation_edit_start = None;
         self.sharpness_edit_start = None;
@@ -777,6 +874,7 @@ impl Controller {
         self.crop_saved_view = None;
         self.crop_aspect_ratio = None;
         self.curve_edit_start = None;
+        self.frame_edit_start = None;
         self.last_canvas_size = (0, 0);
         self.autosave_due = None;
 
@@ -794,11 +892,19 @@ impl Controller {
         );
         ui.set_exposure(document.exposure_ev());
         ui.set_exposure_text(format_exposure(document.exposure_ev()).into());
+        ui.set_contrast(document.contrast());
+        ui.set_contrast_text(format_adjustment(document.contrast()).into());
         self.set_white_balance_ui(ui, document.white_balance());
         ui.set_saturation(document.saturation());
         ui.set_saturation_text(format_adjustment(document.saturation()).into());
         ui.set_sharpness(document.sharpness());
         ui.set_sharpness_text(format_nonnegative_adjustment(document.sharpness()).into());
+        let (frame_w, frame_c) = document.frame();
+        ui.set_frame_width(frame_w);
+        ui.set_frame_width_text(format!("{:.0}%", frame_w).into());
+        ui.set_frame_color_r(i32::from(frame_c.r));
+        ui.set_frame_color_g(i32::from(frame_c.g));
+        ui.set_frame_color_b(i32::from(frame_c.b));
         ui.set_crop_mode(false);
         ui.set_curve_mode(false);
         self.set_curve_ui(ui, document.tone_curve());
@@ -1034,6 +1140,149 @@ impl Controller {
             self.exposure_edit_start = None;
             ui.set_exposure(0.0);
             ui.set_exposure_text(format_exposure(0.0).into());
+            self.mark_changed();
+            self.update_history_ui(ui);
+            self.queue_preview(ui);
+        }
+    }
+
+    fn preview_contrast(&mut self, ui: &AppWindow, amount: f32) {
+        if self.curve_edit_start.is_some() || self.crop_edit_start.is_some() {
+            return;
+        }
+        let Some(document) = self.document.as_mut() else {
+            return;
+        };
+        if self.contrast_edit_start.is_none() {
+            self.contrast_edit_start = Some(document.contrast());
+        }
+        if let Err(error) = document.preview_contrast(amount) {
+            self.show_error(ui, "Could not apply contrast", &error);
+            return;
+        }
+        ui.set_contrast_text(format_adjustment(amount).into());
+        self.mark_changed();
+        self.queue_preview(ui);
+    }
+
+    fn commit_contrast(&mut self, ui: &AppWindow, amount: f32) {
+        if self.curve_edit_start.is_some() || self.crop_edit_start.is_some() {
+            return;
+        }
+        let Some(document) = self.document.as_mut() else {
+            return;
+        };
+        let before = self
+            .contrast_edit_start
+            .take()
+            .unwrap_or_else(|| document.contrast());
+        if let Err(error) = document.commit_contrast(before, amount) {
+            self.show_error(ui, "Could not commit contrast", &error);
+            return;
+        }
+        ui.set_contrast_text(format_adjustment(amount).into());
+        self.mark_changed();
+        self.update_history_ui(ui);
+    }
+
+    fn reset_contrast(&mut self, ui: &AppWindow) {
+        if self.curve_edit_start.is_some() || self.crop_edit_start.is_some() {
+            return;
+        }
+        let Some(document) = self.document.as_mut() else {
+            return;
+        };
+        let before = document.contrast();
+        if document.commit_contrast(before, 0.0).is_ok() {
+            self.contrast_edit_start = None;
+            ui.set_contrast(0.0);
+            ui.set_contrast_text(format_adjustment(0.0).into());
+            self.mark_changed();
+            self.update_history_ui(ui);
+            self.queue_preview(ui);
+        }
+    }
+
+    fn preview_frame(&mut self, ui: &AppWindow, width_pct: f32) {
+        if self.crop_edit_start.is_some() || self.curve_edit_start.is_some() {
+            return;
+        }
+        let Some(document) = self.document.as_mut() else {
+            return;
+        };
+        let (_, color) = document.frame();
+        if self.frame_edit_start.is_none() {
+            self.frame_edit_start = Some(document.frame());
+        }
+        if let Err(error) = document.preview_frame(width_pct, color) {
+            self.show_error(ui, "Could not apply frame", &error);
+            return;
+        }
+        ui.set_frame_width_text(format!("{:.0}%", width_pct).into());
+        self.mark_changed();
+        self.queue_preview(ui);
+    }
+
+    fn commit_frame(&mut self, ui: &AppWindow, width_pct: f32) {
+        if self.crop_edit_start.is_some() || self.curve_edit_start.is_some() {
+            return;
+        }
+        let Some(document) = self.document.as_mut() else {
+            return;
+        };
+        let (_, color) = document.frame();
+        let (before_width_pct, before_color) = self
+            .frame_edit_start
+            .take()
+            .unwrap_or_else(|| document.frame());
+        if let Err(error) = document.commit_frame(before_width_pct, before_color, width_pct, color)
+        {
+            self.show_error(ui, "Could not commit frame", &error);
+            return;
+        }
+        ui.set_frame_width_text(format!("{:.0}%", width_pct).into());
+        self.mark_changed();
+        self.update_history_ui(ui);
+    }
+
+    fn change_frame_color(&mut self, ui: &AppWindow, color: FrameColor) {
+        if self.crop_edit_start.is_some() || self.curve_edit_start.is_some() {
+            return;
+        }
+        let Some(document) = self.document.as_mut() else {
+            return;
+        };
+        let (width_pct, before_color) = document.frame();
+        if let Err(error) = document.commit_frame(width_pct, before_color, width_pct, color) {
+            self.show_error(ui, "Could not change frame color", &error);
+            return;
+        }
+        ui.set_frame_color_r(i32::from(color.r));
+        ui.set_frame_color_g(i32::from(color.g));
+        ui.set_frame_color_b(i32::from(color.b));
+        self.mark_changed();
+        self.update_history_ui(ui);
+        self.queue_preview(ui);
+    }
+
+    fn reset_frame(&mut self, ui: &AppWindow) {
+        if self.crop_edit_start.is_some() || self.curve_edit_start.is_some() {
+            return;
+        }
+        let Some(document) = self.document.as_mut() else {
+            return;
+        };
+        let (before_width_pct, before_color) = document.frame();
+        if document
+            .commit_frame(before_width_pct, before_color, 0.0, FrameColor::WHITE)
+            .is_ok()
+        {
+            self.frame_edit_start = None;
+            ui.set_frame_width(0.0);
+            ui.set_frame_width_text("0%".into());
+            ui.set_frame_color_r(255);
+            ui.set_frame_color_g(255);
+            ui.set_frame_color_b(255);
             self.mark_changed();
             self.update_history_ui(ui);
             self.queue_preview(ui);
@@ -1321,23 +1570,34 @@ impl Controller {
             return;
         };
         self.exposure_edit_start = None;
+        self.contrast_edit_start = None;
         self.white_balance_edit_start = None;
         self.saturation_edit_start = None;
         self.sharpness_edit_start = None;
+        self.frame_edit_start = None;
         if document.undo() {
             let exposure = document.exposure_ev();
+            let contrast = document.contrast();
             let white_balance = document.white_balance();
             let saturation = document.saturation();
             let sharpness = document.sharpness();
             let curve = document.tone_curve();
+            let (frame_w, frame_c) = document.frame();
             ui.set_exposure(exposure);
             ui.set_exposure_text(format_exposure(exposure).into());
+            ui.set_contrast(contrast);
+            ui.set_contrast_text(format_adjustment(contrast).into());
             self.set_white_balance_ui(ui, white_balance);
             ui.set_saturation(saturation);
             ui.set_saturation_text(format_adjustment(saturation).into());
             ui.set_sharpness(sharpness);
             ui.set_sharpness_text(format_nonnegative_adjustment(sharpness).into());
             self.set_curve_ui(ui, curve);
+            ui.set_frame_width(frame_w);
+            ui.set_frame_width_text(format!("{:.0}%", frame_w).into());
+            ui.set_frame_color_r(i32::from(frame_c.r));
+            ui.set_frame_color_g(i32::from(frame_c.g));
+            ui.set_frame_color_b(i32::from(frame_c.b));
             self.update_transform_ui(ui);
             self.update_image_info(ui);
             self.mark_changed();
@@ -1354,23 +1614,34 @@ impl Controller {
             return;
         };
         self.exposure_edit_start = None;
+        self.contrast_edit_start = None;
         self.white_balance_edit_start = None;
         self.saturation_edit_start = None;
         self.sharpness_edit_start = None;
+        self.frame_edit_start = None;
         if document.redo() {
             let exposure = document.exposure_ev();
+            let contrast = document.contrast();
             let white_balance = document.white_balance();
             let saturation = document.saturation();
             let sharpness = document.sharpness();
             let curve = document.tone_curve();
+            let (frame_w, frame_c) = document.frame();
             ui.set_exposure(exposure);
             ui.set_exposure_text(format_exposure(exposure).into());
+            ui.set_contrast(contrast);
+            ui.set_contrast_text(format_adjustment(contrast).into());
             self.set_white_balance_ui(ui, white_balance);
             ui.set_saturation(saturation);
             ui.set_saturation_text(format_adjustment(saturation).into());
             ui.set_sharpness(sharpness);
             ui.set_sharpness_text(format_nonnegative_adjustment(sharpness).into());
             self.set_curve_ui(ui, curve);
+            ui.set_frame_width(frame_w);
+            ui.set_frame_width_text(format!("{:.0}%", frame_w).into());
+            ui.set_frame_color_r(i32::from(frame_c.r));
+            ui.set_frame_color_g(i32::from(frame_c.g));
+            ui.set_frame_color_b(i32::from(frame_c.b));
             self.update_transform_ui(ui);
             self.update_image_info(ui);
             self.mark_changed();

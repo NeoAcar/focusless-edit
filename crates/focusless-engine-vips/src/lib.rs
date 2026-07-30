@@ -503,6 +503,17 @@ fn apply_operations(image: &VipsImage, operations: &[Operation]) -> Result<VipsI
     if exposure_ev.abs() > f32::EPSILON {
         current = apply_exposure_linear(&current, exposure_ev)?;
     }
+    let contrast = operations
+        .iter()
+        .rev()
+        .find_map(|operation| match *operation {
+            Operation::Contrast { amount } => Some(amount),
+            _ => None,
+        })
+        .unwrap_or(0.0);
+    if contrast.abs() > f32::EPSILON {
+        current = apply_contrast_oklab(&current, contrast)?;
+    }
     let tone_curve = operations
         .iter()
         .rev()
@@ -536,7 +547,61 @@ fn apply_operations(image: &VipsImage, operations: &[Operation]) -> Result<VipsI
     if sharpness > f32::EPSILON {
         current = apply_sharpness_oklab(&current, sharpness)?;
     }
+
+    let (frame_width_pct, frame_color) = operations
+        .iter()
+        .rev()
+        .find_map(|operation| match *operation {
+            Operation::Frame { width_pct, color } => Some((width_pct, color)),
+            _ => None,
+        })
+        .unwrap_or((0.0, focusless_core::FrameColor::WHITE));
+    if frame_width_pct > f32::EPSILON {
+        current = apply_frame_linear(&current, frame_width_pct, frame_color)?;
+    }
+
     Ok(current)
+}
+
+fn apply_frame_linear(
+    image: &VipsImage,
+    width_pct: f32,
+    color: focusless_core::FrameColor,
+) -> Result<VipsImage, RenderError> {
+    let width = image.get_width();
+    let height = image.get_height();
+    let border_px = ((width.min(height) as f32 * width_pct / 100.0).round() as i32).max(1);
+
+    fn srgb_to_linear(v: u8) -> f64 {
+        let v = f64::from(v) / 255.0;
+        if v <= 0.04045 {
+            v / 12.92
+        } else {
+            ((v + 0.055) / 1.055).powf(2.4)
+        }
+    }
+
+    let mut background = vec![
+        srgb_to_linear(color.r),
+        srgb_to_linear(color.g),
+        srgb_to_linear(color.b),
+    ];
+    if image.hasalpha() {
+        background.push(1.0);
+    }
+
+    ops::embed_with_opts(
+        image,
+        border_px,
+        border_px,
+        width + 2 * border_px,
+        height + 2 * border_px,
+        &ops::EmbedOptions {
+            extend: ops::Extend::Background,
+            background,
+        },
+    )
+    .map_err(vips_error)
 }
 
 fn apply_white_balance_linear(
@@ -604,6 +669,39 @@ fn apply_saturation_oklab(image: &VipsImage, amount: f32) -> Result<VipsImage, R
     .map_err(vips_error)?;
     let saturated = oklab_to_linear_rgb(&adjusted_oklab)?;
     join_alpha(saturated, alpha)
+}
+
+fn apply_contrast_oklab(image: &VipsImage, amount: f32) -> Result<VipsImage, RenderError> {
+    let (color, alpha) = split_color_and_alpha(image, "contrast")?;
+    let oklab = linear_rgb_to_oklab(&color)?;
+
+    let lightness = ops::extract_band(&oklab, 0).map_err(vips_error)?;
+    let chroma = ops::extract_band_with_opts(&oklab, 1, &ops::ExtractBandOptions { n: 2 })
+        .map_err(vips_error)?;
+
+    let gamma = 1.0 + f64::from(amount) / 100.0;
+
+    let condition = ops::relational_const(&lightness, ops::OperationRelational::Lesseq, &mut [0.5])
+        .map_err(vips_error)?;
+
+    let two_i = ops::linear(&lightness, &mut [2.0], &mut [0.0]).map_err(vips_error)?;
+    let two_i_abs = ops::abs(&two_i).map_err(vips_error)?;
+    let shadows_pow =
+        ops::math2_const(&two_i_abs, ops::OperationMath2::Pow, &mut [gamma]).map_err(vips_error)?;
+    let shadows = ops::linear(&shadows_pow, &mut [0.5], &mut [0.0]).map_err(vips_error)?;
+
+    let inverted = ops::linear(&lightness, &mut [-2.0], &mut [2.0]).map_err(vips_error)?;
+    let inverted_abs = ops::abs(&inverted).map_err(vips_error)?;
+    let highlights_pow = ops::math2_const(&inverted_abs, ops::OperationMath2::Pow, &mut [gamma])
+        .map_err(vips_error)?;
+    let highlights = ops::linear(&highlights_pow, &mut [-0.5], &mut [1.0]).map_err(vips_error)?;
+
+    let adjusted_lightness =
+        ops::ifthenelse(&condition, &shadows, &highlights).map_err(vips_error)?;
+
+    let adjusted_oklab = ops::bandjoin(&mut [adjusted_lightness, chroma]).map_err(vips_error)?;
+    let contrasted = oklab_to_linear_rgb(&adjusted_oklab)?;
+    join_alpha(contrasted, alpha)
 }
 
 fn apply_sharpness_oklab(image: &VipsImage, amount: f32) -> Result<VipsImage, RenderError> {
@@ -708,10 +806,10 @@ fn white_balance_rgb_matrix(adjustment: WhiteBalance) -> Result<[[f32; 3]; 3], R
     const D65_KELVIN: f64 = 6504.0;
     const MIRED_RANGE: f64 = 120.0;
     const TINT_DUV_RANGE: f64 = 0.02;
-    const CAT16: [[f64; 3]; 3] = [
-        [0.401_288, 0.650_173, -0.051_461],
-        [-0.250_268, 1.204_414, 0.045_854],
-        [-0.002_079, 0.048_952, 0.953_127],
+    const BRADFORD: [[f64; 3]; 3] = [
+        [0.8951, 0.2664, -0.1614],
+        [-0.7502, 1.7135, 0.0367],
+        [0.0389, -0.0685, 1.0296],
     ];
     const RGB_TO_XYZ: [[f64; 3]; 3] = [
         [0.412_456_4, 0.357_576_1, 0.180_437_5],
@@ -735,14 +833,14 @@ fn white_balance_rgb_matrix(adjustment: WhiteBalance) -> Result<[[f32; 3]; 3], R
     );
     let source_white = xy_to_xyz(D65_XY);
     let target_white = xy_to_xyz(target_xy);
-    let source_cone = matrix_vector(CAT16, source_white);
-    let target_cone = matrix_vector(CAT16, target_white);
+    let source_cone = matrix_vector(BRADFORD, source_white);
+    let target_cone = matrix_vector(BRADFORD, target_white);
     if source_cone
         .into_iter()
         .any(|value| value.abs() < f64::EPSILON)
     {
         return Err(RenderError::Engine(
-            "CAT16 source white produced a zero cone response".into(),
+            "Bradford source white produced a zero cone response".into(),
         ));
     }
     let scale = [
@@ -750,9 +848,9 @@ fn white_balance_rgb_matrix(adjustment: WhiteBalance) -> Result<[[f32; 3]; 3], R
         [0.0, target_cone[1] / source_cone[1], 0.0],
         [0.0, 0.0, target_cone[2] / source_cone[2]],
     ];
-    let cat_inverse = inverse_3x3(CAT16)
-        .ok_or_else(|| RenderError::Engine("CAT16 matrix could not be inverted".into()))?;
-    let adaptation = matrix_multiply(matrix_multiply(cat_inverse, scale), CAT16);
+    let cat_inverse = inverse_3x3(BRADFORD)
+        .ok_or_else(|| RenderError::Engine("Bradford matrix could not be inverted".into()))?;
+    let adaptation = matrix_multiply(matrix_multiply(cat_inverse, scale), BRADFORD);
     let rgb_matrix = matrix_multiply(matrix_multiply(XYZ_TO_RGB, adaptation), RGB_TO_XYZ);
     Ok(rgb_matrix.map(|row| row.map(|value| value as f32)))
 }
@@ -809,12 +907,12 @@ fn planckian_xy(kelvin: f64) -> (f64, f64) {
 
 fn xy_to_uv((x, y): (f64, f64)) -> (f64, f64) {
     let denominator = -2.0 * x + 12.0 * y + 3.0;
-    (4.0 * x / denominator, 9.0 * y / denominator)
+    (4.0 * x / denominator, 6.0 * y / denominator)
 }
 
 fn uv_to_xy((u, v): (f64, f64)) -> (f64, f64) {
-    let denominator = 6.0 * u - 16.0 * v + 12.0;
-    (9.0 * u / denominator, 4.0 * v / denominator)
+    let denominator = 2.0 * u - 8.0 * v + 4.0;
+    (3.0 * u / denominator, 2.0 * v / denominator)
 }
 
 fn xy_to_xyz((x, y): (f64, f64)) -> [f64; 3] {
@@ -1383,7 +1481,7 @@ mod tests {
     }
 
     #[test]
-    fn cat16_white_balance_has_expected_neutral_axis_behavior() {
+    fn bradford_white_balance_has_expected_neutral_axis_behavior() {
         let identity = white_balance_rgb_matrix(WhiteBalance::IDENTITY).unwrap();
         for (row, values) in identity.iter().enumerate() {
             for (column, value) in values.iter().enumerate() {
@@ -1430,7 +1528,7 @@ mod tests {
                 0.212_672_9 * adjusted[0] + 0.715_152_2 * adjusted[1] + 0.072_175 * adjusted[2];
             assert!(
                 (luminance - 0.18).abs() < 2.0e-5,
-                "CAT16 must preserve the reference-white luminance, got {luminance}"
+                "Bradford must preserve the reference-white luminance, got {luminance}"
             );
         }
     }

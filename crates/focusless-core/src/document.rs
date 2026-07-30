@@ -3,9 +3,10 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub const PROJECT_SCHEMA_VERSION: u32 = 8;
+pub const PROJECT_SCHEMA_VERSION: u32 = 10;
 pub const MAX_HISTORY_LEN: usize = 200;
 const MIN_CROP_EXTENT: f32 = 0.01;
+const MAX_FRAME_WIDTH_PCT: f32 = 50.0;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SourceFingerprint {
@@ -104,6 +105,28 @@ impl Default for CropRect {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FrameColor {
+    pub r: u8,
+    pub g: u8,
+    pub b: u8,
+}
+
+impl FrameColor {
+    pub const WHITE: Self = Self {
+        r: 255,
+        g: 255,
+        b: 255,
+    };
+    pub const BLACK: Self = Self { r: 0, g: 0, b: 0 };
+}
+
+impl Default for FrameColor {
+    fn default() -> Self {
+        Self::WHITE
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct WhiteBalance {
     pub temperature: f32,
@@ -175,7 +198,7 @@ impl ToneCurve {
             && (self.highlight_input - self.highlights).abs() < f32::EPSILON
     }
 
-    /// Samples the shape-preserving cubic Hermite curve through the five
+    /// Samples the Catmull-Rom cubic Hermite curve through the five
     /// control points. Values outside the display-referred 0..=1 interval are
     /// preserved so extended-range linear scRGB data is not destroyed.
     #[must_use]
@@ -191,7 +214,7 @@ impl ToneCurve {
             1.0,
         ];
         let values = [0.0, self.shadows, self.midtones, self.highlights, 1.0];
-        let tangents = shape_preserving_tangents(inputs, values);
+        let tangents = catmull_rom_tangents(inputs, values);
         let segment = (0..4)
             .find(|&segment| x <= inputs[segment + 1])
             .unwrap_or(3);
@@ -216,48 +239,20 @@ impl Default for ToneCurve {
     }
 }
 
-fn shape_preserving_tangents(inputs: [f32; 5], values: [f32; 5]) -> [f32; 5] {
-    let intervals = [
-        inputs[1] - inputs[0],
-        inputs[2] - inputs[1],
-        inputs[3] - inputs[2],
-        inputs[4] - inputs[3],
-    ];
-    let slopes = [
-        (values[1] - values[0]) / intervals[0],
-        (values[2] - values[1]) / intervals[1],
-        (values[3] - values[2]) / intervals[2],
-        (values[4] - values[3]) / intervals[3],
-    ];
-    let mut tangents = [slopes[0], 0.0, 0.0, 0.0, slopes[3]];
-    for point in 1..4 {
-        let before = slopes[point - 1];
-        let after = slopes[point];
-        tangents[point] = if before * after <= 0.0 {
-            0.0
-        } else {
-            let before_interval = intervals[point - 1];
-            let after_interval = intervals[point];
-            let before_weight = 2.0 * after_interval + before_interval;
-            let after_weight = after_interval + 2.0 * before_interval;
-            (before_weight + after_weight) / (before_weight / before + after_weight / after)
-        };
+fn catmull_rom_tangents(inputs: [f32; 5], values: [f32; 5]) -> [f32; 5] {
+    let mut tangents = [0.0; 5];
+
+    // First point (forward difference)
+    tangents[0] = (values[1] - values[0]) / (inputs[1] - inputs[0]);
+
+    // Interior points (central difference)
+    for k in 1..4 {
+        tangents[k] = (values[k + 1] - values[k - 1]) / (inputs[k + 1] - inputs[k - 1]);
     }
-    for segment in 0..4 {
-        if slopes[segment].abs() < f32::EPSILON {
-            tangents[segment] = 0.0;
-            tangents[segment + 1] = 0.0;
-            continue;
-        }
-        let a = tangents[segment] / slopes[segment];
-        let b = tangents[segment + 1] / slopes[segment];
-        let magnitude = a * a + b * b;
-        if magnitude > 9.0 {
-            let scale = 3.0 / magnitude.sqrt();
-            tangents[segment] = scale * a * slopes[segment];
-            tangents[segment + 1] = scale * b * slopes[segment];
-        }
-    }
+
+    // Last point (backward difference)
+    tangents[4] = (values[4] - values[3]) / (inputs[4] - inputs[3]);
+
     tangents
 }
 
@@ -268,15 +263,21 @@ pub enum Operation {
     Crop { rect: CropRect },
     WhiteBalance { adjustment: WhiteBalance },
     Exposure { ev: f32 },
+    Contrast { amount: f32 },
     ToneCurve { curve: ToneCurve },
     Saturation { amount: f32 },
     Sharpness { amount: f32 },
+    Frame { width_pct: f32, color: FrameColor },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Command {
     SetExposure {
+        before: f32,
+        after: f32,
+    },
+    SetContrast {
         before: f32,
         after: f32,
     },
@@ -305,6 +306,12 @@ pub enum Command {
     SetToneCurve {
         before: ToneCurve,
         after: ToneCurve,
+    },
+    SetFrame {
+        before_width_pct: f32,
+        before_color: FrameColor,
+        after_width_pct: f32,
+        after_color: FrameColor,
     },
 }
 
@@ -369,11 +376,16 @@ fn default_operations() -> Vec<Operation> {
             adjustment: WhiteBalance::IDENTITY,
         },
         Operation::Exposure { ev: 0.0 },
+        Operation::Contrast { amount: 0.0 },
         Operation::ToneCurve {
             curve: ToneCurve::IDENTITY,
         },
         Operation::Saturation { amount: 0.0 },
         Operation::Sharpness { amount: 0.0 },
+        Operation::Frame {
+            width_pct: 0.0,
+            color: FrameColor::WHITE,
+        },
     ]
 }
 
@@ -383,6 +395,8 @@ pub enum DocumentError {
     UnsupportedSchema { found: u32, supported: u32 },
     #[error("exposure must be finite and between -5 and +5 EV")]
     InvalidExposure,
+    #[error("contrast must be finite and between -100 and +100")]
+    InvalidContrast,
     #[error("temperature and tint must be finite and between -100 and +100")]
     InvalidWhiteBalance,
     #[error("saturation must be finite and between -100 and +100")]
@@ -395,6 +409,8 @@ pub enum DocumentError {
     InvalidCrop,
     #[error("tone curve points must be finite, inside the 0 to 1 interval, and ordered by input")]
     InvalidToneCurve,
+    #[error("frame width must be finite and between 0 and 50 percent")]
+    InvalidFrame,
 }
 
 impl ProjectDocument {
@@ -422,9 +438,11 @@ impl ProjectDocument {
                 Operation::Crop { rect } => validate_crop(rect)?,
                 Operation::WhiteBalance { adjustment } => validate_white_balance(adjustment)?,
                 Operation::Exposure { ev } => validate_exposure(ev)?,
+                Operation::Contrast { amount } => validate_contrast(amount)?,
                 Operation::ToneCurve { curve } => validate_tone_curve(curve)?,
                 Operation::Saturation { amount } => validate_saturation(amount)?,
                 Operation::Sharpness { amount } => validate_sharpness(amount)?,
+                Operation::Frame { width_pct, .. } => validate_frame(width_pct)?,
             }
         }
         Ok(())
@@ -478,6 +496,31 @@ impl ProjectDocument {
             self.operations
                 .insert(index, Operation::Sharpness { amount: 0.0 });
         }
+        if self.schema_version < 9
+            && !self
+                .operations
+                .iter()
+                .any(|operation| matches!(operation, Operation::Contrast { .. }))
+        {
+            let index = self
+                .operations
+                .iter()
+                .rposition(|operation| matches!(operation, Operation::Exposure { .. }))
+                .map_or(self.operations.len(), |index| index + 1);
+            self.operations
+                .insert(index, Operation::Contrast { amount: 0.0 });
+        }
+        if self.schema_version < 10
+            && !self
+                .operations
+                .iter()
+                .any(|operation| matches!(operation, Operation::Frame { .. }))
+        {
+            self.operations.push(Operation::Frame {
+                width_pct: 0.0,
+                color: FrameColor::WHITE,
+            });
+        }
         self.schema_version = PROJECT_SCHEMA_VERSION;
         Ok(())
     }
@@ -489,6 +532,18 @@ impl ProjectDocument {
             .rev()
             .find_map(|operation| match *operation {
                 Operation::Exposure { ev } => Some(ev),
+                _ => None,
+            })
+            .unwrap_or(0.0)
+    }
+
+    #[must_use]
+    pub fn contrast(&self) -> f32 {
+        self.operations
+            .iter()
+            .rev()
+            .find_map(|operation| match *operation {
+                Operation::Contrast { amount } => Some(amount),
                 _ => None,
             })
             .unwrap_or(0.0)
@@ -567,6 +622,18 @@ impl ProjectDocument {
     }
 
     #[must_use]
+    pub fn frame(&self) -> (f32, FrameColor) {
+        self.operations
+            .iter()
+            .rev()
+            .find_map(|operation| match *operation {
+                Operation::Frame { width_pct, color } => Some((width_pct, color)),
+                _ => None,
+            })
+            .unwrap_or((0.0, FrameColor::WHITE))
+    }
+
+    #[must_use]
     pub fn output_dimensions(&self, source_width: u32, source_height: u32) -> (u32, u32) {
         let (rotated_width, rotated_height) = if self.rotation_quarter_turns().is_multiple_of(2) {
             (source_width, source_height)
@@ -574,10 +641,16 @@ impl ProjectDocument {
             (source_height, source_width)
         };
         let crop = self.crop_rect();
-        (
-            ((rotated_width as f32 * crop.width).round() as u32).max(1),
-            ((rotated_height as f32 * crop.height).round() as u32).max(1),
-        )
+        let cropped_w = ((rotated_width as f32 * crop.width).round() as u32).max(1);
+        let cropped_h = ((rotated_height as f32 * crop.height).round() as u32).max(1);
+        let (frame_width_pct, _) = self.frame();
+        if frame_width_pct > f32::EPSILON {
+            let border_px =
+                ((cropped_w.min(cropped_h) as f32 * frame_width_pct / 100.0).round() as u32).max(1);
+            (cropped_w + 2 * border_px, cropped_h + 2 * border_px)
+        } else {
+            (cropped_w, cropped_h)
+        }
     }
 
     /// Updates the visible state without creating a history entry.
@@ -604,6 +677,30 @@ impl ProjectDocument {
         self.preview_exposure(after)?;
         if (before - after).abs() > f32::EPSILON {
             self.history.push(Command::SetExposure { before, after });
+        }
+        Ok(())
+    }
+
+    pub fn preview_contrast(&mut self, amount: f32) -> Result<(), DocumentError> {
+        validate_contrast(amount)?;
+        if let Some(Operation::Contrast { amount: current }) = self
+            .operations
+            .iter_mut()
+            .rev()
+            .find(|operation| matches!(operation, Operation::Contrast { .. }))
+        {
+            *current = amount;
+        } else {
+            self.operations.push(Operation::Contrast { amount });
+        }
+        Ok(())
+    }
+
+    pub fn commit_contrast(&mut self, before: f32, after: f32) -> Result<(), DocumentError> {
+        validate_contrast(before)?;
+        self.preview_contrast(after)?;
+        if (before - after).abs() > f32::EPSILON {
+            self.history.push(Command::SetContrast { before, after });
         }
         Ok(())
     }
@@ -683,6 +780,50 @@ impl ProjectDocument {
         self.preview_sharpness(after)?;
         if (before - after).abs() > f32::EPSILON {
             self.history.push(Command::SetSharpness { before, after });
+        }
+        Ok(())
+    }
+
+    pub fn preview_frame(
+        &mut self,
+        width_pct: f32,
+        color: FrameColor,
+    ) -> Result<(), DocumentError> {
+        validate_frame(width_pct)?;
+        if let Some(Operation::Frame {
+            width_pct: current_w,
+            color: current_c,
+        }) = self
+            .operations
+            .iter_mut()
+            .rev()
+            .find(|op| matches!(op, Operation::Frame { .. }))
+        {
+            *current_w = width_pct;
+            *current_c = color;
+        } else {
+            self.operations.push(Operation::Frame { width_pct, color });
+        }
+        Ok(())
+    }
+
+    pub fn commit_frame(
+        &mut self,
+        before_width_pct: f32,
+        before_color: FrameColor,
+        after_width_pct: f32,
+        after_color: FrameColor,
+    ) -> Result<(), DocumentError> {
+        validate_frame(before_width_pct)?;
+        self.preview_frame(after_width_pct, after_color)?;
+        if (before_width_pct - after_width_pct).abs() > f32::EPSILON || before_color != after_color
+        {
+            self.history.push(Command::SetFrame {
+                before_width_pct,
+                before_color,
+                after_width_pct,
+                after_color,
+            });
         }
         Ok(())
     }
@@ -786,6 +927,9 @@ impl ProjectDocument {
             Command::SetExposure { before, .. } => {
                 let _ = self.preview_exposure(before);
             }
+            Command::SetContrast { before, .. } => {
+                let _ = self.preview_contrast(before);
+            }
             Command::SetWhiteBalance { before, .. } => {
                 let _ = self.preview_white_balance(before);
             }
@@ -809,6 +953,13 @@ impl ProjectDocument {
             Command::SetToneCurve { before, .. } => {
                 let _ = self.preview_tone_curve(before);
             }
+            Command::SetFrame {
+                before_width_pct,
+                before_color,
+                ..
+            } => {
+                let _ = self.preview_frame(before_width_pct, before_color);
+            }
         }
         self.history.redo.push(command);
         true
@@ -821,6 +972,9 @@ impl ProjectDocument {
         match command {
             Command::SetExposure { after, .. } => {
                 let _ = self.preview_exposure(after);
+            }
+            Command::SetContrast { after, .. } => {
+                let _ = self.preview_contrast(after);
             }
             Command::SetWhiteBalance { after, .. } => {
                 let _ = self.preview_white_balance(after);
@@ -842,6 +996,13 @@ impl ProjectDocument {
             }
             Command::SetToneCurve { after, .. } => {
                 let _ = self.preview_tone_curve(after);
+            }
+            Command::SetFrame {
+                after_width_pct,
+                after_color,
+                ..
+            } => {
+                let _ = self.preview_frame(after_width_pct, after_color);
             }
         }
         self.history.undo.push(command);
@@ -932,6 +1093,22 @@ fn validate_exposure(ev: f32) -> Result<(), DocumentError> {
     }
 }
 
+fn validate_contrast(amount: f32) -> Result<(), DocumentError> {
+    if amount.is_finite() && (-100.0..=100.0).contains(&amount) {
+        Ok(())
+    } else {
+        Err(DocumentError::InvalidContrast)
+    }
+}
+
+fn validate_frame(width_pct: f32) -> Result<(), DocumentError> {
+    if width_pct.is_finite() && (0.0..=MAX_FRAME_WIDTH_PCT).contains(&width_pct) {
+        Ok(())
+    } else {
+        Err(DocumentError::InvalidFrame)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -960,6 +1137,19 @@ mod tests {
         assert_eq!(document.exposure_ev(), 0.0);
         assert!(document.redo());
         assert_eq!(document.exposure_ev(), 0.8);
+    }
+
+    #[test]
+    fn contrast_transaction_is_undoable_and_redoable() {
+        let mut document = document();
+        document.preview_contrast(35.0).unwrap();
+        document.commit_contrast(0.0, 35.0).unwrap();
+
+        assert_eq!(document.contrast(), 35.0);
+        assert!(document.undo());
+        assert_eq!(document.contrast(), 0.0);
+        assert!(document.redo());
+        assert_eq!(document.contrast(), 35.0);
     }
 
     #[test]
@@ -1037,6 +1227,19 @@ mod tests {
         assert_eq!(
             document.preview_exposure(5.1),
             Err(DocumentError::InvalidExposure)
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_contrast() {
+        let mut document = document();
+        assert_eq!(
+            document.preview_contrast(f32::NAN),
+            Err(DocumentError::InvalidContrast)
+        );
+        assert_eq!(
+            document.preview_contrast(100.1),
+            Err(DocumentError::InvalidContrast)
         );
     }
 
@@ -1203,5 +1406,56 @@ mod tests {
             }),
             Err(DocumentError::InvalidToneCurve)
         );
+    }
+
+    #[test]
+    fn frame_transaction_is_undoable_and_redoable() {
+        let mut document = document();
+        let color = FrameColor {
+            r: 30,
+            g: 30,
+            b: 30,
+        };
+        document.preview_frame(10.0, color).unwrap();
+        document
+            .commit_frame(0.0, FrameColor::WHITE, 10.0, color)
+            .unwrap();
+        assert_eq!(document.frame(), (10.0, color));
+        assert!(document.undo());
+        assert_eq!(document.frame(), (0.0, FrameColor::WHITE));
+        assert!(document.redo());
+        assert_eq!(document.frame(), (10.0, color));
+    }
+
+    #[test]
+    fn rejects_invalid_frame() {
+        let mut document = document();
+        assert_eq!(
+            document.preview_frame(f32::NAN, FrameColor::WHITE),
+            Err(DocumentError::InvalidFrame)
+        );
+        assert_eq!(
+            document.preview_frame(50.1, FrameColor::WHITE),
+            Err(DocumentError::InvalidFrame)
+        );
+        assert_eq!(
+            document.preview_frame(-0.1, FrameColor::WHITE),
+            Err(DocumentError::InvalidFrame)
+        );
+    }
+
+    #[test]
+    fn schema_v9_migrates_to_v10_with_neutral_frame() {
+        let mut document = document();
+        document.schema_version = 9;
+        // Remove Frame operation to simulate v9 project
+        document
+            .operations
+            .retain(|op| !matches!(op, Operation::Frame { .. }));
+        document.upgrade_to_latest().unwrap();
+        assert_eq!(document.schema_version, 10);
+        let (width_pct, color) = document.frame();
+        assert_eq!(width_pct, 0.0);
+        assert_eq!(color, FrameColor::WHITE);
     }
 }

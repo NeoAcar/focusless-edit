@@ -301,11 +301,16 @@ mod tests {
                     adjustment: focusless_core::WhiteBalance::IDENTITY,
                 },
                 Operation::Exposure { ev: 0.0 },
+                Operation::Contrast { amount: 0.0 },
                 Operation::ToneCurve {
                     curve: focusless_core::ToneCurve::IDENTITY,
                 },
                 Operation::Saturation { amount: 0.0 },
                 Operation::Sharpness { amount: 0.0 },
+                Operation::Frame {
+                    width_pct: 0.0,
+                    color: focusless_core::FrameColor::WHITE,
+                },
             ]
         );
     }
@@ -478,6 +483,64 @@ mod tests {
             .position(|operation| matches!(operation, Operation::Sharpness { .. }))
             .unwrap();
         assert!(saturation_index < sharpness_index);
+    }
+
+    #[test]
+    fn version_eight_project_gets_neutral_contrast_after_exposure() {
+        let directory = tempdir().unwrap();
+        let project_path = directory.path().join("version-eight.focusless");
+        let image_path = directory.path().join("image.jpg");
+        let mut document = ProjectDocument::new(source(image_path));
+        document.schema_version = 8;
+        document
+            .operations
+            .retain(|operation| !matches!(operation, Operation::Contrast { .. }));
+        fs::write(&project_path, serde_json::to_vec_pretty(&document).unwrap()).unwrap();
+
+        let restored = load_project(&project_path).unwrap();
+        assert_eq!(restored.schema_version, PROJECT_SCHEMA_VERSION);
+        assert_eq!(restored.contrast(), 0.0);
+        let exposure_index = restored
+            .operations
+            .iter()
+            .position(|operation| matches!(operation, Operation::Exposure { .. }))
+            .unwrap();
+        let contrast_index = restored
+            .operations
+            .iter()
+            .position(|operation| matches!(operation, Operation::Contrast { .. }))
+            .unwrap();
+        assert!(exposure_index < contrast_index);
+    }
+
+    #[test]
+    fn version_nine_project_gets_neutral_frame_at_end() {
+        let directory = tempdir().unwrap();
+        let project_path = directory.path().join("version-nine.focusless");
+        let image_path = directory.path().join("image.jpg");
+        let mut document = ProjectDocument::new(source(image_path));
+        document.schema_version = 9;
+        document
+            .operations
+            .retain(|operation| !matches!(operation, Operation::Frame { .. }));
+        fs::write(&project_path, serde_json::to_vec_pretty(&document).unwrap()).unwrap();
+
+        let restored = load_project(&project_path).unwrap();
+        assert_eq!(restored.schema_version, PROJECT_SCHEMA_VERSION);
+        let (frame_width_pct, frame_color) = restored.frame();
+        assert_eq!(frame_width_pct, 0.0);
+        assert_eq!(frame_color, focusless_core::FrameColor::WHITE);
+        let sharpness_index = restored
+            .operations
+            .iter()
+            .position(|operation| matches!(operation, Operation::Sharpness { .. }))
+            .unwrap();
+        let frame_index = restored
+            .operations
+            .iter()
+            .position(|operation| matches!(operation, Operation::Frame { .. }))
+            .unwrap();
+        assert!(sharpness_index < frame_index);
     }
 
     #[test]

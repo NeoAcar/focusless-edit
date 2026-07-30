@@ -56,6 +56,7 @@ export component AppWindow inherits Window {
     in-out property <float> saturation: 0;
     in-out property <float> sharpness: 0;
     in-out property <float> exposure: 0;
+    in-out property <float> contrast: 0;
     in-out property <float> crop-x: 0;
     in-out property <float> crop-y: 0;
     in-out property <float> crop-width: 1;
@@ -67,6 +68,7 @@ export component AppWindow inherits Window {
     in-out property <float> curve-highlight-input: 0.75;
     in-out property <float> curve-highlights: 0.75;
     in property <string> exposure-text: "0.0 EV";
+    in property <string> contrast-text: "0";
     in property <string> temperature-text: "0";
     in property <string> tint-text: "0";
     in property <string> saturation-text: "0";
@@ -91,6 +93,11 @@ export component AppWindow inherits Window {
     in property <float> photo-y: 0;
     in property <float> photo-width: 0;
     in property <float> photo-height: 0;
+    in-out property <float> frame-width: 0;
+    in property <string> frame-width-text: "0%";
+    in-out property <int> frame-color-r: 255;
+    in-out property <int> frame-color-g: 255;
+    in-out property <int> frame-color-b: 255;
 
     out property <int> canvas-width: canvas.width / 1px;
     out property <int> canvas-height: canvas.height / 1px;
@@ -109,6 +116,9 @@ export component AppWindow inherits Window {
     callback exposure-preview(value: float);
     callback exposure-commit(value: float);
     callback reset-exposure-requested;
+    callback contrast-preview(amount: float);
+    callback contrast-commit(amount: float);
+    callback reset-contrast-requested;
     callback white-balance-preview(temperature: float, tint: float);
     callback white-balance-commit(temperature: float, tint: float);
     callback reset-white-balance-requested;
@@ -138,6 +148,10 @@ export component AppWindow inherits Window {
     callback crop-aspect-requested(ratio: float);
     callback crop-apply-requested;
     callback crop-cancel-requested;
+    callback frame-width-preview(width-pct: float);
+    callback frame-width-commit(width-pct: float);
+    callback frame-color-changed(r: int, g: int, b: int);
+    callback reset-frame-requested;
 
     init => {
         Palette.color-scheme = ColorScheme.dark;
@@ -864,6 +878,64 @@ export component AppWindow inherits Window {
                         clicked => { root.reset-exposure-requested(); }
                     }
 
+                    Rectangle {
+                        height: 1px;
+                        background: #343840;
+                    }
+
+                    HorizontalLayout {
+                        spacing: 8px;
+                        Text {
+                            text: "Contrast";
+                            color: root.document-loaded ? #eef1f6 : #777d87;
+                            font-size: 14px;
+                            font-weight: 600;
+                        }
+                        Rectangle { horizontal-stretch: 1; background: transparent; }
+                        Text {
+                            text: root.contrast-text;
+                            color: #9fa7b4;
+                            font-size: 13px;
+                            horizontal-alignment: right;
+                        }
+                    }
+
+                    Slider {
+                        minimum: -100;
+                        maximum: 100;
+                        step: 1;
+                        value <=> root.contrast;
+                        enabled: root.document-loaded && !root.crop-mode && !root.curve-mode;
+                        changed(value) => { root.contrast-preview(value); }
+                        released(value) => { root.contrast-commit(value); }
+                    }
+
+                    HorizontalLayout {
+                        Text {
+                            text: "-100";
+                            color: #6f7682;
+                            font-size: 11px;
+                        }
+                        Rectangle { horizontal-stretch: 1; background: transparent; }
+                        Text {
+                            text: "+100";
+                            color: #6f7682;
+                            font-size: 11px;
+                        }
+                    }
+
+                    ActionButton {
+                        text: "Reset Contrast";
+                        enabled: root.document-loaded && !root.crop-mode
+                            && !root.curve-mode && abs(root.contrast) > 0.001;
+                        clicked => { root.reset-contrast-requested(); }
+                    }
+
+                    Rectangle {
+                        height: 1px;
+                        background: #343840;
+                    }
+
                     HorizontalLayout {
                         spacing: 8px;
                         Text {
@@ -1111,6 +1183,168 @@ export component AppWindow inherits Window {
                             primary: true;
                             clicked => { root.crop-apply-requested(); }
                         }
+                    }
+
+                    Rectangle {
+                        height: 1px;
+                        background: #343840;
+                    }
+
+                    Text {
+                        text: "FRAME";
+                        color: #828a97;
+                        font-size: 11px;
+                        font-weight: 700;
+                    }
+
+                    HorizontalLayout {
+                        spacing: 8px;
+                        Text {
+                            text: "Width";
+                            color: root.document-loaded ? #eef1f6 : #777d87;
+                            font-size: 14px;
+                            font-weight: 600;
+                        }
+                        Rectangle { horizontal-stretch: 1; background: transparent; }
+                        Text {
+                            text: root.frame-width-text;
+                            color: #9fa7b4;
+                            font-size: 13px;
+                            horizontal-alignment: right;
+                        }
+                    }
+
+                    Slider {
+                        minimum: 0;
+                        maximum: 50;
+                        step: 1;
+                        value <=> root.frame-width;
+                        enabled: root.document-loaded && !root.crop-mode && !root.curve-mode;
+                        changed(value) => { root.frame-width-preview(value); }
+                        released(value) => { root.frame-width-commit(value); }
+                    }
+
+                    HorizontalLayout {
+                        Text {
+                            text: "0%";
+                            color: #6f7682;
+                            font-size: 11px;
+                        }
+                        Rectangle { horizontal-stretch: 1; background: transparent; }
+                        Text {
+                            text: "50%";
+                            color: #6f7682;
+                            font-size: 11px;
+                        }
+                    }
+
+                    Text {
+                        text: "Color";
+                        color: root.document-loaded ? #eef1f6 : #777d87;
+                        font-size: 14px;
+                        font-weight: 600;
+                    }
+
+                    // Color swatch row
+                    HorizontalLayout {
+                        spacing: 6px;
+
+                        // White
+                        Rectangle {
+                            private property <bool> selected: root.frame-color-r == 255 && root.frame-color-g == 255 && root.frame-color-b == 255;
+                            width: 32px;
+                            height: 32px;
+                            border-radius: 6px;
+                            background: #ffffff;
+                            border-width: selected ? 2px : 1px;
+                            border-color: selected ? #5294ff : #555b65;
+                            TouchArea {
+                                enabled: root.document-loaded && !root.crop-mode && !root.curve-mode;
+                                mouse-cursor: pointer;
+                                clicked => { root.frame-color-changed(255, 255, 255); }
+                            }
+                        }
+
+                        // Light grey
+                        Rectangle {
+                            private property <bool> selected: root.frame-color-r == 220 && root.frame-color-g == 220 && root.frame-color-b == 220;
+                            width: 32px;
+                            height: 32px;
+                            border-radius: 6px;
+                            background: #dcdcdc;
+                            border-width: selected ? 2px : 1px;
+                            border-color: selected ? #5294ff : #555b65;
+                            TouchArea {
+                                enabled: root.document-loaded && !root.crop-mode && !root.curve-mode;
+                                mouse-cursor: pointer;
+                                clicked => { root.frame-color-changed(220, 220, 220); }
+                            }
+                        }
+
+                        // Warm cream
+                        Rectangle {
+                            private property <bool> selected: root.frame-color-r == 245 && root.frame-color-g == 240 && root.frame-color-b == 230;
+                            width: 32px;
+                            height: 32px;
+                            border-radius: 6px;
+                            background: #f5f0e6;
+                            border-width: selected ? 2px : 1px;
+                            border-color: selected ? #5294ff : #555b65;
+                            TouchArea {
+                                enabled: root.document-loaded && !root.crop-mode && !root.curve-mode;
+                                mouse-cursor: pointer;
+                                clicked => { root.frame-color-changed(245, 240, 230); }
+                            }
+                        }
+
+                        // Dark grey
+                        Rectangle {
+                            private property <bool> selected: root.frame-color-r == 50 && root.frame-color-g == 50 && root.frame-color-b == 50;
+                            width: 32px;
+                            height: 32px;
+                            border-radius: 6px;
+                            background: #323232;
+                            border-width: selected ? 2px : 1px;
+                            border-color: selected ? #5294ff : #555b65;
+                            TouchArea {
+                                enabled: root.document-loaded && !root.crop-mode && !root.curve-mode;
+                                mouse-cursor: pointer;
+                                clicked => { root.frame-color-changed(50, 50, 50); }
+                            }
+                        }
+
+                        // Black
+                        Rectangle {
+                            private property <bool> selected: root.frame-color-r == 0 && root.frame-color-g == 0 && root.frame-color-b == 0;
+                            width: 32px;
+                            height: 32px;
+                            border-radius: 6px;
+                            background: #000000;
+                            border-width: selected ? 2px : 1px;
+                            border-color: selected ? #5294ff : #555b65;
+                            TouchArea {
+                                enabled: root.document-loaded && !root.crop-mode && !root.curve-mode;
+                                mouse-cursor: pointer;
+                                clicked => { root.frame-color-changed(0, 0, 0); }
+                            }
+                        }
+
+                        // Current preview swatch
+                        Rectangle {
+                            horizontal-stretch: 1;
+                            height: 32px;
+                            border-radius: 6px;
+                            background: Colors.rgb(root.frame-color-r, root.frame-color-g, root.frame-color-b);
+                            border-width: 1px;
+                            border-color: #555b65;
+                        }
+                    }
+
+                    ActionButton {
+                        text: "Reset Frame";
+                        enabled: root.document-loaded && !root.crop-mode && !root.curve-mode
+                            && root.frame-width > 0.001;
+                        clicked => { root.reset-frame-requested(); }
                     }
 
                     Rectangle {

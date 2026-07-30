@@ -1,4 +1,3 @@
-[CmdletBinding()]
 param(
     [switch]$Debug,
     [switch]$SkipChecks,
