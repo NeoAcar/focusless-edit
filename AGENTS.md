@@ -52,10 +52,10 @@ The canonical render order is:
    untagged RGB as sRGB.
 3. Decode the sRGB transfer curve into 32-bit float linear scRGB.
 4. Apply rotation and normalized crop.
-5. Apply white balance, exposure, tone curve, and saturation in the documented
-   order.
-6. Apply sharpness to OKLab lightness before preview resize or output
-   conversion.
+5. Apply white balance, exposure, contrast, tone curve, and saturation in the
+   documented order.
+6. Apply sharpness to OKLab lightness, then add the frame in linear light,
+   before preview resize or output conversion.
 7. Encode to display-referred sRGB and embed the sRGB ICC profile in exported
    JPEG, PNG, and WebP files.
 
@@ -66,7 +66,7 @@ changes require numerical reference tests.
 
 ## Document and interaction rules
 
-- The current project schema is version 8. Old versions 1–7 must continue to
+- The current project schema is version 11. Old versions 1–10 must continue to
   load. Any semantic or serialized-model change requires a schema increment
   and an explicit migration test.
 - Every document-changing action must support undo/redo. Group continuous

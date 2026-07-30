@@ -257,7 +257,7 @@ fn sync_directory(_path: &Path) -> Result<(), StorageError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use focusless_core::Operation;
+    use focusless_core::{Operation, WhiteBalance};
     use tempfile::tempdir;
 
     fn source(path: PathBuf) -> SourceReference {
@@ -541,6 +541,26 @@ mod tests {
             .position(|operation| matches!(operation, Operation::Frame { .. }))
             .unwrap();
         assert!(sharpness_index < frame_index);
+    }
+
+    #[test]
+    fn version_ten_project_adopts_cat16_white_balance_semantics() {
+        let directory = tempdir().unwrap();
+        let project_path = directory.path().join("version-ten.focusless");
+        let image_path = directory.path().join("image.jpg");
+        let adjustment = WhiteBalance {
+            temperature: 37.0,
+            tint: -12.0,
+        };
+        let mut document = ProjectDocument::new(source(image_path));
+        document.schema_version = 10;
+        document.preview_white_balance(adjustment).unwrap();
+        fs::write(&project_path, serde_json::to_vec_pretty(&document).unwrap()).unwrap();
+
+        let restored = load_project(&project_path).unwrap();
+
+        assert_eq!(restored.schema_version, PROJECT_SCHEMA_VERSION);
+        assert_eq!(restored.white_balance(), adjustment);
     }
 
     #[test]

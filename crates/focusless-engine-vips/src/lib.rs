@@ -19,8 +19,8 @@ use std::{
 
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded, select, unbounded};
 use focusless_core::{
-    CropRect, ExportFormat, ExportRequest, Operation, PreviewRequest, RenderError, RenderResult,
-    ToneCurve, Viewport, WhiteBalance,
+    CropRect, ExportFormat, ExportRequest, FrameColor, Operation, PreviewRequest, RenderError,
+    RenderResult, ToneCurve, Viewport, WhiteBalance,
 };
 use tracing::{debug, error};
 use vips_compat::{VipsApp, VipsError, VipsImage, ops};
@@ -136,7 +136,7 @@ fn worker_loop(
     event_tx: Sender<EngineEvent>,
     cancel_export: Arc<AtomicBool>,
 ) {
-    let engine = match VipsEngine::new() {
+    let mut engine = match VipsEngine::new() {
         Ok(engine) => engine,
         Err(error) => {
             error!(%error, "failed to initialize libvips");
@@ -177,6 +177,23 @@ fn worker_loop(
 struct VipsEngine {
     app: VipsApp,
     srgb_profile: PathBuf,
+    preview_pipeline: Option<PreviewPipeline>,
+    #[cfg(test)]
+    preview_pipeline_builds: usize,
+}
+
+struct PreviewPipeline {
+    source_path: PathBuf,
+    operations: Vec<Operation>,
+    image: VipsImage,
+    fit_cache: Option<FitPreview>,
+}
+
+struct FitPreview {
+    output_width: u32,
+    output_height: u32,
+    image: VipsImage,
+    effective_zoom: f32,
 }
 
 impl VipsEngine {
@@ -190,7 +207,13 @@ impl VipsEngine {
         app.cache_set_max_mem(512 * 1024 * 1024);
         app.cache_set_max_files(64);
         let srgb_profile = resolve_srgb_profile()?;
-        Ok(Self { app, srgb_profile })
+        Ok(Self {
+            app,
+            srgb_profile,
+            preview_pipeline: None,
+            #[cfg(test)]
+            preview_pipeline_builds: 0,
+        })
     }
 
     fn inspect(&self, path: &Path) -> Result<ImageInfo, RenderError> {
@@ -198,12 +221,97 @@ impl VipsEngine {
         dimensions(&source)
     }
 
-    fn render_preview(&self, request: &PreviewRequest) -> Result<RenderResult, RenderError> {
+    fn render_preview(&mut self, request: &PreviewRequest) -> Result<RenderResult, RenderError> {
         validate_viewport(request.viewport)?;
-        let source = load_oriented(&request.source_path)?;
-        let source = to_working_linear(&source, &self.srgb_profile)?;
-        let adjusted = apply_operations(&source, &request.operations)?;
-        let (visible, effective_zoom) = render_viewport(&adjusted, request.viewport)?;
+        let base_operations = request
+            .operations
+            .iter()
+            .copied()
+            .filter(|operation| !matches!(operation, Operation::Frame { .. }))
+            .collect::<Vec<_>>();
+        let rebuild_pipeline = self.preview_pipeline.as_ref().is_none_or(|pipeline| {
+            pipeline.source_path != request.source_path || pipeline.operations != base_operations
+        });
+        if rebuild_pipeline {
+            let source = load_oriented(&request.source_path)?;
+            let source = to_working_linear(&source, &self.srgb_profile)?;
+            let image = apply_operations(&source, &base_operations)?;
+            self.preview_pipeline = Some(PreviewPipeline {
+                source_path: request.source_path.clone(),
+                operations: base_operations,
+                image,
+                fit_cache: None,
+            });
+            #[cfg(test)]
+            {
+                self.preview_pipeline_builds += 1;
+            }
+            debug!(
+                generation = request.generation,
+                "rebuilt preview operation pipeline"
+            );
+        } else {
+            debug!(
+                generation = request.generation,
+                "reusing preview operation pipeline"
+            );
+        }
+        let (frame_width_pct, frame_color) = latest_frame(&request.operations);
+        let (visible, effective_zoom) = if request.viewport.zoom <= 0.0 {
+            let pipeline = self
+                .preview_pipeline
+                .as_mut()
+                .expect("preview pipeline was initialized");
+            let rebuild_fit_cache = pipeline.fit_cache.as_ref().is_none_or(|cache| {
+                cache.output_width != request.viewport.output_width
+                    || cache.output_height != request.viewport.output_height
+            });
+            if rebuild_fit_cache {
+                let fit_viewport = Viewport::fit(
+                    request.viewport.output_width,
+                    request.viewport.output_height,
+                );
+                let (visible, effective_zoom) = render_viewport(&pipeline.image, fit_viewport)?;
+                let visible = visible.copy_memory().map_err(vips_error)?;
+                pipeline.fit_cache = Some(FitPreview {
+                    output_width: request.viewport.output_width,
+                    output_height: request.viewport.output_height,
+                    image: visible,
+                    effective_zoom,
+                });
+                debug!(
+                    generation = request.generation,
+                    "materialized frame-independent fit preview"
+                );
+            }
+            let cache = pipeline
+                .fit_cache
+                .as_ref()
+                .expect("fit preview cache was initialized");
+            if frame_width_pct > f32::EPSILON {
+                apply_cached_fit_frame(
+                    &pipeline.image,
+                    cache,
+                    request.viewport,
+                    frame_width_pct,
+                    frame_color,
+                )?
+            } else {
+                (cache.image.clone(), cache.effective_zoom)
+            }
+        } else {
+            let base = &self
+                .preview_pipeline
+                .as_ref()
+                .expect("preview pipeline was initialized")
+                .image;
+            let adjusted = if frame_width_pct > f32::EPSILON {
+                apply_frame_linear(base, frame_width_pct, frame_color)?
+            } else {
+                base.clone()
+            };
+            render_viewport(&adjusted, request.viewport)?
+        };
         let display = from_working_linear(&visible)?;
         let rgba = ensure_rgba8(&display)?;
         let canvas = fit_to_canvas(&rgba, request.viewport)?;
@@ -548,14 +656,7 @@ fn apply_operations(image: &VipsImage, operations: &[Operation]) -> Result<VipsI
         current = apply_sharpness_oklab(&current, sharpness)?;
     }
 
-    let (frame_width_pct, frame_color) = operations
-        .iter()
-        .rev()
-        .find_map(|operation| match *operation {
-            Operation::Frame { width_pct, color } => Some((width_pct, color)),
-            _ => None,
-        })
-        .unwrap_or((0.0, focusless_core::FrameColor::WHITE));
+    let (frame_width_pct, frame_color) = latest_frame(operations);
     if frame_width_pct > f32::EPSILON {
         current = apply_frame_linear(&current, frame_width_pct, frame_color)?;
     }
@@ -563,15 +664,43 @@ fn apply_operations(image: &VipsImage, operations: &[Operation]) -> Result<VipsI
     Ok(current)
 }
 
+fn latest_frame(operations: &[Operation]) -> (f32, FrameColor) {
+    operations
+        .iter()
+        .rev()
+        .find_map(|operation| match *operation {
+            Operation::Frame { width_pct, color } => Some((width_pct, color)),
+            _ => None,
+        })
+        .unwrap_or((0.0, FrameColor::WHITE))
+}
+
 fn apply_frame_linear(
     image: &VipsImage,
     width_pct: f32,
-    color: focusless_core::FrameColor,
+    color: FrameColor,
 ) -> Result<VipsImage, RenderError> {
     let width = image.get_width();
     let height = image.get_height();
     let border_px = ((width.min(height) as f32 * width_pct / 100.0).round() as i32).max(1);
+    embed_frame_linear(
+        image,
+        border_px,
+        border_px,
+        width + 2 * border_px,
+        height + 2 * border_px,
+        color,
+    )
+}
 
+fn embed_frame_linear(
+    image: &VipsImage,
+    left: i32,
+    top: i32,
+    width: i32,
+    height: i32,
+    color: FrameColor,
+) -> Result<VipsImage, RenderError> {
     fn srgb_to_linear(v: u8) -> f64 {
         let v = f64::from(v) / 255.0;
         if v <= 0.04045 {
@@ -592,16 +721,55 @@ fn apply_frame_linear(
 
     ops::embed_with_opts(
         image,
-        border_px,
-        border_px,
-        width + 2 * border_px,
-        height + 2 * border_px,
+        left,
+        top,
+        width,
+        height,
         &ops::EmbedOptions {
             extend: ops::Extend::Background,
             background,
         },
     )
     .map_err(vips_error)
+}
+
+fn apply_cached_fit_frame(
+    full_resolution: &VipsImage,
+    cache: &FitPreview,
+    viewport: Viewport,
+    width_pct: f32,
+    color: FrameColor,
+) -> Result<(VipsImage, f32), RenderError> {
+    let source = dimensions(full_resolution)?;
+    let border =
+        ((source.width.min(source.height) as f32 * width_pct / 100.0).round() as u32).max(1);
+    let framed_width = source.width.saturating_add(border.saturating_mul(2));
+    let framed_height = source.height.saturating_add(border.saturating_mul(2));
+    let scale = (f64::from(viewport.output_width) / f64::from(framed_width))
+        .min(f64::from(viewport.output_height) / f64::from(framed_height))
+        .min(1.0);
+    let cache_scale = f64::from(cache.effective_zoom);
+    let relative_scale = (scale / cache_scale).min(1.0);
+    let resized = if (relative_scale - 1.0).abs() < f64::EPSILON {
+        cache.image.clone()
+    } else {
+        ops::resize(&cache.image, relative_scale).map_err(vips_error)?
+    };
+    let resized_info = dimensions(&resized)?;
+    let target_width = ((f64::from(framed_width) * scale).round() as u32)
+        .max(resized_info.width)
+        .max(1);
+    let target_height = ((f64::from(framed_height) * scale).round() as u32)
+        .max(resized_info.height)
+        .max(1);
+    let left = (target_width - resized_info.width) / 2;
+    let top = (target_height - resized_info.height) / 2;
+    let left = i32::try_from(left).map_err(|_| RenderError::InvalidDimensions)?;
+    let top = i32::try_from(top).map_err(|_| RenderError::InvalidDimensions)?;
+    let target_width = i32::try_from(target_width).map_err(|_| RenderError::InvalidDimensions)?;
+    let target_height = i32::try_from(target_height).map_err(|_| RenderError::InvalidDimensions)?;
+    let framed = embed_frame_linear(&resized, left, top, target_width, target_height, color)?;
+    Ok((framed, scale as f32))
 }
 
 fn apply_white_balance_linear(
@@ -698,6 +866,14 @@ fn apply_contrast_oklab(image: &VipsImage, amount: f32) -> Result<VipsImage, Ren
 
     let adjusted_lightness =
         ops::ifthenelse(&condition, &shadows, &highlights).map_err(vips_error)?;
+    let below = ops::relational_const(&lightness, ops::OperationRelational::Less, &mut [0.0])
+        .map_err(vips_error)?;
+    let above = ops::relational_const(&lightness, ops::OperationRelational::More, &mut [1.0])
+        .map_err(vips_error)?;
+    let adjusted_lightness =
+        ops::ifthenelse(&below, &lightness, &adjusted_lightness).map_err(vips_error)?;
+    let adjusted_lightness =
+        ops::ifthenelse(&above, &lightness, &adjusted_lightness).map_err(vips_error)?;
 
     let adjusted_oklab = ops::bandjoin(&mut [adjusted_lightness, chroma]).map_err(vips_error)?;
     let contrasted = oklab_to_linear_rgb(&adjusted_oklab)?;
@@ -806,10 +982,10 @@ fn white_balance_rgb_matrix(adjustment: WhiteBalance) -> Result<[[f32; 3]; 3], R
     const D65_KELVIN: f64 = 6504.0;
     const MIRED_RANGE: f64 = 120.0;
     const TINT_DUV_RANGE: f64 = 0.02;
-    const BRADFORD: [[f64; 3]; 3] = [
-        [0.8951, 0.2664, -0.1614],
-        [-0.7502, 1.7135, 0.0367],
-        [0.0389, -0.0685, 1.0296],
+    const CAT16: [[f64; 3]; 3] = [
+        [0.401_288, 0.650_173, -0.051_461],
+        [-0.250_268, 1.204_414, 0.045_854],
+        [-0.002_079, 0.048_952, 0.953_127],
     ];
     const RGB_TO_XYZ: [[f64; 3]; 3] = [
         [0.412_456_4, 0.357_576_1, 0.180_437_5],
@@ -833,14 +1009,14 @@ fn white_balance_rgb_matrix(adjustment: WhiteBalance) -> Result<[[f32; 3]; 3], R
     );
     let source_white = xy_to_xyz(D65_XY);
     let target_white = xy_to_xyz(target_xy);
-    let source_cone = matrix_vector(BRADFORD, source_white);
-    let target_cone = matrix_vector(BRADFORD, target_white);
+    let source_cone = matrix_vector(CAT16, source_white);
+    let target_cone = matrix_vector(CAT16, target_white);
     if source_cone
         .into_iter()
         .any(|value| value.abs() < f64::EPSILON)
     {
         return Err(RenderError::Engine(
-            "Bradford source white produced a zero cone response".into(),
+            "CAT16 source white produced a zero cone response".into(),
         ));
     }
     let scale = [
@@ -848,9 +1024,9 @@ fn white_balance_rgb_matrix(adjustment: WhiteBalance) -> Result<[[f32; 3]; 3], R
         [0.0, target_cone[1] / source_cone[1], 0.0],
         [0.0, 0.0, target_cone[2] / source_cone[2]],
     ];
-    let cat_inverse = inverse_3x3(BRADFORD)
-        .ok_or_else(|| RenderError::Engine("Bradford matrix could not be inverted".into()))?;
-    let adaptation = matrix_multiply(matrix_multiply(cat_inverse, scale), BRADFORD);
+    let cat_inverse = inverse_3x3(CAT16)
+        .ok_or_else(|| RenderError::Engine("CAT16 matrix could not be inverted".into()))?;
+    let adaptation = matrix_multiply(matrix_multiply(cat_inverse, scale), CAT16);
     let rgb_matrix = matrix_multiply(matrix_multiply(XYZ_TO_RGB, adaptation), RGB_TO_XYZ);
     Ok(rgb_matrix.map(|row| row.map(|value| value as f32)))
 }
@@ -1221,7 +1397,7 @@ mod tests {
     fn renders_exposure_and_exports_all_supported_formats() {
         let directory = tempfile::tempdir().unwrap();
         let source_path = directory.path().join("source.png");
-        let engine = VipsEngine::new().unwrap();
+        let mut engine = VipsEngine::new().unwrap();
 
         let pixels = [
             64_u8, 32, 16, 255, 128, 64, 32, 128, 255, 128, 64, 255, 32, 16, 8, 255,
@@ -1248,10 +1424,37 @@ mod tests {
         );
         assert_eq!(result.rgba8[3], 255);
         assert_eq!(result.rgba8[7], 128, "exposure must preserve alpha");
+        assert_eq!(engine.preview_pipeline_builds, 1);
+
+        let framed = engine
+            .render_preview(&PreviewRequest {
+                generation: 8,
+                source_path: source_path.clone(),
+                operations: vec![
+                    Operation::Exposure { ev: 1.0 },
+                    Operation::Frame {
+                        width_pct: 10.0,
+                        color: FrameColor::BLACK,
+                    },
+                ],
+                viewport: Viewport::fit(4, 4),
+            })
+            .unwrap();
+        assert_eq!((framed.width, framed.height), (4, 4));
+        assert_eq!(&framed.rgba8[0..4], &[0, 0, 0, 255]);
+        assert_eq!(
+            framed.rgba8[(4 + 2) * 4 + 3],
+            128,
+            "adding an opaque frame must preserve the source alpha channel"
+        );
+        assert_eq!(
+            engine.preview_pipeline_builds, 1,
+            "frame-only previews must reuse the expensive base pipeline"
+        );
 
         let darker = engine
             .render_preview(&PreviewRequest {
-                generation: 8,
+                generation: 9,
                 source_path: source_path.clone(),
                 operations: vec![Operation::Exposure { ev: -1.0 }],
                 viewport: Viewport::fit(2, 2),
@@ -1261,6 +1464,52 @@ mod tests {
             (i16::from(darker.rgba8[0]) - i16::from(expected_srgb_exposure(64, -1.0))).abs() <= 1
         );
         assert_eq!(darker.rgba8[7], 128, "negative EV must preserve alpha");
+        assert_eq!(engine.preview_pipeline_builds, 2);
+
+        let contrasted = engine
+            .render_preview(&PreviewRequest {
+                generation: 10,
+                source_path: source_path.clone(),
+                operations: vec![Operation::Contrast { amount: 100.0 }],
+                viewport: Viewport::fit(2, 2),
+            })
+            .unwrap();
+        assert!(
+            contrasted.rgba8[0] < pixels[0],
+            "positive contrast must darken a dark sample"
+        );
+        assert!(
+            contrasted.rgba8[8] >= pixels[8],
+            "positive contrast must not darken the brightest sample"
+        );
+        assert_eq!(
+            contrasted.rgba8[7], 128,
+            "contrast must preserve the alpha channel"
+        );
+
+        let mut extended_bytes = Vec::new();
+        for value in [-0.1_f32, -0.1, -0.1, 1.1, 1.1, 1.1] {
+            extended_bytes.extend_from_slice(&value.to_ne_bytes());
+        }
+        let extended =
+            VipsImage::new_from_memory_copy(&extended_bytes, 2, 1, 3, ops::BandFormat::Float)
+                .unwrap();
+        let preserved = apply_contrast_oklab(&extended, 100.0).unwrap();
+        let preserved = ops::cast(&preserved, ops::BandFormat::Float).unwrap();
+        let preserved_bytes = preserved.write_to_memory();
+        let preserved_values = preserved_bytes
+            .chunks_exact(size_of::<f32>())
+            .map(|bytes| f32::from_ne_bytes(bytes.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        for (actual, expected) in preserved_values
+            .iter()
+            .zip([-0.1_f32, -0.1, -0.1, 1.1, 1.1, 1.1])
+        {
+            assert!(
+                (*actual - expected).abs() < 2.0e-5,
+                "contrast changed extended-range value {expected} to {actual}"
+            );
+        }
 
         let curve = ToneCurve {
             shadow_input: 0.2,
@@ -1481,7 +1730,7 @@ mod tests {
     }
 
     #[test]
-    fn bradford_white_balance_has_expected_neutral_axis_behavior() {
+    fn cat16_white_balance_has_expected_neutral_axis_behavior() {
         let identity = white_balance_rgb_matrix(WhiteBalance::IDENTITY).unwrap();
         for (row, values) in identity.iter().enumerate() {
             for (column, value) in values.iter().enumerate() {
@@ -1528,9 +1777,86 @@ mod tests {
                 0.212_672_9 * adjusted[0] + 0.715_152_2 * adjusted[1] + 0.072_175 * adjusted[2];
             assert!(
                 (luminance - 0.18).abs() < 2.0e-5,
-                "Bradford must preserve the reference-white luminance, got {luminance}"
+                "CAT16 must preserve the reference-white luminance, got {luminance}"
             );
         }
+    }
+
+    #[test]
+    fn cached_fit_frame_matches_the_full_resolution_reference() {
+        let directory = tempfile::tempdir().unwrap();
+        let source_path = directory.path().join("frame-reference.png");
+        let mut pixels = Vec::with_capacity(120 * 80 * 4);
+        for y in 0..80_u16 {
+            for x in 0..120_u16 {
+                pixels.extend_from_slice(&[
+                    (24 + x * 231 / 119) as u8,
+                    (32 + y * 223 / 79) as u8,
+                    (48 + (x + y) * 207 / 198) as u8,
+                    (80 + x * 175 / 119) as u8,
+                ]);
+            }
+        }
+        let image =
+            VipsImage::new_from_memory_copy(&pixels, 120, 80, 4, ops::BandFormat::Uchar).unwrap();
+        ops::pngsave(&image, source_path.to_str().unwrap()).unwrap();
+
+        let operations = vec![
+            Operation::Exposure { ev: 0.75 },
+            Operation::Frame {
+                width_pct: 20.0,
+                color: FrameColor {
+                    r: 46,
+                    g: 46,
+                    b: 46,
+                },
+            },
+        ];
+        let viewport = Viewport::fit(70, 50);
+        let mut engine = VipsEngine::new().unwrap();
+        let cached = engine
+            .render_preview(&PreviewRequest {
+                generation: 1,
+                source_path: source_path.clone(),
+                operations: operations.clone(),
+                viewport,
+            })
+            .unwrap();
+
+        let source = load_oriented(&source_path).unwrap();
+        let source = to_working_linear(&source, &engine.srgb_profile).unwrap();
+        let adjusted = apply_operations(&source, &operations).unwrap();
+        let (visible, _) = render_viewport(&adjusted, viewport).unwrap();
+        let display = from_working_linear(&visible).unwrap();
+        let rgba = ensure_rgba8(&display).unwrap();
+        let reference = fit_to_canvas(&rgba, viewport).unwrap().write_to_memory();
+
+        assert_eq!(cached.rgba8.len(), reference.len());
+        let differences = cached
+            .rgba8
+            .iter()
+            .zip(reference)
+            .map(|(cached, reference)| cached.abs_diff(reference))
+            .collect::<Vec<_>>();
+        let maximum_difference = differences.iter().copied().max().unwrap();
+        let mean_difference = differences
+            .iter()
+            .map(|difference| u64::from(*difference))
+            .sum::<u64>() as f64
+            / differences.len() as f64;
+        let large_differences = differences
+            .iter()
+            .filter(|difference| **difference > 2)
+            .count();
+        // The optimized preview resizes the photo and frame separately, so a
+        // narrow strip at their boundary uses different interpolation. Keep
+        // the overall preview numerically close to the export-quality path.
+        assert!(
+            maximum_difference <= 64
+                && mean_difference <= 2.0
+                && large_differences <= differences.len() / 10,
+            "cached frame preview differed from the full-resolution reference by {maximum_difference}; mean {mean_difference}; {large_differences} channels exceeded 2"
+        );
     }
 
     fn apply_test_matrix(matrix: [[f32; 3]; 3], value: [f32; 3]) -> [f32; 3] {

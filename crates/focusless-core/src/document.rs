@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub const PROJECT_SCHEMA_VERSION: u32 = 10;
+pub const PROJECT_SCHEMA_VERSION: u32 = 11;
 pub const MAX_HISTORY_LEN: usize = 200;
 const MIN_CROP_EXTENT: f32 = 0.01;
 const MAX_FRAME_WIDTH_PCT: f32 = 50.0;
@@ -198,7 +198,7 @@ impl ToneCurve {
             && (self.highlight_input - self.highlights).abs() < f32::EPSILON
     }
 
-    /// Samples the Catmull-Rom cubic Hermite curve through the five
+    /// Samples the shape-preserving cubic Hermite curve through the five
     /// control points. Values outside the display-referred 0..=1 interval are
     /// preserved so extended-range linear scRGB data is not destroyed.
     #[must_use]
@@ -214,7 +214,7 @@ impl ToneCurve {
             1.0,
         ];
         let values = [0.0, self.shadows, self.midtones, self.highlights, 1.0];
-        let tangents = catmull_rom_tangents(inputs, values);
+        let tangents = shape_preserving_tangents(inputs, values);
         let segment = (0..4)
             .find(|&segment| x <= inputs[segment + 1])
             .unwrap_or(3);
@@ -239,20 +239,48 @@ impl Default for ToneCurve {
     }
 }
 
-fn catmull_rom_tangents(inputs: [f32; 5], values: [f32; 5]) -> [f32; 5] {
-    let mut tangents = [0.0; 5];
-
-    // First point (forward difference)
-    tangents[0] = (values[1] - values[0]) / (inputs[1] - inputs[0]);
-
-    // Interior points (central difference)
-    for k in 1..4 {
-        tangents[k] = (values[k + 1] - values[k - 1]) / (inputs[k + 1] - inputs[k - 1]);
+fn shape_preserving_tangents(inputs: [f32; 5], values: [f32; 5]) -> [f32; 5] {
+    let intervals = [
+        inputs[1] - inputs[0],
+        inputs[2] - inputs[1],
+        inputs[3] - inputs[2],
+        inputs[4] - inputs[3],
+    ];
+    let slopes = [
+        (values[1] - values[0]) / intervals[0],
+        (values[2] - values[1]) / intervals[1],
+        (values[3] - values[2]) / intervals[2],
+        (values[4] - values[3]) / intervals[3],
+    ];
+    let mut tangents = [slopes[0], 0.0, 0.0, 0.0, slopes[3]];
+    for point in 1..4 {
+        let before = slopes[point - 1];
+        let after = slopes[point];
+        tangents[point] = if before * after <= 0.0 {
+            0.0
+        } else {
+            let before_interval = intervals[point - 1];
+            let after_interval = intervals[point];
+            let before_weight = 2.0 * after_interval + before_interval;
+            let after_weight = after_interval + 2.0 * before_interval;
+            (before_weight + after_weight) / (before_weight / before + after_weight / after)
+        };
     }
-
-    // Last point (backward difference)
-    tangents[4] = (values[4] - values[3]) / (inputs[4] - inputs[3]);
-
+    for segment in 0..4 {
+        if slopes[segment].abs() < f32::EPSILON {
+            tangents[segment] = 0.0;
+            tangents[segment + 1] = 0.0;
+            continue;
+        }
+        let a = tangents[segment] / slopes[segment];
+        let b = tangents[segment + 1] / slopes[segment];
+        let magnitude = a * a + b * b;
+        if magnitude > 9.0 {
+            let scale = 3.0 / magnitude.sqrt();
+            tangents[segment] = scale * a * slopes[segment];
+            tangents[segment + 1] = scale * b * slopes[segment];
+        }
+    }
     tangents
 }
 
@@ -1445,17 +1473,33 @@ mod tests {
     }
 
     #[test]
-    fn schema_v9_migrates_to_v10_with_neutral_frame() {
+    fn schema_v9_migrates_with_neutral_frame() {
         let mut document = document();
         document.schema_version = 9;
-        // Remove Frame operation to simulate v9 project
+        // Remove the Frame operation to simulate a v9 project.
         document
             .operations
             .retain(|op| !matches!(op, Operation::Frame { .. }));
         document.upgrade_to_latest().unwrap();
-        assert_eq!(document.schema_version, 10);
+        assert_eq!(document.schema_version, PROJECT_SCHEMA_VERSION);
         let (width_pct, color) = document.frame();
         assert_eq!(width_pct, 0.0);
         assert_eq!(color, FrameColor::WHITE);
+    }
+
+    #[test]
+    fn schema_v10_migrates_to_cat16_semantics_without_changing_parameters() {
+        let mut document = document();
+        let adjustment = WhiteBalance {
+            temperature: 37.0,
+            tint: -12.0,
+        };
+        document.schema_version = 10;
+        document.preview_white_balance(adjustment).unwrap();
+
+        document.upgrade_to_latest().unwrap();
+
+        assert_eq!(document.schema_version, PROJECT_SCHEMA_VERSION);
+        assert_eq!(document.white_balance(), adjustment);
     }
 }

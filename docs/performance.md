@@ -30,3 +30,34 @@ memory. This run produced approximately 572 MiB of filesystem writes, a
 deliberate tradeoff for controlled RAM usage. Future measurements with real
 photos should track preview latency, disk writes, and close-zoom tile behavior
 together.
+
+## 100 MP frame interaction
+
+Measured on July 31, 2026, on Windows 11 Pro with 31.2 GiB RAM, an AMD Ryzen 7
+6800H, and libvips 8.18.2. Values are medians from three release-mode runs:
+
+- Source: synthetic `10000 × 10000` JPEG, 100 MP
+- Base operation: `+0.75 EV`
+- Output viewport: `1920 × 1080` RGBA8
+- Initial preview render time: `942 ms`
+- Frame-only preview render time: `34 ms`
+- Whole two-preview process wall time: `1.136 s`
+- Peak resident memory: `502.7 MiB`
+- Previous frame-only path median: approximately `746 ms`
+- Frame-only latency reduction: approximately `95%` (`21.9×` faster)
+
+The optimized fit-preview path materializes the frame-independent, linear
+viewport image. Frame slider updates reuse those pixels, resize the photo to
+the exact framed fit geometry, and composite the frame in linear light.
+Full-resolution export continues to render the canonical pipeline from the
+source.
+
+Reproduce the measurement in PowerShell:
+
+```powershell
+.\.local\windows\libvips\bin\vips.exe black `
+  .local\focusless-bench-100mp.jpg 10000 10000 --bands 3
+cargo build -p focusless-engine-vips --example preview_bench --release --locked
+.\target\release\examples\preview_bench.exe `
+  .local\focusless-bench-100mp.jpg --frame-sequence
+```

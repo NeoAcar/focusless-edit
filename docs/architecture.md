@@ -33,8 +33,9 @@ The workspace contains four production crates:
 1. The UI changes an adjustment or the viewport.
 2. The controller creates a `PreviewRequest` with an increasing `generation`.
 3. Only the newest request that has not started reaches the libvips worker.
-4. The worker computes only the visible source region at the requested screen
-   dimensions.
+4. For fit previews, the worker materializes the frame-independent linear
+   viewport image. Frame-only changes reuse those pixels; other edits compute
+   the visible source region at the requested screen dimensions.
 5. An RGBA8 pixel buffer returns to the UI thread.
 6. The controller displays the result only when its generation is still the
    newest.
@@ -47,7 +48,7 @@ CPU pool for image computation.
 
 `ProjectDocument` persists:
 
-- Schema version (currently version 8; version 1–7 projects migrate on load)
+- Schema version (currently version 11; version 1–10 projects migrate on load)
 - Source photo path and sampled BLAKE3 fingerprint
 - Ordered non-destructive operation list
 - Zoom and normalized center coordinates
@@ -60,11 +61,12 @@ synchronization cannot block the UI.
 
 Geometry and tonal operations use a stable render order: EXIF orientation,
 ICC conversion to the working space, quarter-turn rotation, normalized crop,
-white balance, exposure, the tone curve, then saturation. A crop rectangle is
-stored as normalized coordinates so it remains independent of source
-resolution. Sharpness runs last, before preview resizing or output conversion.
-Rotating an existing crop transforms the rectangle with the image and records
-both changes as one undoable command.
+white balance, exposure, contrast, the tone curve, then saturation. A crop
+rectangle is stored as normalized coordinates so it remains independent of
+source resolution. Sharpness follows the tonal operations, and the frame is
+added last before preview resizing or output conversion. Rotating an existing
+crop transforms the rectangle with the image and records both changes as one
+undoable command.
 
 The color pipeline converts an embedded source profile to sRGB with LittleCMS,
 using relative colorimetric intent and black-point compensation. An untagged
@@ -90,6 +92,11 @@ limiting prevents interpolation overshoot. The renderer applies a 16-bit
 lookup table to the linear RGB channels, preserves alpha, and leaves
 extended-range values outside `0..1` unchanged.
 
+Contrast applies a symmetric power curve around `0.5` to OKLab lightness. The
+`-100..+100` control ranges from a constant mid-gray lightness through identity
+to stronger separation of shadows and highlights. OKLab chroma, alpha, and
+extended-range lightness values outside `0..1` remain unchanged.
+
 Saturation converts linear sRGB to OKLab, scales only the `a` and `b` chroma
 axes, then converts back to linear sRGB. The `-100..+100` control maps to a
 `0..2` chroma multiplier, so `-100` is neutral gray, `0` is identity, and
@@ -101,6 +108,13 @@ Sharpness applies a full-resolution unsharp mask only to OKLab lightness:
 `0..3` gain. Detail below a fixed `0.003` OKLab-lightness threshold is left
 unchanged to avoid amplifying low-level noise. Chroma and alpha remain
 separate, which prevents colored sharpening halos.
+
+The frame width is a percentage of the shorter cropped image dimension. Its
+sRGB color preset is decoded to linear light before an opaque border is added
+after sharpening. Preview rendering caches the frame-independent libvips
+pipeline and materialized fit-preview pixels, so changing frame width or color
+does not repeat source decoding, ICC conversion, or the tonal operations.
+Export still evaluates the complete full-resolution pipeline.
 
 Crop editing temporarily renders the complete rotated photo and draws the
 interactive frame in Slint. Apply creates one history command; Cancel restores
