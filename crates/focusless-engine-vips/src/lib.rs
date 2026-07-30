@@ -4,6 +4,8 @@
 //! This keeps the UI responsive and respects the Rust binding's thread-safety
 //! constraints while libvips still uses its own internal worker pool.
 
+mod vips_compat;
+
 use std::{
     env, fs,
     mem::size_of,
@@ -20,8 +22,8 @@ use focusless_core::{
     CropRect, ExportFormat, ExportRequest, Operation, PreviewRequest, RenderError, RenderResult,
     ToneCurve, Viewport, WhiteBalance,
 };
-use libvips::{VipsApp, VipsImage, ops};
 use tracing::{debug, error};
+use vips_compat::{VipsApp, VipsError, VipsImage, ops};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ImageInfo {
@@ -206,7 +208,7 @@ impl VipsEngine {
         let rgba = ensure_rgba8(&display)?;
         let canvas = fit_to_canvas(&rgba, request.viewport)?;
         let info = dimensions(&canvas)?;
-        let rgba8 = canvas.image_write_to_memory();
+        let rgba8 = canvas.write_to_memory();
         let expected_len = info.width as usize * info.height as usize * 4;
         if rgba8.len() != expected_len {
             return Err(RenderError::Engine(format!(
@@ -238,6 +240,7 @@ impl VipsEngine {
             fs::remove_file(&temporary)?;
         }
         let temporary_str = path_string(&temporary)?;
+        let profile = profile_string(&self.srgb_profile)?;
 
         let result = match request.format {
             ExportFormat::Jpeg { quality } => {
@@ -245,44 +248,29 @@ impl VipsEngine {
                     &adjusted,
                     &ops::FlattenOptions {
                         background: vec![255.0, 255.0, 255.0],
-                        ..Default::default()
                     },
                 )
                 .map_err(vips_error)?;
-                ops::jpegsave_with_opts(
-                    &flattened,
-                    &temporary_str,
-                    &ops::JpegsaveOptions {
-                        q: i32::from(quality.clamp(1, 100)),
-                        optimize_coding: true,
-                        interlace: true,
-                        keep: ops::ForeignKeep::None,
-                        profile: Some(profile_string(&self.srgb_profile)?),
-                        ..Default::default()
-                    },
-                )
+                flattened.write_to_file(format!(
+                    "{temporary_str}[Q={},optimize-coding=true,interlace=true,keep=none,profile={profile}]",
+                    quality.clamp(1, 100)
+                ))
             }
-            ExportFormat::Png => ops::pngsave_with_opts(
-                &adjusted,
-                &temporary_str,
-                &ops::PngsaveOptions {
-                    compression: 6,
-                    keep: ops::ForeignKeep::None,
-                    profile: Some(profile_string(&self.srgb_profile)?),
-                    ..Default::default()
-                },
-            ),
-            // The generated Rust options target a newer libvips than Ubuntu
-            // 24.04 and include fields 8.15 does not know. Filename options
-            // let libvips negotiate the supported WebP surface itself.
-            ExportFormat::WebP { quality } => adjusted.image_write_to_file(&format!(
-                "{temporary_str}[Q={},keep=none,profile={}]",
+            ExportFormat::Png => adjusted.write_to_file(format!(
+                "{temporary_str}[compression=6,keep=none,profile={profile}]"
+            )),
+            // Filename options let each installed libvips version negotiate
+            // the supported WebP saver surface itself.
+            ExportFormat::WebP { quality } => adjusted.write_to_file(format!(
+                "{temporary_str}[Q={},keep=none,profile={profile}]",
                 quality.clamp(1, 100),
-                profile_string(&self.srgb_profile)?
             )),
         };
         if let Err(error) = result {
-            let detail = self.app.error_buffer().unwrap_or("no libvips details");
+            let detail = self
+                .app
+                .error_buffer()
+                .unwrap_or_else(|_| "no libvips details".into());
             let message = format!("{error}: {}", detail.trim());
             self.app.error_clear();
             let _ = fs::remove_file(&temporary);
@@ -293,13 +281,15 @@ impl VipsEngine {
             let _ = fs::remove_file(&temporary);
             return Err(RenderError::Cancelled);
         }
-        fs::rename(&temporary, &request.destination_path)?;
+        replace_file(&temporary, &request.destination_path)?;
         Ok(())
     }
 
     #[allow(dead_code)]
-    fn version(&self) -> &str {
-        self.app.version_string().unwrap_or("unknown")
+    fn version(&self) -> String {
+        self.app
+            .version_string()
+            .unwrap_or_else(|_| "unknown".into())
     }
 }
 
@@ -310,26 +300,59 @@ fn load_oriented(path: &Path) -> Result<VipsImage, RenderError> {
 }
 
 fn resolve_srgb_profile() -> Result<PathBuf, RenderError> {
-    let override_path = env::var_os("FOCUSLESS_SRGB_PROFILE").map(PathBuf::from);
-    let candidates = override_path.into_iter().chain(
-        [
-            "/usr/share/color/icc/sRGB.icc",
-            "/usr/share/color/icc/ghostscript/srgb.icc",
-            "/usr/share/color/icc/colord/sRGB.icc",
-        ]
-        .into_iter()
-        .map(PathBuf::from),
-    );
-    candidates
+    srgb_profile_candidates()
         .into_iter()
         .find(|path| path.is_file())
         .ok_or_else(|| {
             RenderError::Engine(
-                "an sRGB ICC profile is required; install icc-profiles-free or set \
-                 FOCUSLESS_SRGB_PROFILE"
+                "an sRGB ICC profile is required; set FOCUSLESS_SRGB_PROFILE or provide the \
+                 standard sRGB profile for this operating system"
                     .into(),
             )
         })
+}
+
+fn srgb_profile_candidates() -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(path) = env::var_os("FOCUSLESS_SRGB_PROFILE") {
+        candidates.push(PathBuf::from(path));
+    }
+    if let Some(executable_directory) = env::current_exe()
+        .ok()
+        .and_then(|executable| executable.parent().map(Path::to_path_buf))
+    {
+        candidates.push(executable_directory.join("sRGB Color Space Profile.icm"));
+        candidates.push(executable_directory.join("sRGB.icc"));
+    }
+    candidates.extend(platform_srgb_profile_candidates());
+    candidates
+}
+
+#[cfg(target_os = "windows")]
+fn platform_srgb_profile_candidates() -> Vec<PathBuf> {
+    env::var_os("SystemRoot")
+        .map(PathBuf::from)
+        .into_iter()
+        .map(|root| {
+            root.join("System32")
+                .join("spool")
+                .join("drivers")
+                .join("color")
+                .join("sRGB Color Space Profile.icm")
+        })
+        .collect()
+}
+
+#[cfg(not(target_os = "windows"))]
+fn platform_srgb_profile_candidates() -> Vec<PathBuf> {
+    [
+        "/usr/share/color/icc/sRGB.icc",
+        "/usr/share/color/icc/ghostscript/srgb.icc",
+        "/usr/share/color/icc/colord/sRGB.icc",
+    ]
+    .into_iter()
+    .map(PathBuf::from)
+    .collect()
 }
 
 fn profile_string(path: &Path) -> Result<String, RenderError> {
@@ -339,7 +362,7 @@ fn profile_string(path: &Path) -> Result<String, RenderError> {
 }
 
 fn to_working_linear(image: &VipsImage, srgb_profile: &Path) -> Result<VipsImage, RenderError> {
-    let has_alpha = image.image_hasalpha();
+    let has_alpha = image.hasalpha();
     let bands = image.get_bands();
     let color_bands = if has_alpha { bands - 1 } else { bands };
     let color = if has_alpha {
@@ -373,7 +396,6 @@ fn to_working_linear(image: &VipsImage, srgb_profile: &Path) -> Result<VipsImage
             embedded: true,
             input_profile: Some(profile.clone()),
             depth: 16,
-            ..Default::default()
         },
     )
     .map_err(vips_error)?;
@@ -386,7 +408,7 @@ fn to_working_linear(image: &VipsImage, srgb_profile: &Path) -> Result<VipsImage
 }
 
 fn from_working_linear(image: &VipsImage) -> Result<VipsImage, RenderError> {
-    let has_alpha = image.image_hasalpha();
+    let has_alpha = image.hasalpha();
     let bands = image.get_bands();
     let color = if has_alpha {
         ops::extract_band_with_opts(image, 0, &ops::ExtractBandOptions { n: bands - 1 })
@@ -522,7 +544,7 @@ fn apply_white_balance_linear(
     adjustment: WhiteBalance,
 ) -> Result<VipsImage, RenderError> {
     let bands = image.get_bands();
-    let has_alpha = image.image_hasalpha();
+    let has_alpha = image.hasalpha();
     let color = if has_alpha {
         ops::extract_band_with_opts(image, 0, &ops::ExtractBandOptions { n: bands - 1 })
             .map_err(vips_error)?
@@ -617,7 +639,7 @@ fn split_color_and_alpha(
     operation_name: &str,
 ) -> Result<(VipsImage, Option<VipsImage>), RenderError> {
     let bands = image.get_bands();
-    let has_alpha = image.image_hasalpha();
+    let has_alpha = image.hasalpha();
     let color = if has_alpha {
         ops::extract_band_with_opts(image, 0, &ops::ExtractBandOptions { n: bands - 1 })
             .map_err(vips_error)?
@@ -856,7 +878,7 @@ fn crop_image(image: &VipsImage, crop: CropRect) -> Result<VipsImage, RenderErro
 fn apply_exposure_linear(image: &VipsImage, ev: f32) -> Result<VipsImage, RenderError> {
     let factor = 2_f64.powf(f64::from(ev));
     let bands = image.get_bands();
-    let has_alpha = image.image_hasalpha();
+    let has_alpha = image.hasalpha();
     if has_alpha {
         let color =
             ops::extract_band_with_opts(image, 0, &ops::ExtractBandOptions { n: bands - 1 })
@@ -871,7 +893,7 @@ fn apply_exposure_linear(image: &VipsImage, ev: f32) -> Result<VipsImage, Render
 
 fn apply_tone_curve_linear(image: &VipsImage, curve: ToneCurve) -> Result<VipsImage, RenderError> {
     let bands = image.get_bands();
-    let has_alpha = image.image_hasalpha();
+    let has_alpha = image.hasalpha();
     let color = if has_alpha {
         ops::extract_band_with_opts(image, 0, &ops::ExtractBandOptions { n: bands - 1 })
             .map_err(vips_error)?
@@ -1053,7 +1075,43 @@ fn export_temporary_path(destination: &Path) -> PathBuf {
     destination.with_file_name(name)
 }
 
-fn vips_error(error: libvips::error::Error) -> RenderError {
+#[cfg(not(target_os = "windows"))]
+fn replace_file(source: &Path, destination: &Path) -> std::io::Result<()> {
+    fs::rename(source, destination)
+}
+
+#[cfg(target_os = "windows")]
+fn replace_file(source: &Path, destination: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    };
+
+    let source = source
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let destination = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let result = unsafe {
+        MoveFileExW(
+            source.as_ptr(),
+            destination.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if result == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+fn vips_error(error: VipsError) -> RenderError {
     RenderError::Engine(error.to_string())
 }
 
@@ -1216,7 +1274,7 @@ mod tests {
             assert!(destination.metadata().unwrap().len() > 0);
             let exported = VipsImage::new_from_file(destination.to_str().unwrap()).unwrap();
             assert!(
-                exported.get_as_string("icc-profile-data").is_ok(),
+                exported.get_blob("icc-profile-data").is_ok(),
                 "exports must include the sRGB ICC profile"
             );
             assert_eq!(
@@ -1227,6 +1285,25 @@ mod tests {
                 }
             );
         }
+
+        let replacement = directory.path().join("out.png");
+        let previous_bytes = fs::read(&replacement).unwrap();
+        engine
+            .export(
+                &ExportRequest {
+                    source_path: source_path.clone(),
+                    destination_path: replacement.clone(),
+                    operations: vec![Operation::Exposure { ev: -0.5 }],
+                    format: ExportFormat::Png,
+                },
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+        assert_ne!(
+            fs::read(&replacement).unwrap(),
+            previous_bytes,
+            "exporting over an existing destination must replace its bytes"
+        );
 
         let source_path = directory.path().join("geometry.png");
         let pixels = vec![128_u8; 4 * 2 * 4];

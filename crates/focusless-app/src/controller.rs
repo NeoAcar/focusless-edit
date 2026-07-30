@@ -1725,10 +1725,13 @@ fn has_extension(path: &Path, expected: &str) -> bool {
         .is_some_and(|extension| extension.eq_ignore_ascii_case(expected))
 }
 
+#[cfg(not(target_os = "linux"))]
 fn file_dialog_backend_available() -> bool {
-    if !cfg!(target_os = "linux") {
-        return true;
-    }
+    true
+}
+
+#[cfg(target_os = "linux")]
+fn file_dialog_backend_available() -> bool {
     let zenity_available = std::env::var_os("PATH").is_some_and(|path| {
         std::env::split_paths(&path).any(|directory| directory.join("zenity").is_file())
     });

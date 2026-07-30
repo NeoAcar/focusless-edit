@@ -6,12 +6,17 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-blake3.workspace = true
 focusless-core = { path = "../focusless-core" }
 pathdiff.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 
+[target.'cfg(not(target_os = "windows"))'.dependencies]
+blake3.workspace = true
+
+[target.'cfg(target_os = "windows")'.dependencies]
+blake3 = { workspace = true, features = ["pure"] }
+windows-sys = { workspace = true, features = ["Win32_Storage_FileSystem"] }
+
 [dev-dependencies]
 tempfile.workspace = true
-

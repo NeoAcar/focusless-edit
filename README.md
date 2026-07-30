@@ -30,7 +30,8 @@ RAW files, layers, masks, and photo catalogs are not implemented yet.
 - [libvips](https://www.libvips.org/) image engine
 - LittleCMS-backed ICC color management with a 32-bit float linear scRGB
   working space
-- Linux-first runtime with X11 and Wayland support
+- Native Linux runtime with X11 and Wayland support
+- Native Windows x64 runtime and portable packaging
 
 The UI, document model, persistence, and image engine live in separate crates.
 See the [architecture document](docs/architecture.md) for details and the
@@ -39,6 +40,9 @@ See the [architecture document](docs/architecture.md) for details and the
 New developers and AI collaborators should follow the complete
 [development setup and handoff guide](docs/development-setup.md). Repository
 rules for coding agents are in [AGENTS.md](AGENTS.md).
+
+Native Windows development, release builds, and portable packages are covered
+in the [Windows guide](docs/windows.md).
 
 ## Ubuntu 24.04 setup
 
@@ -67,6 +71,23 @@ cd focusless-edit
 cargo test --workspace --locked
 cargo build --workspace --release --locked
 ```
+
+## Windows x64 setup
+
+Install Git, Rustup, and Visual Studio Build Tools with the **Desktop
+development with C++** workload. Then run from a native PowerShell window:
+
+```powershell
+git clone https://github.com/NeoAcar/focusless-edit.git
+Set-Location focusless-edit
+.\scripts\windows\build.ps1 -Package
+```
+
+The script downloads and verifies the pinned official libvips runtime, runs
+the quality gate, builds the native application, and creates
+`dist\Focusless-Edit-windows-x64.zip`. See the
+[complete Windows guide](docs/windows.md) for development and
+troubleshooting.
 
 ## Run
 
@@ -124,9 +145,10 @@ shape-preserving interpolation, and a live full-image preview.
 
 ```bash
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
-cargo build --workspace --release
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --locked
+cargo build --workspace --release --locked
+git diff --check
 ```
 
 Before contributing, read [CONTRIBUTING.md](CONTRIBUTING.md) and the

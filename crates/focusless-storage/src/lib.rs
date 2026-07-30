@@ -137,7 +137,7 @@ pub fn save_project(path: &Path, document: &ProjectDocument) -> Result<(), Stora
         })?;
     drop(temporary);
 
-    fs::rename(&temporary_path, path).map_err(|source| StorageError::Io {
+    replace_file(&temporary_path, path).map_err(|source| StorageError::Io {
         path: path.to_path_buf(),
         source,
     })?;
@@ -199,6 +199,43 @@ fn temporary_path_for(path: &Path) -> PathBuf {
     path.with_file_name(name)
 }
 
+#[cfg(not(target_os = "windows"))]
+fn replace_file(source: &Path, destination: &Path) -> std::io::Result<()> {
+    fs::rename(source, destination)
+}
+
+#[cfg(target_os = "windows")]
+fn replace_file(source: &Path, destination: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    };
+
+    let source = source
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let destination = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let result = unsafe {
+        MoveFileExW(
+            source.as_ptr(),
+            destination.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if result == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
 fn sync_directory(path: &Path) -> Result<(), StorageError> {
     let directory = File::open(path).map_err(|source| StorageError::Io {
         path: path.to_path_buf(),
@@ -210,10 +247,17 @@ fn sync_directory(path: &Path) -> Result<(), StorageError> {
     })
 }
 
+#[cfg(target_os = "windows")]
+fn sync_directory(_path: &Path) -> Result<(), StorageError> {
+    // MOVEFILE_WRITE_THROUGH flushes the replacement before returning. Opening
+    // directories for sync requires Windows-specific backup semantics.
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use focusless_core::{Operation, ViewState};
+    use focusless_core::Operation;
     use tempfile::tempdir;
 
     fn source(path: PathBuf) -> SourceReference {
@@ -234,14 +278,18 @@ mod tests {
         let directory = tempdir().unwrap();
         let image_path = directory.path().join("image.jpg");
         let project_path = directory.path().join("edit.focusless");
-        let document = ProjectDocument::new(source(image_path.clone()));
+        let mut document = ProjectDocument::new(source(image_path.clone()));
 
         save_project(&project_path, &document).unwrap();
         let raw = fs::read_to_string(&project_path).unwrap();
         assert!(raw.contains("\"path\": \"image.jpg\""));
 
+        document.view.zoom = 2.0;
+        save_project(&project_path, &document).unwrap();
+
         let restored = load_project(&project_path).unwrap();
         assert_eq!(restored.source.path, image_path);
+        assert_eq!(restored.view.zoom, 2.0);
         assert_eq!(
             restored.operations,
             vec![
@@ -260,7 +308,6 @@ mod tests {
                 Operation::Sharpness { amount: 0.0 },
             ]
         );
-        assert_eq!(restored.view, ViewState::default());
     }
 
     #[test]

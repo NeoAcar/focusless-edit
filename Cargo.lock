@@ -1330,10 +1330,11 @@ version = "0.1.0"
 dependencies = [
  "crossbeam-channel",
  "focusless-core",
- "libvips",
+ "rs-vips",
  "tempfile",
  "thiserror 2.0.19",
  "tracing",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -1346,6 +1347,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror 2.0.19",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -2592,16 +2594,6 @@ checksum = "3c8469b4a23b962c1396b9b451dda50ef5b283e8dd309d69033475fa9b334324"
 dependencies = [
  "libc",
  "pkg-config",
-]
-
-[[package]]
-name = "libvips"
-version = "2.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "29c2daabf7114fd6e626fef46e3ba187d204554cf94d31312424300bd8160d9b"
-dependencies = [
- "num-derive",
- "num-traits",
 ]
 
 [[package]]
@@ -4046,6 +4038,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f1964b10c76125c36f8afe190065a4bf9a87bf324842c05701330bba9f1cacbb"
 dependencies = [
  "memchr",
+]
+
+[[package]]
+name = "rs-vips"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "52bff86a769bb29a4a68a54ca68dfb8e713aa5e6c6a380d26d6878393007528c"
+dependencies = [
+ "num-derive",
+ "num-traits",
 ]
 
 [[package]]

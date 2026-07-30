@@ -37,10 +37,62 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Lint
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       - name: Test
         run: cargo test --workspace --locked
 
       - name: Build release
         run: cargo build --workspace --release --locked
+
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        shell: pwsh
+        run: |
+          rustup toolchain install 1.97.1 `
+            --profile minimal `
+            --component clippy `
+            --component rustfmt
+          rustup default 1.97.1
+
+      - name: Prepare libvips
+        shell: pwsh
+        run: |
+          $vips = & .\scripts\windows\bootstrap-libvips.ps1
+          "FOCUSLESS_VIPS_DIR=$vips" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "$vips\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          $libraryPath = "$vips\lib"
+          if ($env:LIB) {
+            $libraryPath = "$libraryPath;$env:LIB"
+          }
+          "LIB=$libraryPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Lint
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace --locked
+
+      - name: Build release
+        run: cargo build --workspace --release --locked
+
+      - name: Create portable package
+        shell: pwsh
+        run: .\scripts\windows\package.ps1 -SkipBuild
+
+      - name: Upload portable package
+        uses: actions/upload-artifact@v4
+        with:
+          name: Focusless-Edit-windows-x64
+          path: dist/Focusless-Edit-windows-x64.zip
+          if-no-files-found: error

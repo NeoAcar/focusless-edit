@@ -1,4 +1,6 @@
 /target/
+/.local/
+/dist/
 /.idea/
 /.vscode/
 *.focusless.tmp

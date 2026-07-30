@@ -17,12 +17,17 @@ directories.workspace = true
 focusless-core = { path = "../focusless-core" }
 focusless-engine-vips = { path = "../focusless-engine-vips" }
 focusless-storage = { path = "../focusless-storage" }
-rfd.workspace = true
 slint.workspace = true
-tokio.workspace = true
 tracing.workspace = true
 tracing-appender.workspace = true
 tracing-subscriber.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+rfd = { workspace = true, features = ["tokio", "xdg-portal"] }
+tokio.workspace = true
+
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+rfd.workspace = true
 
 [build-dependencies]
 slint-build = "1.17.1"

@@ -1,3 +1,5 @@
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
+
 mod controller;
 mod storage_worker;
 
@@ -16,10 +18,12 @@ slint::include_modules!();
 fn main() -> Result<()> {
     // The XDG portal backend used by the native Linux file dialogs performs
     // D-Bus work asynchronously. Keep its executor alive for the full UI run.
+    #[cfg(target_os = "linux")]
     let portal_runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .context("could not start the Linux portal runtime")?;
+    #[cfg(target_os = "linux")]
     let _portal_runtime_guard = portal_runtime.enter();
 
     let (project_dirs, _log_guard) = initialize_logging()?;

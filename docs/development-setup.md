@@ -1,8 +1,10 @@
 # Development setup and handoff
 
 This guide takes a new Ubuntu or WSL2 developer from an empty machine to a
-tested release build. Ubuntu 24.04 is the reference environment. WSL2 requires
-WSLg or another working X11/Wayland display server to show the desktop UI.
+tested release build. Ubuntu 24.04 is the Linux reference environment. WSL2
+requires WSLg or another working X11/Wayland display server to show the
+desktop UI. For a native Windows build, follow
+[the Windows development and packaging guide](windows.md).
 
 ## 1. Install native dependencies
 
@@ -102,8 +104,8 @@ cargo build --workspace --release --locked
 git diff --check
 ```
 
-CI runs the same formatting, lint, test, and release-build checks on Ubuntu
-24.04.
+CI runs formatting, lint, tests, and release builds on Ubuntu 24.04 and native
+Windows x64. The Windows job also creates the portable package artifact.
 
 ## 6. Logs and recovery
 

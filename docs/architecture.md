@@ -114,7 +114,14 @@ the original rectangle without modifying history or autosave state.
 - libvips pool: distributes tile and scanline computation across CPU cores.
 - Storage worker: serializes project writes and retains only the newest queued
   autosave snapshot.
-- Tokio runtime: supports the XDG portal file dialog's D-Bus operations.
+- Linux-only Tokio runtime: supports the XDG portal file dialog's D-Bus
+  operations.
+
+Windows uses `rfd`'s native Win32 dialogs. Official libvips runtime DLLs are
+kept beside the packaged executable, while development shells add the pinned
+bundle's `bin` and `lib` directories to the process environment. Project saves
+and exports use Windows replacement semantics so overwriting an existing
+destination remains atomic and durable.
 
 The renderer boundary uses core request/result contracts, so a GPU backend can
 be added later if measurements justify it.

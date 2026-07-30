@@ -2,7 +2,8 @@
 
 ## Getting started
 
-1. Install the Ubuntu dependencies listed in the README.
+1. Install the Linux dependencies or Windows prerequisites listed in the
+   README.
 2. Read [the development setup guide](docs/development-setup.md).
 3. Run `cargo test --workspace --locked`.
 4. Make the change in a small, single-purpose branch.
@@ -27,8 +28,10 @@
 
 ```bash
 cargo fmt --all
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --locked
+cargo build --workspace --release --locked
+git diff --check
 ```
 
 For performance-related changes, include the image dimensions, peak memory,
