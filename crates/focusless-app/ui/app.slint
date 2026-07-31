@@ -88,6 +88,7 @@ export component AppWindow inherits Window {
     in-out property <float> exposure: 0;
     in-out property <float> contrast: 0;
     in-out property <float> rotation-angle: 0;
+    in-out property <bool> rotation-mode: false;
     in-out property <float> crop-x: 0;
     in-out property <float> crop-y: 0;
     in-out property <float> crop-width: 1;
@@ -210,7 +211,10 @@ export component AppWindow inherits Window {
 
                 ActionButton {
                     text: "Import";
-                    clicked => { root.open-requested(); }
+                    clicked => {
+                        root.rotation-mode = false;
+                        root.open-requested();
+                    }
                 }
                 ActionButton {
                     text: "Save";
@@ -226,7 +230,10 @@ export component AppWindow inherits Window {
                     text: "Restore Original";
                     min-width: 112px;
                     enabled: root.document-loaded && !root.crop-mode && !root.curve-mode;
-                    clicked => { root.restore-original-requested(); }
+                    clicked => {
+                        root.rotation-mode = false;
+                        root.restore-original-requested();
+                    }
                 }
                 Divider {}
                 ActionButton {
@@ -317,7 +324,10 @@ export component AppWindow inherits Window {
                         ActionButton {
                             text: "Import Photo";
                             primary: true;
-                            clicked => { root.open-requested(); }
+                            clicked => {
+                                root.rotation-mode = false;
+                                root.open-requested();
+                            }
                         }
                     }
 
@@ -744,7 +754,8 @@ export component AppWindow inherits Window {
                 }
             }
 
-                if root.document-loaded: Rectangle {
+                if root.document-loaded && root.rotation-mode
+                    && !root.crop-mode && !root.curve-mode: Rectangle {
                     height: 68px;
                     background: #171a1f;
                     border-width: 0px;
@@ -1088,7 +1099,10 @@ export component AppWindow inherits Window {
                     if !root.curve-mode: ActionButton {
                         text: "Edit Tone Curve";
                         enabled: root.document-loaded && !root.crop-mode;
-                        clicked => { root.curve-requested(); }
+                        clicked => {
+                            root.rotation-mode = false;
+                            root.curve-requested();
+                        }
                     }
 
                     if root.curve-mode: HorizontalLayout {
@@ -1225,6 +1239,13 @@ export component AppWindow inherits Window {
                         }
                     }
 
+                    ActionButton {
+                        text: root.rotation-mode ? "Done" : "Rotate";
+                        selected: root.rotation-mode;
+                        enabled: root.document-loaded && !root.crop-mode && !root.curve-mode;
+                        clicked => { root.rotation-mode = !root.rotation-mode; }
+                    }
+
                     HorizontalLayout {
                         spacing: 8px;
                         Text {
@@ -1244,7 +1265,10 @@ export component AppWindow inherits Window {
                     if !root.crop-mode: ActionButton {
                         text: "Crop Photo";
                         enabled: root.document-loaded && !root.curve-mode;
-                        clicked => { root.crop-requested(); }
+                        clicked => {
+                            root.rotation-mode = false;
+                            root.crop-requested();
+                        }
                     }
 
                     if root.crop-mode: HorizontalLayout {
@@ -1527,7 +1551,10 @@ export component AppWindow inherits Window {
 
         KeyBinding {
             keys: @keys(Control + O);
-            activated => { root.open-requested(); }
+            activated => {
+                root.rotation-mode = false;
+                root.open-requested();
+            }
         }
         KeyBinding {
             keys: @keys(Control + S);

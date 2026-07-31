@@ -13,10 +13,10 @@ use focusless_engine_vips::{EngineEvent, EngineWorker};
 
 fn main() -> Result<(), Box<dyn Error>> {
     let mut arguments = env::args_os().skip(1);
-    let source = arguments
-        .next()
-        .map(PathBuf::from)
-        .ok_or("usage: preview_bench <image> [--frame-sequence|--adjustment-sequence]")?;
+    let source = arguments.next().map(PathBuf::from).ok_or(
+        "usage: preview_bench <image> \
+             [--frame-sequence|--adjustment-sequence|--zoom-sequence]",
+    )?;
     let mode = arguments.next();
     let frame_sequence = mode
         .as_deref()
@@ -24,6 +24,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     let adjustment_sequence = mode
         .as_deref()
         .is_some_and(|value| value == "--adjustment-sequence");
+    let zoom_sequence = mode
+        .as_deref()
+        .is_some_and(|value| value == "--zoom-sequence");
     let engine = EngineWorker::start();
     let started = Instant::now();
     engine.request_preview(PreviewRequest {
@@ -125,6 +128,34 @@ fn main() -> Result<(), Box<dyn Error>> {
                 result.width,
                 result.height,
                 feature_started.elapsed().as_millis()
+            );
+        }
+    }
+    if zoom_sequence {
+        for (index, factor) in [1.15_f32, 1.15_f32.powi(2), 1.15_f32.powi(3)]
+            .into_iter()
+            .enumerate()
+        {
+            let zoom_started = Instant::now();
+            engine.request_preview(PreviewRequest {
+                generation: index as u64 + 2,
+                source_path: source.clone(),
+                operations: vec![Operation::Exposure { ev: 0.75 }],
+                viewport: Viewport {
+                    output_width: 1920,
+                    output_height: 1080,
+                    zoom: first.effective_zoom * factor,
+                    center_x: 0.5,
+                    center_y: 0.5,
+                },
+            });
+            let result = wait_for_preview(&engine, zoom_started)?;
+            println!(
+                "zoom_preview={}x fit size={}x{} elapsed_ms={}",
+                factor,
+                result.width,
+                result.height,
+                zoom_started.elapsed().as_millis()
             );
         }
     }

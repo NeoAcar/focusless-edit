@@ -227,8 +227,8 @@ impl VipsEngine {
 
     fn render_preview(&mut self, request: &PreviewRequest) -> Result<RenderResult, RenderError> {
         validate_viewport(request.viewport)?;
-        if request.viewport.zoom <= 0.0 {
-            return self.render_fit_preview(request);
+        if request.viewport.zoom <= 0.0 || self.fit_source_supports(request) {
+            return self.render_source_proxy_preview(request);
         }
         let base_operations = request
             .operations
@@ -273,7 +273,16 @@ impl VipsEngine {
         finalize_preview(request, visible, effective_zoom)
     }
 
-    fn render_fit_preview(
+    fn fit_source_supports(&self, request: &PreviewRequest) -> bool {
+        self.fit_source.as_ref().is_some_and(|source| {
+            source.source_path == request.source_path
+                && source.output_width == request.viewport.output_width
+                && source.output_height == request.viewport.output_height
+                && request.viewport.zoom <= source.source_scale
+        })
+    }
+
+    fn render_source_proxy_preview(
         &mut self,
         request: &PreviewRequest,
     ) -> Result<RenderResult, RenderError> {
@@ -317,7 +326,15 @@ impl VipsEngine {
             .expect("fit-preview source was initialized");
         let adjusted =
             apply_operations_scaled(&source.image, &request.operations, source.source_scale)?;
-        let (visible, proxy_zoom) = render_viewport(&adjusted, request.viewport)?;
+        let proxy_viewport = Viewport {
+            zoom: if request.viewport.zoom <= 0.0 {
+                0.0
+            } else {
+                request.viewport.zoom / source.source_scale
+            },
+            ..request.viewport
+        };
+        let (visible, proxy_zoom) = render_viewport(&adjusted, proxy_viewport)?;
         finalize_preview(request, visible, source.source_scale * proxy_zoom)
     }
 }
