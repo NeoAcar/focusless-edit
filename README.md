@@ -11,6 +11,7 @@ The project currently contains its first working vertical slice:
 - Live Temperature and Tint white-balance adjustment
 - Perceptual Contrast adjustment from `-100` to `+100`
 - Perceptual Saturation adjustment from `-100` to `+100`
+- One-click Matrix-inspired cinematic look
 - Luminance-only Sharpness adjustment from `0` to `300`
 - Live exposure adjustment from `-3 EV` to `+3 EV`
 - Interactive five-point tone curve drawn directly over the photo
@@ -139,7 +140,9 @@ Crop and straighten rotation are stored non-destructively in the project and
 applied to full-resolution exports. Temperature and Tint use CAT16 chromatic
 adaptation in linear RGB and preserve alpha. Contrast reshapes OKLab
 lightness while leaving chroma and extended-range values intact. Saturation scales OKLab
-chroma while preserving perceptual lightness and hue. Sharpness uses a
+chroma while preserving perceptual lightness and hue. The Matrix look retains
+30% chroma and applies smooth green/cyan shadow, green midtone, and yellow
+highlight biases in OKLab. Sharpness uses a
 thresholded unsharp mask on OKLab lightness to avoid color halos. The tone
 curve works in linear RGB with fixed endpoints, three two-dimensional control
 points, shape-preserving interpolation, and a live full-image preview. The

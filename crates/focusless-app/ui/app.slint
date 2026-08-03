@@ -84,6 +84,7 @@ export component AppWindow inherits Window {
     in-out property <float> temperature: 0;
     in-out property <float> tint: 0;
     in-out property <float> saturation: 0;
+    in-out property <bool> matrix-enabled: false;
     in-out property <float> sharpness: 0;
     in-out property <float> exposure: 0;
     in-out property <float> contrast: 0;
@@ -158,6 +159,7 @@ export component AppWindow inherits Window {
     callback saturation-preview(amount: float);
     callback saturation-commit(amount: float);
     callback reset-saturation-requested;
+    callback matrix-toggled(enabled: bool);
     callback sharpness-preview(amount: float);
     callback sharpness-commit(amount: float);
     callback reset-sharpness-requested;
@@ -1157,6 +1159,23 @@ export component AppWindow inherits Window {
                             text: "+100";
                             color: #6f7682;
                             font-size: 11px;
+                        }
+                    }
+
+                    HorizontalLayout {
+                        spacing: 8px;
+                        Text {
+                            text: "Matrix";
+                            color: root.document-loaded ? #eef1f6 : #777d87;
+                            font-size: 14px;
+                            font-weight: 600;
+                        }
+                        Rectangle { horizontal-stretch: 1; background: transparent; }
+                        ActionButton {
+                            text: root.matrix-enabled ? "On" : "Off";
+                            selected: root.matrix-enabled;
+                            enabled: root.document-loaded && !root.crop-mode && !root.curve-mode;
+                            clicked => { root.matrix-toggled(!root.matrix-enabled); }
                         }
                     }
 

@@ -385,13 +385,7 @@ impl VipsEngine {
 
         let result = match request.format {
             ExportFormat::Jpeg { quality } => {
-                let flattened = ops::flatten_with_opts(
-                    &adjusted,
-                    &ops::FlattenOptions {
-                        background: vec![255.0, 255.0, 255.0],
-                    },
-                )
-                .map_err(vips_error)?;
+                let flattened = flatten_for_jpeg(&adjusted)?;
                 flattened.write_to_file(format!(
                     "{temporary_str}[Q={},optimize-coding=true,interlace=true,keep=none,profile={profile}]",
                     quality.clamp(1, 100)
@@ -568,6 +562,20 @@ fn from_working_linear(image: &VipsImage) -> Result<VipsImage, RenderError> {
     }
 }
 
+fn flatten_for_jpeg(image: &VipsImage) -> Result<VipsImage, RenderError> {
+    if !image.hasalpha() {
+        return ops::copy(image).map_err(vips_error);
+    }
+    let color_bands = (image.get_bands() - 1).max(1) as usize;
+    ops::flatten_with_opts(
+        image,
+        &ops::FlattenOptions {
+            background: vec![255.0; color_bands],
+        },
+    )
+    .map_err(vips_error)
+}
+
 fn alpha_to_unit(
     alpha: &VipsImage,
     source_format: ops::BandFormat,
@@ -696,6 +704,17 @@ fn apply_operations_scaled(
         .unwrap_or(0.0);
     if saturation.abs() > f32::EPSILON {
         current = apply_saturation_oklab(&current, saturation)?;
+    }
+    let matrix_enabled = operations
+        .iter()
+        .rev()
+        .find_map(|operation| match *operation {
+            Operation::Matrix { enabled } => Some(enabled),
+            _ => None,
+        })
+        .unwrap_or(false);
+    if matrix_enabled {
+        current = apply_matrix_look_oklab(&current)?;
     }
     let sharpness = operations
         .iter()
@@ -909,6 +928,70 @@ fn apply_saturation_oklab(image: &VipsImage, amount: f32) -> Result<VipsImage, R
     .map_err(vips_error)?;
     let saturated = oklab_to_linear_rgb(&adjusted_oklab)?;
     join_alpha(saturated, alpha)
+}
+
+fn apply_matrix_look_oklab(image: &VipsImage) -> Result<VipsImage, RenderError> {
+    // The fixed preset follows the published Matrix grading recipe: retain
+    // 30% chroma, bias shadows green/cyan, push midtones further toward
+    // green, and add a small yellow bias in highlights. Smooth interpolation
+    // between these OKLab anchors avoids tonal seams.
+    const CHROMA_SCALE: f64 = 0.30;
+    const SHADOW_BIAS: [f64; 2] = [-0.018, -0.004];
+    const MIDTONE_BIAS: [f64; 2] = [-0.035, 0.006];
+    const HIGHLIGHT_BIAS: [f64; 2] = [-0.006, 0.018];
+
+    let (color, alpha) = split_color_and_alpha(image, "Matrix look")?;
+    let oklab = linear_rgb_to_oklab(&color)?;
+    let lightness = ops::extract_band(&oklab, 0).map_err(vips_error)?;
+    let chroma = ops::extract_band_with_opts(&oklab, 1, &ops::ExtractBandOptions { n: 2 })
+        .map_err(vips_error)?;
+
+    let zero = ops::linear(&lightness, &mut [0.0], &mut [0.0]).map_err(vips_error)?;
+    let one = ops::linear(&lightness, &mut [0.0], &mut [1.0]).map_err(vips_error)?;
+    let below = ops::relational_const(&lightness, ops::OperationRelational::Less, &mut [0.0])
+        .map_err(vips_error)?;
+    let above = ops::relational_const(&lightness, ops::OperationRelational::More, &mut [1.0])
+        .map_err(vips_error)?;
+    let bounded_lightness = ops::ifthenelse(&below, &zero, &lightness).map_err(vips_error)?;
+    let bounded_lightness =
+        ops::ifthenelse(&above, &one, &bounded_lightness).map_err(vips_error)?;
+    let lower_half = ops::relational_const(
+        &bounded_lightness,
+        ops::OperationRelational::Lesseq,
+        &mut [0.5],
+    )
+    .map_err(vips_error)?;
+
+    let mut adjusted_chroma = Vec::with_capacity(2);
+    for band in 0..2 {
+        let component = ops::extract_band(&chroma, band).map_err(vips_error)?;
+        let component =
+            ops::linear(&component, &mut [CHROMA_SCALE], &mut [0.0]).map_err(vips_error)?;
+
+        let lower_slope = 2.0 * (MIDTONE_BIAS[band as usize] - SHADOW_BIAS[band as usize]);
+        let lower_bias = ops::linear(
+            &bounded_lightness,
+            &mut [lower_slope],
+            &mut [SHADOW_BIAS[band as usize]],
+        )
+        .map_err(vips_error)?;
+        let upper_slope = 2.0 * (HIGHLIGHT_BIAS[band as usize] - MIDTONE_BIAS[band as usize]);
+        let upper_intercept = 2.0 * MIDTONE_BIAS[band as usize] - HIGHLIGHT_BIAS[band as usize];
+        let upper_bias = ops::linear(
+            &bounded_lightness,
+            &mut [upper_slope],
+            &mut [upper_intercept],
+        )
+        .map_err(vips_error)?;
+        let tonal_bias =
+            ops::ifthenelse(&lower_half, &lower_bias, &upper_bias).map_err(vips_error)?;
+        adjusted_chroma.push(ops::add(&component, &tonal_bias).map_err(vips_error)?);
+    }
+
+    let adjusted_chroma = ops::bandjoin(&mut adjusted_chroma).map_err(vips_error)?;
+    let adjusted_oklab = ops::bandjoin(&mut [lightness, adjusted_chroma]).map_err(vips_error)?;
+    let graded = oklab_to_linear_rgb(&adjusted_oklab)?;
+    join_alpha(graded, alpha)
 }
 
 fn apply_contrast_oklab(image: &VipsImage, amount: f32) -> Result<VipsImage, RenderError> {
@@ -1685,6 +1768,7 @@ mod tests {
                             },
                             Operation::Exposure { ev: 0.5 },
                             Operation::Saturation { amount: 24.0 },
+                            Operation::Matrix { enabled: true },
                             Operation::Sharpness { amount: 145.0 },
                         ],
                         format,
@@ -1828,6 +1912,118 @@ mod tests {
                 "straightening changed source alpha to {value}"
             );
         }
+    }
+
+    #[test]
+    fn matrix_look_matches_tonal_oklab_anchors_and_preserves_alpha() {
+        let mut pixels = Vec::new();
+        for lightness in [0.25_f32, 0.5, 0.75] {
+            let neutral = lightness.powi(3);
+            for value in [neutral, neutral, neutral] {
+                pixels.extend_from_slice(&value.to_ne_bytes());
+            }
+        }
+        let image =
+            VipsImage::new_from_memory_copy(&pixels, 3, 1, 3, ops::BandFormat::Float).unwrap();
+
+        let graded = apply_matrix_look_oklab(&image).unwrap();
+        let oklab = linear_rgb_to_oklab(&graded).unwrap();
+        let values = oklab
+            .write_to_memory()
+            .chunks_exact(size_of::<f32>())
+            .map(|bytes| f32::from_ne_bytes(bytes.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        let expected = [
+            [0.25_f32, -0.0265, 0.001],
+            [0.5, -0.035, 0.006],
+            [0.75, -0.0205, 0.012],
+        ];
+        for (actual, expected) in values.chunks_exact(3).zip(expected) {
+            for (actual, expected) in actual.iter().zip(expected) {
+                assert!(
+                    (*actual - expected).abs() < 3.0e-5,
+                    "Matrix OKLab sample differed: expected {expected}, got {actual}"
+                );
+            }
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let source_path = directory.path().join("matrix-alpha.png");
+        let rgba = [96_u8, 128, 160, 77];
+        let image =
+            VipsImage::new_from_memory_copy(&rgba, 1, 1, 4, ops::BandFormat::Uchar).unwrap();
+        ops::pngsave(&image, source_path.to_str().unwrap()).unwrap();
+        let mut engine = VipsEngine::new().unwrap();
+        let preview = engine
+            .render_preview(&PreviewRequest {
+                generation: 1,
+                source_path,
+                operations: vec![Operation::Matrix { enabled: true }],
+                viewport: Viewport::fit(1, 1),
+            })
+            .unwrap();
+        assert_eq!(preview.rgba8[3], 77, "Matrix look must preserve alpha");
+    }
+
+    #[test]
+    fn exports_grayscale_alpha_as_jpeg() {
+        let directory = tempfile::tempdir().unwrap();
+        let source_path = directory.path().join("grayscale-alpha.png");
+        let destination = directory.path().join("grayscale-alpha.jpg");
+        let pixels = [32_u8, 255, 128, 128, 224, 64, 255, 0];
+        let image =
+            VipsImage::new_from_memory_copy(&pixels, 2, 2, 2, ops::BandFormat::Uchar).unwrap();
+        ops::pngsave(&image, source_path.to_str().unwrap()).unwrap();
+
+        let engine = VipsEngine::new().unwrap();
+        engine
+            .export(
+                &ExportRequest {
+                    source_path,
+                    destination_path: destination.clone(),
+                    operations: vec![],
+                    format: ExportFormat::Jpeg { quality: 92 },
+                },
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+
+        let exported = VipsImage::new_from_file(destination.to_str().unwrap()).unwrap();
+        assert_eq!(exported.get_bands(), 3);
+        assert!(exported.get_blob("icc-profile-data").is_ok());
+    }
+
+    #[test]
+    fn exports_opaque_rgb_as_jpeg_without_flattening() {
+        let directory = tempfile::tempdir().unwrap();
+        let source_path = directory.path().join("opaque-rgb.png");
+        let destination = directory.path().join("opaque-rgb.jpg");
+        let pixels = [32_u8, 64, 96, 128, 160, 192, 224, 240, 255, 12, 24, 48];
+        let image =
+            VipsImage::new_from_memory_copy(&pixels, 2, 2, 3, ops::BandFormat::Uchar).unwrap();
+        ops::pngsave(&image, source_path.to_str().unwrap()).unwrap();
+
+        let engine = VipsEngine::new().unwrap();
+        engine
+            .export(
+                &ExportRequest {
+                    source_path,
+                    destination_path: destination.clone(),
+                    operations: vec![Operation::WhiteBalance {
+                        adjustment: WhiteBalance {
+                            temperature: 12.0,
+                            tint: -20.0,
+                        },
+                    }],
+                    format: ExportFormat::Jpeg { quality: 92 },
+                },
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+
+        let exported = VipsImage::new_from_file(destination.to_str().unwrap()).unwrap();
+        assert_eq!(exported.get_bands(), 3);
+        assert!(exported.get_blob("icc-profile-data").is_ok());
     }
 
     #[test]

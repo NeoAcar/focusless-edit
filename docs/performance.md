@@ -33,8 +33,9 @@ together.
 
 ## 100 MP interactive adjustments
 
-Measured on July 31, 2026, on Windows 11 Pro with 31.2 GiB RAM, an AMD Ryzen 7
-6800H, and libvips 8.18.2. Values are medians from three release-mode runs:
+Measured on July 31 and August 3, 2026, on Windows 11 Pro with 31.2 GiB RAM,
+an AMD Ryzen 7 6800H, and libvips 8.18.2. Values are medians from three
+release-mode runs:
 
 - Source: synthetic `10000 × 10000` JPEG, 100 MP
 - Output viewport: `1920 × 1080` RGBA8
@@ -44,12 +45,13 @@ Measured on July 31, 2026, on Windows 11 Pro with 31.2 GiB RAM, an AMD Ryzen 7
 - Contrast: `197 ms`
 - Tone curve: `84 ms`
 - Saturation: `154 ms`
+- Matrix look: `259 ms`
 - Sharpness: `181 ms`
 - Crop: `44 ms`
 - Straighten rotation: `125 ms`
 - Frame: `63 ms`
-- Whole ten-preview process wall time: `2.123 s`
-- Peak resident memory: `491.4 MiB`
+- Whole eleven-preview process wall time: `2.452 s`
+- Peak resident memory: `489.9 MiB`
 
 The fit-preview path materializes one color-managed, 32-bit float linear proxy
 at 1.5 times the fitted display resolution. Every interactive operation reuses

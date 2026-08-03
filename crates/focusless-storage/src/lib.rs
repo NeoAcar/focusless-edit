@@ -307,6 +307,7 @@ mod tests {
                     curve: focusless_core::ToneCurve::IDENTITY,
                 },
                 Operation::Saturation { amount: 0.0 },
+                Operation::Matrix { enabled: false },
                 Operation::Sharpness { amount: 0.0 },
                 Operation::Frame {
                     width_pct: 0.0,
@@ -591,6 +592,40 @@ mod tests {
             .position(|operation| matches!(operation, Operation::Straighten { .. }))
             .unwrap();
         assert_eq!(straighten_index, rotate_index + 1);
+    }
+
+    #[test]
+    fn version_twelve_project_gets_disabled_matrix_after_saturation() {
+        let directory = tempdir().unwrap();
+        let project_path = directory.path().join("version-twelve.focusless");
+        let image_path = directory.path().join("image.jpg");
+        let mut document = ProjectDocument::new(source(image_path));
+        document.schema_version = 12;
+        document
+            .operations
+            .retain(|operation| !matches!(operation, Operation::Matrix { .. }));
+        fs::write(&project_path, serde_json::to_vec_pretty(&document).unwrap()).unwrap();
+
+        let restored = load_project(&project_path).unwrap();
+
+        assert_eq!(restored.schema_version, PROJECT_SCHEMA_VERSION);
+        assert!(!restored.matrix_enabled());
+        let saturation_index = restored
+            .operations
+            .iter()
+            .position(|operation| matches!(operation, Operation::Saturation { .. }))
+            .unwrap();
+        let matrix_index = restored
+            .operations
+            .iter()
+            .position(|operation| matches!(operation, Operation::Matrix { .. }))
+            .unwrap();
+        let sharpness_index = restored
+            .operations
+            .iter()
+            .position(|operation| matches!(operation, Operation::Sharpness { .. }))
+            .unwrap();
+        assert!(saturation_index < matrix_index && matrix_index < sharpness_index);
     }
 
     #[test]

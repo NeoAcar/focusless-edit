@@ -473,6 +473,17 @@ impl Controller {
         {
             let controller = Rc::clone(controller);
             let weak_ui = weak_ui.clone();
+            ui.on_matrix_toggled(move |enabled| {
+                let Some(ui) = weak_ui.upgrade() else {
+                    return;
+                };
+                controller.borrow_mut().set_matrix_enabled(&ui, enabled);
+            });
+        }
+
+        {
+            let controller = Rc::clone(controller);
+            let weak_ui = weak_ui.clone();
             ui.on_rotation_commit(move |degrees| {
                 let Some(ui) = weak_ui.upgrade() else {
                     return;
@@ -938,6 +949,7 @@ impl Controller {
         self.set_white_balance_ui(ui, document.white_balance());
         ui.set_saturation(document.saturation());
         ui.set_saturation_text(format_adjustment(document.saturation()).into());
+        ui.set_matrix_enabled(document.matrix_enabled());
         ui.set_sharpness(document.sharpness());
         ui.set_sharpness_text(format_nonnegative_adjustment(document.sharpness()).into());
         let (frame_w, frame_c) = document.frame();
@@ -1072,6 +1084,28 @@ impl Controller {
             self.update_history_ui(ui);
             self.queue_preview(ui);
         }
+    }
+
+    fn set_matrix_enabled(&mut self, ui: &AppWindow, enabled: bool) {
+        if self.crop_edit_start.is_some() || self.curve_edit_start.is_some() {
+            return;
+        }
+        let Some(document) = self.document.as_mut() else {
+            return;
+        };
+        document.set_matrix_enabled(enabled);
+        ui.set_matrix_enabled(enabled);
+        self.mark_changed();
+        self.update_history_ui(ui);
+        self.queue_preview(ui);
+        ui.set_status_text(
+            if enabled {
+                "Matrix look enabled"
+            } else {
+                "Matrix look disabled"
+            }
+            .into(),
+        );
     }
 
     fn preview_sharpness(&mut self, ui: &AppWindow, amount: f32) {
@@ -1358,6 +1392,7 @@ impl Controller {
         self.set_white_balance_ui(ui, WhiteBalance::IDENTITY);
         ui.set_saturation(0.0);
         ui.set_saturation_text(format_adjustment(0.0).into());
+        ui.set_matrix_enabled(false);
         ui.set_sharpness(0.0);
         ui.set_sharpness_text(format_nonnegative_adjustment(0.0).into());
         self.set_curve_ui(ui, ToneCurve::IDENTITY);
@@ -1699,6 +1734,7 @@ impl Controller {
             let contrast = document.contrast();
             let white_balance = document.white_balance();
             let saturation = document.saturation();
+            let matrix_enabled = document.matrix_enabled();
             let sharpness = document.sharpness();
             let curve = document.tone_curve();
             let (frame_w, frame_c) = document.frame();
@@ -1709,6 +1745,7 @@ impl Controller {
             self.set_white_balance_ui(ui, white_balance);
             ui.set_saturation(saturation);
             ui.set_saturation_text(format_adjustment(saturation).into());
+            ui.set_matrix_enabled(matrix_enabled);
             ui.set_sharpness(sharpness);
             ui.set_sharpness_text(format_nonnegative_adjustment(sharpness).into());
             self.set_curve_ui(ui, curve);
@@ -1744,6 +1781,7 @@ impl Controller {
             let contrast = document.contrast();
             let white_balance = document.white_balance();
             let saturation = document.saturation();
+            let matrix_enabled = document.matrix_enabled();
             let sharpness = document.sharpness();
             let curve = document.tone_curve();
             let (frame_w, frame_c) = document.frame();
@@ -1754,6 +1792,7 @@ impl Controller {
             self.set_white_balance_ui(ui, white_balance);
             ui.set_saturation(saturation);
             ui.set_saturation_text(format_adjustment(saturation).into());
+            ui.set_matrix_enabled(matrix_enabled);
             ui.set_sharpness(sharpness);
             ui.set_sharpness_text(format_nonnegative_adjustment(sharpness).into());
             self.set_curve_ui(ui, curve);

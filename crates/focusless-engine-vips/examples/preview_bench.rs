@@ -92,6 +92,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 }],
             ),
             ("saturation", vec![Operation::Saturation { amount: 45.0 }]),
+            ("matrix", vec![Operation::Matrix { enabled: true }]),
             ("sharpness", vec![Operation::Sharpness { amount: 120.0 }]),
             (
                 "crop",

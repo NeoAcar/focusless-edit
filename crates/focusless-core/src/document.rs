@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub const PROJECT_SCHEMA_VERSION: u32 = 12;
+pub const PROJECT_SCHEMA_VERSION: u32 = 13;
 pub const MAX_HISTORY_LEN: usize = 200;
 const MIN_CROP_EXTENT: f32 = 0.01;
 const MAX_FRAME_WIDTH_PCT: f32 = 50.0;
@@ -296,6 +296,7 @@ pub enum Operation {
     Contrast { amount: f32 },
     ToneCurve { curve: ToneCurve },
     Saturation { amount: f32 },
+    Matrix { enabled: bool },
     Sharpness { amount: f32 },
     Frame { width_pct: f32, color: FrameColor },
 }
@@ -318,6 +319,10 @@ pub enum Command {
     SetSaturation {
         before: f32,
         after: f32,
+    },
+    SetMatrix {
+        before: bool,
+        after: bool,
     },
     SetSharpness {
         before: f32,
@@ -420,6 +425,7 @@ fn default_operations() -> Vec<Operation> {
             curve: ToneCurve::IDENTITY,
         },
         Operation::Saturation { amount: 0.0 },
+        Operation::Matrix { enabled: false },
         Operation::Sharpness { amount: 0.0 },
         Operation::Frame {
             width_pct: 0.0,
@@ -483,6 +489,7 @@ impl ProjectDocument {
                 Operation::Contrast { amount } => validate_contrast(amount)?,
                 Operation::ToneCurve { curve } => validate_tone_curve(curve)?,
                 Operation::Saturation { amount } => validate_saturation(amount)?,
+                Operation::Matrix { .. } => {}
                 Operation::Sharpness { amount } => validate_sharpness(amount)?,
                 Operation::Frame { width_pct, .. } => validate_frame(width_pct)?,
             }
@@ -577,6 +584,20 @@ impl ProjectDocument {
             self.operations
                 .insert(index, Operation::Straighten { degrees: 0.0 });
         }
+        if self.schema_version < 13
+            && !self
+                .operations
+                .iter()
+                .any(|operation| matches!(operation, Operation::Matrix { .. }))
+        {
+            let index = self
+                .operations
+                .iter()
+                .rposition(|operation| matches!(operation, Operation::Saturation { .. }))
+                .map_or(self.operations.len(), |index| index + 1);
+            self.operations
+                .insert(index, Operation::Matrix { enabled: false });
+        }
         self.schema_version = PROJECT_SCHEMA_VERSION;
         Ok(())
     }
@@ -663,6 +684,18 @@ impl ProjectDocument {
                 _ => None,
             })
             .unwrap_or(0.0)
+    }
+
+    #[must_use]
+    pub fn matrix_enabled(&self) -> bool {
+        self.operations
+            .iter()
+            .rev()
+            .find_map(|operation| match *operation {
+                Operation::Matrix { enabled } => Some(enabled),
+                _ => None,
+            })
+            .unwrap_or(false)
     }
 
     #[must_use]
@@ -832,6 +865,39 @@ impl ProjectDocument {
             self.history.push(Command::SetSaturation { before, after });
         }
         Ok(())
+    }
+
+    pub fn set_matrix_enabled(&mut self, enabled: bool) {
+        let before = self.matrix_enabled();
+        if let Some(Operation::Matrix { enabled: current }) = self
+            .operations
+            .iter_mut()
+            .rev()
+            .find(|operation| matches!(operation, Operation::Matrix { .. }))
+        {
+            *current = enabled;
+        } else {
+            self.operations.push(Operation::Matrix { enabled });
+        }
+        if before != enabled {
+            self.history.push(Command::SetMatrix {
+                before,
+                after: enabled,
+            });
+        }
+    }
+
+    fn preview_matrix(&mut self, enabled: bool) {
+        if let Some(Operation::Matrix { enabled: current }) = self
+            .operations
+            .iter_mut()
+            .rev()
+            .find(|operation| matches!(operation, Operation::Matrix { .. }))
+        {
+            *current = enabled;
+        } else {
+            self.operations.push(Operation::Matrix { enabled });
+        }
     }
 
     pub fn preview_sharpness(&mut self, amount: f32) -> Result<(), DocumentError> {
@@ -1049,6 +1115,9 @@ impl ProjectDocument {
             Command::SetSaturation { before, .. } => {
                 let _ = self.preview_saturation(before);
             }
+            Command::SetMatrix { before, .. } => {
+                self.preview_matrix(before);
+            }
             Command::SetSharpness { before, .. } => {
                 let _ = self.preview_sharpness(before);
             }
@@ -1100,6 +1169,9 @@ impl ProjectDocument {
             }
             Command::SetSaturation { after, .. } => {
                 let _ = self.preview_saturation(after);
+            }
+            Command::SetMatrix { after, .. } => {
+                self.preview_matrix(after);
             }
             Command::SetSharpness { after, .. } => {
                 let _ = self.preview_sharpness(after);
@@ -1361,6 +1433,19 @@ mod tests {
         assert_eq!(document.saturation(), 0.0);
         assert!(document.redo());
         assert_eq!(document.saturation(), 35.0);
+    }
+
+    #[test]
+    fn matrix_transaction_is_undoable_and_redoable() {
+        let mut document = document();
+        assert!(!document.matrix_enabled());
+
+        document.set_matrix_enabled(true);
+        assert!(document.matrix_enabled());
+        assert!(document.undo());
+        assert!(!document.matrix_enabled());
+        assert!(document.redo());
+        assert!(document.matrix_enabled());
     }
 
     #[test]
@@ -1685,24 +1770,58 @@ mod tests {
     }
 
     #[test]
+    fn schema_v12_migrates_with_disabled_matrix_after_saturation() {
+        let mut document = document();
+        document.schema_version = 12;
+        document
+            .operations
+            .retain(|operation| !matches!(operation, Operation::Matrix { .. }));
+
+        document.upgrade_to_latest().unwrap();
+
+        assert_eq!(document.schema_version, PROJECT_SCHEMA_VERSION);
+        assert!(!document.matrix_enabled());
+        let saturation_index = document
+            .operations
+            .iter()
+            .position(|operation| matches!(operation, Operation::Saturation { .. }))
+            .unwrap();
+        let matrix_index = document
+            .operations
+            .iter()
+            .position(|operation| matches!(operation, Operation::Matrix { .. }))
+            .unwrap();
+        let sharpness_index = document
+            .operations
+            .iter()
+            .position(|operation| matches!(operation, Operation::Sharpness { .. }))
+            .unwrap();
+        assert!(saturation_index < matrix_index && matrix_index < sharpness_index);
+    }
+
+    #[test]
     fn straighten_and_restore_original_are_undoable() {
         let mut document = document();
         document.preview_exposure(1.0).unwrap();
         document.commit_exposure(0.0, 1.0).unwrap();
         document.preview_straighten(12.5).unwrap();
         document.commit_straighten(0.0, 12.5).unwrap();
+        document.set_matrix_enabled(true);
         let straightened = document.output_dimensions(100, 50);
         assert!(straightened.0 < 100 && straightened.1 < 50);
 
         document.restore_original();
         assert_eq!(document.exposure_ev(), 0.0);
         assert_eq!(document.straighten_degrees(), 0.0);
+        assert!(!document.matrix_enabled());
         assert!(document.undo());
         assert_eq!(document.exposure_ev(), 1.0);
         assert_eq!(document.straighten_degrees(), 12.5);
+        assert!(document.matrix_enabled());
         assert!(document.redo());
         assert_eq!(document.exposure_ev(), 0.0);
         assert_eq!(document.straighten_degrees(), 0.0);
+        assert!(!document.matrix_enabled());
     }
 
     #[test]

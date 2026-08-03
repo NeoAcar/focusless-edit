@@ -48,7 +48,7 @@ CPU pool for image computation.
 
 `ProjectDocument` persists:
 
-- Schema version (currently version 12; version 1–11 projects migrate on load)
+- Schema version (currently version 13; version 1–12 projects migrate on load)
 - Source photo path and sampled BLAKE3 fingerprint
 - Ordered non-destructive operation list
 - Zoom and normalized center coordinates
@@ -62,7 +62,7 @@ synchronization cannot block the UI.
 Geometry and tonal operations use a stable render order: EXIF orientation,
 ICC conversion to the working space, quarter-turn rotation, auto-cropped
 straighten rotation, normalized crop, white balance, exposure, contrast, the
-tone curve, then saturation. A crop
+tone curve, saturation, then the optional Matrix look. A crop
 rectangle is stored as normalized coordinates so it remains independent of
 source resolution. Sharpness follows the tonal operations, and the frame is
 added last before preview resizing or output conversion. Rotating an existing
@@ -103,6 +103,14 @@ axes, then converts back to linear sRGB. The `-100..+100` control maps to a
 `0..2` chroma multiplier, so `-100` is neutral gray, `0` is identity, and
 `+100` doubles chroma. Lightness and hue remain unchanged in OKLab, alpha stays
 separate, and no intermediate gamut clipping is performed.
+
+The fixed Matrix look retains 30% of existing OKLab chroma. It then smoothly
+interpolates exact `a,b` biases across lightness anchors: shadows
+`(-0.018, -0.004)`, midtones `(-0.035, +0.006)`, and highlights
+`(-0.006, +0.018)`. This creates green/cyan shadows, stronger green midtones,
+and slightly yellow highlights without changing OKLab lightness or alpha.
+Lightness is bounded only for selecting the tonal bias; extended-range color
+values are not clipped.
 
 Sharpness applies a full-resolution unsharp mask only to OKLab lightness:
 `L' = L + gain × (L - GaussianBlur(L, 1 px))`. The `0..300` control maps to a
