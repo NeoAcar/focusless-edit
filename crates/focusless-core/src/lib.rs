@@ -5,8 +5,8 @@ mod render;
 
 pub use document::{
     Command, CommandHistory, CropRect, DocumentError, FrameColor, MAX_HISTORY_LEN, Operation,
-    PROJECT_SCHEMA_VERSION, ProjectDocument, SourceFingerprint, SourceReference, ToneCurve,
-    ViewState, WhiteBalance,
+    PROJECT_SCHEMA_VERSION, ProjectDocument, ShadowsHighlights, SourceFingerprint, SourceReference,
+    ToneCurve, ViewState, WhiteBalance,
 };
 pub use render::{
     ExportFormat, ExportRequest, PreviewRequest, RenderError, RenderResult, Viewport,

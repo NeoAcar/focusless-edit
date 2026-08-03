@@ -88,6 +88,8 @@ export component AppWindow inherits Window {
     in-out property <float> sharpness: 0;
     in-out property <float> exposure: 0;
     in-out property <float> contrast: 0;
+    in-out property <float> shadows: 0;
+    in-out property <float> highlights: 0;
     in-out property <float> rotation-angle: 0;
     in-out property <bool> rotation-mode: false;
     in-out property <float> crop-x: 0;
@@ -102,6 +104,8 @@ export component AppWindow inherits Window {
     in-out property <float> curve-highlights: 0.75;
     in property <string> exposure-text: "0.0 EV";
     in property <string> contrast-text: "0";
+    in property <string> shadows-text: "0";
+    in property <string> highlights-text: "0";
     in property <string> temperature-text: "0";
     in property <string> tint-text: "0";
     in property <string> saturation-text: "0";
@@ -153,6 +157,11 @@ export component AppWindow inherits Window {
     callback contrast-preview(amount: float);
     callback contrast-commit(amount: float);
     callback reset-contrast-requested;
+    callback shadows-preview(amount: float);
+    callback shadows-commit(amount: float);
+    callback highlights-preview(amount: float);
+    callback highlights-commit(amount: float);
+    callback reset-shadows-highlights-requested;
     callback white-balance-preview(temperature: float, tint: float);
     callback white-balance-commit(temperature: float, tint: float);
     callback reset-white-balance-requested;
@@ -382,9 +391,9 @@ export component AppWindow inherits Window {
                     }
                     scroll-event(event) => {
                         if event.delta-y < 0px {
-                            root.zoom-requested(1.15);
-                        } else if event.delta-y > 0px {
                             root.zoom-requested(0.87);
+                        } else if event.delta-y > 0px {
+                            root.zoom-requested(1.15);
                         }
                         accept
                     }
@@ -1063,6 +1072,79 @@ export component AppWindow inherits Window {
                             color: #6f7682;
                             font-size: 11px;
                         }
+                    }
+
+                    Rectangle {
+                        height: 1px;
+                        background: #343840;
+                    }
+
+                    HorizontalLayout {
+                        spacing: 8px;
+                        Text {
+                            text: "Highlights & Shadows";
+                            color: root.document-loaded ? #eef1f6 : #777d87;
+                            font-size: 14px;
+                            font-weight: 600;
+                        }
+                        Rectangle { horizontal-stretch: 1; background: transparent; }
+                        ResetButton {
+                            enabled: root.document-loaded && !root.crop-mode
+                                && !root.curve-mode && (abs(root.shadows) > 0.001 || abs(root.highlights) > 0.001);
+                            clicked => { root.reset-shadows-highlights-requested(); }
+                        }
+                    }
+
+                    HorizontalLayout {
+                        spacing: 8px;
+                        Text {
+                            text: "Highlights";
+                            color: #9fa7b4;
+                            font-size: 13px;
+                        }
+                        Rectangle { horizontal-stretch: 1; background: transparent; }
+                        Text {
+                            text: root.highlights-text;
+                            color: #9fa7b4;
+                            font-size: 13px;
+                            horizontal-alignment: right;
+                        }
+                    }
+
+                    Slider {
+                        minimum: -100;
+                        maximum: 100;
+                        step: 1;
+                        value <=> root.highlights;
+                        enabled: root.document-loaded && !root.crop-mode && !root.curve-mode;
+                        changed(value) => { root.highlights-preview(value); }
+                        released(value) => { root.highlights-commit(value); }
+                    }
+
+                    HorizontalLayout {
+                        spacing: 8px;
+                        Text {
+                            text: "Shadows";
+                            color: #9fa7b4;
+                            font-size: 13px;
+                        }
+                        Rectangle { horizontal-stretch: 1; background: transparent; }
+                        Text {
+                            text: root.shadows-text;
+                            color: #9fa7b4;
+                            font-size: 13px;
+                            horizontal-alignment: right;
+                        }
+                    }
+
+                    Slider {
+                        minimum: -100;
+                        maximum: 100;
+                        step: 1;
+                        value <=> root.shadows;
+                        enabled: root.document-loaded && !root.crop-mode && !root.curve-mode;
+                        changed(value) => { root.shadows-preview(value); }
+                        released(value) => { root.shadows-commit(value); }
                     }
 
                     Rectangle {

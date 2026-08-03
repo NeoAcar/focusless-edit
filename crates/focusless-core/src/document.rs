@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub const PROJECT_SCHEMA_VERSION: u32 = 13;
+pub const PROJECT_SCHEMA_VERSION: u32 = 14;
 pub const MAX_HISTORY_LEN: usize = 200;
 const MIN_CROP_EXTENT: f32 = 0.01;
 const MAX_FRAME_WIDTH_PCT: f32 = 50.0;
@@ -153,6 +153,30 @@ impl Default for WhiteBalance {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct ShadowsHighlights {
+    pub shadows: f32,
+    pub highlights: f32,
+}
+
+impl ShadowsHighlights {
+    pub const IDENTITY: Self = Self {
+        shadows: 0.0,
+        highlights: 0.0,
+    };
+
+    #[must_use]
+    pub fn is_identity(self) -> bool {
+        self.shadows.abs() < f32::EPSILON && self.highlights.abs() < f32::EPSILON
+    }
+}
+
+impl Default for ShadowsHighlights {
+    fn default() -> Self {
+        Self::IDENTITY
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct ToneCurve {
     #[serde(default = "default_shadow_input")]
     pub shadow_input: f32,
@@ -294,6 +318,7 @@ pub enum Operation {
     WhiteBalance { adjustment: WhiteBalance },
     Exposure { ev: f32 },
     Contrast { amount: f32 },
+    ShadowsHighlights { adjustment: ShadowsHighlights },
     ToneCurve { curve: ToneCurve },
     Saturation { amount: f32 },
     Matrix { enabled: bool },
@@ -345,6 +370,10 @@ pub enum Command {
     SetToneCurve {
         before: ToneCurve,
         after: ToneCurve,
+    },
+    SetShadowsHighlights {
+        before: ShadowsHighlights,
+        after: ShadowsHighlights,
     },
     SetFrame {
         before_width_pct: f32,
@@ -421,6 +450,9 @@ fn default_operations() -> Vec<Operation> {
         },
         Operation::Exposure { ev: 0.0 },
         Operation::Contrast { amount: 0.0 },
+        Operation::ShadowsHighlights {
+            adjustment: ShadowsHighlights::IDENTITY,
+        },
         Operation::ToneCurve {
             curve: ToneCurve::IDENTITY,
         },
@@ -448,6 +480,8 @@ pub enum DocumentError {
     InvalidSaturation,
     #[error("sharpness must be finite and between 0 and 300")]
     InvalidSharpness,
+    #[error("shadows and highlights must be finite and between -100 and +100")]
+    InvalidShadowsHighlights,
     #[error("rotation must be between 0 and 3 quarter turns")]
     InvalidRotation,
     #[error("straighten angle must be finite and between -45 and +45 degrees")]
@@ -487,6 +521,9 @@ impl ProjectDocument {
                 Operation::WhiteBalance { adjustment } => validate_white_balance(adjustment)?,
                 Operation::Exposure { ev } => validate_exposure(ev)?,
                 Operation::Contrast { amount } => validate_contrast(amount)?,
+                Operation::ShadowsHighlights { adjustment } => {
+                    validate_shadows_highlights(adjustment)?;
+                }
                 Operation::ToneCurve { curve } => validate_tone_curve(curve)?,
                 Operation::Saturation { amount } => validate_saturation(amount)?,
                 Operation::Matrix { .. } => {}
@@ -598,6 +635,31 @@ impl ProjectDocument {
             self.operations
                 .insert(index, Operation::Matrix { enabled: false });
         }
+        if self.schema_version < 14
+            && !self
+                .operations
+                .iter()
+                .any(|operation| matches!(operation, Operation::ShadowsHighlights { .. }))
+        {
+            // Insert between Contrast and ToneCurve.
+            let index = self
+                .operations
+                .iter()
+                .rposition(|operation| matches!(operation, Operation::Contrast { .. }))
+                .map_or(
+                    self.operations
+                        .iter()
+                        .position(|operation| matches!(operation, Operation::ToneCurve { .. }))
+                        .unwrap_or(self.operations.len()),
+                    |index| index + 1,
+                );
+            self.operations.insert(
+                index,
+                Operation::ShadowsHighlights {
+                    adjustment: ShadowsHighlights::IDENTITY,
+                },
+            );
+        }
         self.schema_version = PROJECT_SCHEMA_VERSION;
         Ok(())
     }
@@ -624,6 +686,18 @@ impl ProjectDocument {
                 _ => None,
             })
             .unwrap_or(0.0)
+    }
+
+    #[must_use]
+    pub fn shadows_highlights(&self) -> ShadowsHighlights {
+        self.operations
+            .iter()
+            .rev()
+            .find_map(|operation| match *operation {
+                Operation::ShadowsHighlights { adjustment } => Some(adjustment),
+                _ => None,
+            })
+            .unwrap_or_default()
     }
 
     #[must_use]
@@ -808,6 +882,41 @@ impl ProjectDocument {
         self.preview_contrast(after)?;
         if (before - after).abs() > f32::EPSILON {
             self.history.push(Command::SetContrast { before, after });
+        }
+        Ok(())
+    }
+
+    pub fn preview_shadows_highlights(
+        &mut self,
+        adjustment: ShadowsHighlights,
+    ) -> Result<(), DocumentError> {
+        validate_shadows_highlights(adjustment)?;
+        if let Some(Operation::ShadowsHighlights {
+            adjustment: current,
+        }) = self
+            .operations
+            .iter_mut()
+            .rev()
+            .find(|operation| matches!(operation, Operation::ShadowsHighlights { .. }))
+        {
+            *current = adjustment;
+        } else {
+            self.operations
+                .push(Operation::ShadowsHighlights { adjustment });
+        }
+        Ok(())
+    }
+
+    pub fn commit_shadows_highlights(
+        &mut self,
+        before: ShadowsHighlights,
+        after: ShadowsHighlights,
+    ) -> Result<(), DocumentError> {
+        validate_shadows_highlights(before)?;
+        self.preview_shadows_highlights(after)?;
+        if before != after {
+            self.history
+                .push(Command::SetShadowsHighlights { before, after });
         }
         Ok(())
     }
@@ -1109,6 +1218,9 @@ impl ProjectDocument {
             Command::SetContrast { before, .. } => {
                 let _ = self.preview_contrast(before);
             }
+            Command::SetShadowsHighlights { before, .. } => {
+                let _ = self.preview_shadows_highlights(before);
+            }
             Command::SetWhiteBalance { before, .. } => {
                 let _ = self.preview_white_balance(before);
             }
@@ -1163,6 +1275,9 @@ impl ProjectDocument {
             }
             Command::SetContrast { after, .. } => {
                 let _ = self.preview_contrast(after);
+            }
+            Command::SetShadowsHighlights { after, .. } => {
+                let _ = self.preview_shadows_highlights(after);
             }
             Command::SetWhiteBalance { after, .. } => {
                 let _ = self.preview_white_balance(after);
@@ -1349,6 +1464,18 @@ fn validate_contrast(amount: f32) -> Result<(), DocumentError> {
         Ok(())
     } else {
         Err(DocumentError::InvalidContrast)
+    }
+}
+
+fn validate_shadows_highlights(adjustment: ShadowsHighlights) -> Result<(), DocumentError> {
+    if adjustment.shadows.is_finite()
+        && (-100.0..=100.0).contains(&adjustment.shadows)
+        && adjustment.highlights.is_finite()
+        && (-100.0..=100.0).contains(&adjustment.highlights)
+    {
+        Ok(())
+    } else {
+        Err(DocumentError::InvalidShadowsHighlights)
     }
 }
 

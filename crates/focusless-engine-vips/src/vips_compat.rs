@@ -52,7 +52,8 @@ impl Drop for VipsApp {
 
 pub mod ops {
     pub use rs_vips::enums::{
-        Angle, BandFormat, Extend, Intent, Interpretation, OperationMath2, OperationRelational,
+        Angle, BandFormat, Extend, Intent, Interpretation, OperationMath, OperationMath2,
+        OperationRelational,
     };
 
     use rs_vips::{
@@ -129,6 +130,11 @@ pub mod ops {
 
     pub fn copy(image: &VipsImage) -> Result<VipsImage> {
         image.copy()
+    }
+
+    pub fn cache(image: &VipsImage) -> Result<VipsImage> {
+        let mut cloned = image.clone();
+        cloned.tilecache()
     }
 
     pub fn premultiply(image: &VipsImage) -> Result<VipsImage> {
@@ -230,6 +236,14 @@ pub mod ops {
         constants: &mut [f64],
     ) -> Result<VipsImage> {
         image.math2_const(operation, constants)
+    }
+
+    pub fn math(image: &VipsImage, operation: OperationMath) -> Result<VipsImage> {
+        image.math(operation)
+    }
+
+    pub fn divide(left: &VipsImage, right: &VipsImage) -> Result<VipsImage> {
+        left.divide(right)
     }
 
     pub fn multiply(left: &VipsImage, right: &VipsImage) -> Result<VipsImage> {

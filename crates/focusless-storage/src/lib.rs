@@ -303,6 +303,9 @@ mod tests {
                 },
                 Operation::Exposure { ev: 0.0 },
                 Operation::Contrast { amount: 0.0 },
+                Operation::ShadowsHighlights {
+                    adjustment: focusless_core::ShadowsHighlights::IDENTITY,
+                },
                 Operation::ToneCurve {
                     curve: focusless_core::ToneCurve::IDENTITY,
                 },

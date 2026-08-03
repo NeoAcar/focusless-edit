@@ -11,7 +11,7 @@ use anyhow::{Context, Result};
 use directories::ProjectDirs;
 use focusless_core::{
     CropRect, ExportFormat, ExportRequest, FrameColor, Operation, PreviewRequest, ProjectDocument,
-    SourceReference, ToneCurve, ViewState, Viewport, WhiteBalance,
+    ShadowsHighlights, SourceReference, ToneCurve, ViewState, Viewport, WhiteBalance,
 };
 use focusless_engine_vips::{EngineEvent, EngineWorker, ImageInfo};
 use focusless_storage::{SourceStatus, fingerprint_source, inspect_source, load_project};
@@ -53,6 +53,7 @@ pub struct Controller {
     effective_zoom: f32,
     exposure_edit_start: Option<f32>,
     contrast_edit_start: Option<f32>,
+    shadows_highlights_edit_start: Option<ShadowsHighlights>,
     white_balance_edit_start: Option<WhiteBalance>,
     saturation_edit_start: Option<f32>,
     sharpness_edit_start: Option<f32>,
@@ -92,6 +93,7 @@ impl Controller {
             effective_zoom: 1.0,
             exposure_edit_start: None,
             contrast_edit_start: None,
+            shadows_highlights_edit_start: None,
             white_balance_edit_start: None,
             saturation_edit_start: None,
             sharpness_edit_start: None,
@@ -357,6 +359,69 @@ impl Controller {
                     return;
                 };
                 controller.borrow_mut().reset_contrast(&ui);
+            });
+        }
+
+        {
+            let controller = Rc::clone(controller);
+            let weak_ui = weak_ui.clone();
+            ui.on_shadows_preview(move |amount| {
+                let Some(ui) = weak_ui.upgrade() else {
+                    return;
+                };
+                controller
+                    .borrow_mut()
+                    .preview_shadows(&ui, amount.clamp(-100.0, 100.0));
+            });
+        }
+
+        {
+            let controller = Rc::clone(controller);
+            let weak_ui = weak_ui.clone();
+            ui.on_shadows_commit(move |amount| {
+                let Some(ui) = weak_ui.upgrade() else {
+                    return;
+                };
+                controller
+                    .borrow_mut()
+                    .commit_shadows(&ui, amount.clamp(-100.0, 100.0));
+            });
+        }
+
+        {
+            let controller = Rc::clone(controller);
+            let weak_ui = weak_ui.clone();
+            ui.on_highlights_preview(move |amount| {
+                let Some(ui) = weak_ui.upgrade() else {
+                    return;
+                };
+                controller
+                    .borrow_mut()
+                    .preview_highlights(&ui, amount.clamp(-100.0, 100.0));
+            });
+        }
+
+        {
+            let controller = Rc::clone(controller);
+            let weak_ui = weak_ui.clone();
+            ui.on_highlights_commit(move |amount| {
+                let Some(ui) = weak_ui.upgrade() else {
+                    return;
+                };
+                controller
+                    .borrow_mut()
+                    .commit_highlights(&ui, amount.clamp(-100.0, 100.0));
+            });
+        }
+
+        {
+            let controller = Rc::clone(controller);
+            let weak_ui = weak_ui.clone();
+            ui.on_reset_shadows_highlights_requested(move || {
+                let Some(ui) = weak_ui.upgrade() else {
+                    return;
+                };
+                controller.borrow_mut().reset_shadows_highlights(&ui);
             });
         }
 
@@ -918,6 +983,7 @@ impl Controller {
         self.image_info = Some(info);
         self.exposure_edit_start = None;
         self.contrast_edit_start = None;
+        self.shadows_highlights_edit_start = None;
         self.white_balance_edit_start = None;
         self.saturation_edit_start = None;
         self.sharpness_edit_start = None;
@@ -946,6 +1012,11 @@ impl Controller {
         ui.set_exposure_text(format_exposure(document.exposure_ev()).into());
         ui.set_contrast(document.contrast());
         ui.set_contrast_text(format_adjustment(document.contrast()).into());
+        let sh = document.shadows_highlights();
+        ui.set_shadows(sh.shadows);
+        ui.set_shadows_text(format_adjustment(sh.shadows).into());
+        ui.set_highlights(sh.highlights);
+        ui.set_highlights_text(format_adjustment(sh.highlights).into());
         self.set_white_balance_ui(ui, document.white_balance());
         ui.set_saturation(document.saturation());
         ui.set_saturation_text(format_adjustment(document.saturation()).into());
@@ -1278,6 +1349,115 @@ impl Controller {
         }
     }
 
+    fn preview_shadows(&mut self, ui: &AppWindow, amount: f32) {
+        if self.curve_edit_start.is_some() || self.crop_edit_start.is_some() {
+            return;
+        }
+        let Some(document) = self.document.as_mut() else {
+            return;
+        };
+        if self.shadows_highlights_edit_start.is_none() {
+            self.shadows_highlights_edit_start = Some(document.shadows_highlights());
+        }
+        let mut adjustment = document.shadows_highlights();
+        adjustment.shadows = amount;
+        if let Err(error) = document.preview_shadows_highlights(adjustment) {
+            self.show_error(ui, "Could not apply shadows", &error);
+            return;
+        }
+        ui.set_shadows_text(format_adjustment(amount).into());
+        self.mark_changed();
+        self.queue_preview(ui);
+    }
+
+    fn commit_shadows(&mut self, ui: &AppWindow, amount: f32) {
+        if self.curve_edit_start.is_some() || self.crop_edit_start.is_some() {
+            return;
+        }
+        let Some(document) = self.document.as_mut() else {
+            return;
+        };
+        let before = self
+            .shadows_highlights_edit_start
+            .take()
+            .unwrap_or_else(|| document.shadows_highlights());
+        let mut after = before;
+        after.shadows = amount;
+        if let Err(error) = document.commit_shadows_highlights(before, after) {
+            self.show_error(ui, "Could not commit shadows", &error);
+            return;
+        }
+        ui.set_shadows_text(format_adjustment(amount).into());
+        self.mark_changed();
+        self.update_history_ui(ui);
+    }
+
+    fn preview_highlights(&mut self, ui: &AppWindow, amount: f32) {
+        if self.curve_edit_start.is_some() || self.crop_edit_start.is_some() {
+            return;
+        }
+        let Some(document) = self.document.as_mut() else {
+            return;
+        };
+        if self.shadows_highlights_edit_start.is_none() {
+            self.shadows_highlights_edit_start = Some(document.shadows_highlights());
+        }
+        let mut adjustment = document.shadows_highlights();
+        adjustment.highlights = amount;
+        if let Err(error) = document.preview_shadows_highlights(adjustment) {
+            self.show_error(ui, "Could not apply highlights", &error);
+            return;
+        }
+        ui.set_highlights_text(format_adjustment(amount).into());
+        self.mark_changed();
+        self.queue_preview(ui);
+    }
+
+    fn commit_highlights(&mut self, ui: &AppWindow, amount: f32) {
+        if self.curve_edit_start.is_some() || self.crop_edit_start.is_some() {
+            return;
+        }
+        let Some(document) = self.document.as_mut() else {
+            return;
+        };
+        let before = self
+            .shadows_highlights_edit_start
+            .take()
+            .unwrap_or_else(|| document.shadows_highlights());
+        let mut after = before;
+        after.highlights = amount;
+        if let Err(error) = document.commit_shadows_highlights(before, after) {
+            self.show_error(ui, "Could not commit highlights", &error);
+            return;
+        }
+        ui.set_highlights_text(format_adjustment(amount).into());
+        self.mark_changed();
+        self.update_history_ui(ui);
+    }
+
+    fn reset_shadows_highlights(&mut self, ui: &AppWindow) {
+        if self.curve_edit_start.is_some() || self.crop_edit_start.is_some() {
+            return;
+        }
+        let Some(document) = self.document.as_mut() else {
+            return;
+        };
+        let before = document.shadows_highlights();
+        if document
+            .commit_shadows_highlights(before, ShadowsHighlights::IDENTITY)
+            .is_ok()
+        {
+            self.shadows_highlights_edit_start = None;
+            ui.set_shadows(0.0);
+            ui.set_shadows_text(format_adjustment(0.0).into());
+            ui.set_highlights(0.0);
+            ui.set_highlights_text(format_adjustment(0.0).into());
+            self.mark_changed();
+            self.update_history_ui(ui);
+            self.queue_preview(ui);
+        }
+    }
+
     fn preview_frame(&mut self, ui: &AppWindow, width_pct: f32) {
         if self.crop_edit_start.is_some() || self.curve_edit_start.is_some() {
             return;
@@ -1379,6 +1559,7 @@ impl Controller {
         document.view = ViewState::default();
         self.exposure_edit_start = None;
         self.contrast_edit_start = None;
+        self.shadows_highlights_edit_start = None;
         self.white_balance_edit_start = None;
         self.saturation_edit_start = None;
         self.sharpness_edit_start = None;
@@ -1389,6 +1570,10 @@ impl Controller {
         ui.set_exposure_text(format_exposure(0.0).into());
         ui.set_contrast(0.0);
         ui.set_contrast_text(format_adjustment(0.0).into());
+        ui.set_shadows(0.0);
+        ui.set_shadows_text(format_adjustment(0.0).into());
+        ui.set_highlights(0.0);
+        ui.set_highlights_text(format_adjustment(0.0).into());
         self.set_white_balance_ui(ui, WhiteBalance::IDENTITY);
         ui.set_saturation(0.0);
         ui.set_saturation_text(format_adjustment(0.0).into());
@@ -1724,6 +1909,7 @@ impl Controller {
         };
         self.exposure_edit_start = None;
         self.contrast_edit_start = None;
+        self.shadows_highlights_edit_start = None;
         self.white_balance_edit_start = None;
         self.saturation_edit_start = None;
         self.sharpness_edit_start = None;
@@ -1742,6 +1928,11 @@ impl Controller {
             ui.set_exposure_text(format_exposure(exposure).into());
             ui.set_contrast(contrast);
             ui.set_contrast_text(format_adjustment(contrast).into());
+            let shadows_highlights = document.shadows_highlights();
+            ui.set_shadows(shadows_highlights.shadows);
+            ui.set_shadows_text(format_adjustment(shadows_highlights.shadows).into());
+            ui.set_highlights(shadows_highlights.highlights);
+            ui.set_highlights_text(format_adjustment(shadows_highlights.highlights).into());
             self.set_white_balance_ui(ui, white_balance);
             ui.set_saturation(saturation);
             ui.set_saturation_text(format_adjustment(saturation).into());
@@ -1771,6 +1962,7 @@ impl Controller {
         };
         self.exposure_edit_start = None;
         self.contrast_edit_start = None;
+        self.shadows_highlights_edit_start = None;
         self.white_balance_edit_start = None;
         self.saturation_edit_start = None;
         self.sharpness_edit_start = None;
@@ -1789,6 +1981,11 @@ impl Controller {
             ui.set_exposure_text(format_exposure(exposure).into());
             ui.set_contrast(contrast);
             ui.set_contrast_text(format_adjustment(contrast).into());
+            let shadows_highlights = document.shadows_highlights();
+            ui.set_shadows(shadows_highlights.shadows);
+            ui.set_shadows_text(format_adjustment(shadows_highlights.shadows).into());
+            ui.set_highlights(shadows_highlights.highlights);
+            ui.set_highlights_text(format_adjustment(shadows_highlights.highlights).into());
             self.set_white_balance_ui(ui, white_balance);
             ui.set_saturation(saturation);
             ui.set_saturation_text(format_adjustment(saturation).into());
