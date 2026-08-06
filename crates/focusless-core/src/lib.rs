@@ -9,5 +9,6 @@ pub use document::{
     ToneCurve, ViewState, WhiteBalance,
 };
 pub use render::{
-    ExportFormat, ExportRequest, PreviewRequest, RenderError, RenderResult, Viewport,
+    CopyRequest, CopyResult, ExportFormat, ExportRequest, PreviewRequest, RenderError,
+    RenderResult, Viewport,
 };

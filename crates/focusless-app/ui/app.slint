@@ -1,4 +1,4 @@
-import { Palette, ScrollView, Slider } from "std-widgets.slint";
+import { Palette, ScrollView, Slider, LineEdit } from "std-widgets.slint";
 
 component ActionButton inherits Rectangle {
     in property <string> text;
@@ -72,6 +72,41 @@ component Divider inherits Rectangle {
     background: #343840;
 }
 
+component EditableValueLabel inherits HorizontalLayout {
+    in property <string> text;
+    in property <bool> enabled: true;
+    in-out property <bool> editing: false;
+    callback accepted(string);
+
+    alignment: end;
+    
+    Text {
+        text: root.text;
+        color: #9fa7b4;
+        font-size: 13px;
+        horizontal-alignment: right;
+        vertical-alignment: center;
+        visible: !root.editing;
+        
+        TouchArea {
+            enabled: root.enabled;
+            clicked => {
+                root.editing = true;
+                input.text = root.text;
+                input.focus();
+            }
+        }
+    }
+    input := LineEdit {
+        width: 60px;
+        visible: root.editing;
+        accepted(t) => {
+            root.editing = false;
+            root.accepted(t);
+        }
+    }
+}
+
 export component AppWindow inherits Window {
     title: document-loaded ? file-name + " — Focusless Edit" : "Focusless Edit";
     preferred-width: 1180px;
@@ -91,6 +126,8 @@ export component AppWindow inherits Window {
     in-out property <float> shadows: 0;
     in-out property <float> highlights: 0;
     in-out property <float> rotation-angle: 0;
+    callback copy-image-requested();
+
     in-out property <bool> rotation-mode: false;
     in-out property <float> crop-x: 0;
     in-out property <float> crop-y: 0;
@@ -165,6 +202,10 @@ export component AppWindow inherits Window {
     callback white-balance-preview(temperature: float, tint: float);
     callback white-balance-commit(temperature: float, tint: float);
     callback reset-white-balance-requested;
+    callback reset-temperature-requested;
+    callback reset-tint-requested;
+    callback reset-shadows-requested;
+    callback reset-highlights-requested;
     callback saturation-preview(amount: float);
     callback saturation-commit(amount: float);
     callback reset-saturation-requested;
@@ -195,8 +236,19 @@ export component AppWindow inherits Window {
     callback crop-cancel-requested;
     callback frame-width-preview(width-pct: float);
     callback frame-width-commit(width-pct: float);
+    callback frame-width-value-submitted(string);
     callback frame-color-changed(r: int, g: int, b: int);
     callback reset-frame-requested;
+
+    callback exposure-value-submitted(string);
+    callback contrast-value-submitted(string);
+    callback shadows-value-submitted(string);
+    callback highlights-value-submitted(string);
+    callback temperature-value-submitted(string);
+    callback tint-value-submitted(string);
+    callback saturation-value-submitted(string);
+    callback sharpness-value-submitted(string);
+    callback rotation-value-submitted(string);
 
     init => {
         Palette.color-scheme = ColorScheme.dark;
@@ -268,6 +320,12 @@ export component AppWindow inherits Window {
                 if root.exporting: ActionButton {
                     text: "Cancel";
                     clicked => { root.cancel-export-requested(); }
+                }
+                ActionButton {
+                    text: "Copy";
+                    enabled: root.document-loaded && !root.exporting
+                        && !root.crop-mode;
+                    clicked => { root.copy-image-requested(); }
                 }
 
                 Rectangle { horizontal-stretch: 1; background: transparent; }
@@ -882,12 +940,6 @@ export component AppWindow inherits Window {
                             font-weight: 700;
                             vertical-alignment: center;
                         }
-                        Rectangle { horizontal-stretch: 1; background: transparent; }
-                        ResetButton {
-                            enabled: root.document-loaded && !root.crop-mode && !root.curve-mode
-                                && (abs(root.temperature) > 0.001 || abs(root.tint) > 0.001);
-                            clicked => { root.reset-white-balance-requested(); }
-                        }
                     }
 
                     HorizontalLayout {
@@ -899,11 +951,15 @@ export component AppWindow inherits Window {
                             font-weight: 600;
                         }
                         Rectangle { horizontal-stretch: 1; background: transparent; }
-                        Text {
+                        EditableValueLabel {
                             text: root.temperature-text;
-                            color: #9fa7b4;
-                            font-size: 13px;
-                            horizontal-alignment: right;
+                            enabled: root.document-loaded && !root.crop-mode && !root.curve-mode;
+                            accepted(t) => { root.temperature-value-submitted(t); }
+                        }
+                        ResetButton {
+                            enabled: root.document-loaded && !root.crop-mode && !root.curve-mode
+                                && abs(root.temperature) > 0.001;
+                            clicked => { root.reset-temperature-requested(); }
                         }
                     }
 
@@ -940,11 +996,15 @@ export component AppWindow inherits Window {
                             font-weight: 600;
                         }
                         Rectangle { horizontal-stretch: 1; background: transparent; }
-                        Text {
+                        EditableValueLabel {
                             text: root.tint-text;
-                            color: #9fa7b4;
-                            font-size: 13px;
-                            horizontal-alignment: right;
+                            enabled: root.document-loaded && !root.crop-mode && !root.curve-mode;
+                            accepted(t) => { root.tint-value-submitted(t); }
+                        }
+                        ResetButton {
+                            enabled: root.document-loaded && !root.crop-mode && !root.curve-mode
+                                && abs(root.tint) > 0.001;
+                            clicked => { root.reset-tint-requested(); }
                         }
                     }
 
@@ -986,11 +1046,10 @@ export component AppWindow inherits Window {
                             font-weight: 600;
                         }
                         Rectangle { horizontal-stretch: 1; background: transparent; }
-                        Text {
+                        EditableValueLabel {
                             text: root.exposure-text;
-                            color: #9fa7b4;
-                            font-size: 13px;
-                            horizontal-alignment: right;
+                            enabled: root.document-loaded && !root.crop-mode && !root.curve-mode;
+                            accepted(t) => { root.exposure-value-submitted(t); }
                         }
                         ResetButton {
                             enabled: root.document-loaded && !root.crop-mode
@@ -1037,11 +1096,10 @@ export component AppWindow inherits Window {
                             font-weight: 600;
                         }
                         Rectangle { horizontal-stretch: 1; background: transparent; }
-                        Text {
+                        EditableValueLabel {
                             text: root.contrast-text;
-                            color: #9fa7b4;
-                            font-size: 13px;
-                            horizontal-alignment: right;
+                            enabled: root.document-loaded && !root.crop-mode && !root.curve-mode;
+                            accepted(t) => { root.contrast-value-submitted(t); }
                         }
                         ResetButton {
                             enabled: root.document-loaded && !root.crop-mode
@@ -1080,18 +1138,12 @@ export component AppWindow inherits Window {
                     }
 
                     HorizontalLayout {
-                        spacing: 8px;
                         Text {
-                            text: "Highlights & Shadows";
-                            color: root.document-loaded ? #eef1f6 : #777d87;
-                            font-size: 14px;
-                            font-weight: 600;
-                        }
-                        Rectangle { horizontal-stretch: 1; background: transparent; }
-                        ResetButton {
-                            enabled: root.document-loaded && !root.crop-mode
-                                && !root.curve-mode && (abs(root.shadows) > 0.001 || abs(root.highlights) > 0.001);
-                            clicked => { root.reset-shadows-highlights-requested(); }
+                            text: "HIGHLIGHTS & SHADOWS";
+                            color: #828a97;
+                            font-size: 11px;
+                            font-weight: 700;
+                            vertical-alignment: center;
                         }
                     }
 
@@ -1103,11 +1155,15 @@ export component AppWindow inherits Window {
                             font-size: 13px;
                         }
                         Rectangle { horizontal-stretch: 1; background: transparent; }
-                        Text {
+                        EditableValueLabel {
                             text: root.highlights-text;
-                            color: #9fa7b4;
-                            font-size: 13px;
-                            horizontal-alignment: right;
+                            enabled: root.document-loaded && !root.crop-mode && !root.curve-mode;
+                            accepted(t) => { root.highlights-value-submitted(t); }
+                        }
+                        ResetButton {
+                            enabled: root.document-loaded && !root.crop-mode && !root.curve-mode
+                                && abs(root.highlights) > 0.001;
+                            clicked => { root.reset-highlights-requested(); }
                         }
                     }
 
@@ -1129,11 +1185,15 @@ export component AppWindow inherits Window {
                             font-size: 13px;
                         }
                         Rectangle { horizontal-stretch: 1; background: transparent; }
-                        Text {
+                        EditableValueLabel {
                             text: root.shadows-text;
-                            color: #9fa7b4;
-                            font-size: 13px;
-                            horizontal-alignment: right;
+                            enabled: root.document-loaded && !root.crop-mode && !root.curve-mode;
+                            accepted(t) => { root.shadows-value-submitted(t); }
+                        }
+                        ResetButton {
+                            enabled: root.document-loaded && !root.crop-mode && !root.curve-mode
+                                && abs(root.shadows) > 0.001;
+                            clicked => { root.reset-shadows-requested(); }
                         }
                     }
 
@@ -1207,11 +1267,10 @@ export component AppWindow inherits Window {
                             font-weight: 600;
                         }
                         Rectangle { horizontal-stretch: 1; background: transparent; }
-                        Text {
+                        EditableValueLabel {
                             text: root.saturation-text;
-                            color: #9fa7b4;
-                            font-size: 13px;
-                            horizontal-alignment: right;
+                            enabled: root.document-loaded && !root.crop-mode && !root.curve-mode;
+                            accepted(t) => { root.saturation-value-submitted(t); }
                         }
                         ResetButton {
                             enabled: root.document-loaded && !root.crop-mode
@@ -1270,11 +1329,10 @@ export component AppWindow inherits Window {
                             font-weight: 600;
                         }
                         Rectangle { horizontal-stretch: 1; background: transparent; }
-                        Text {
+                        EditableValueLabel {
                             text: root.sharpness-text;
-                            color: #9fa7b4;
-                            font-size: 13px;
-                            horizontal-alignment: right;
+                            enabled: root.document-loaded && !root.crop-mode && !root.curve-mode;
+                            accepted(t) => { root.sharpness-value-submitted(t); }
                         }
                         ResetButton {
                             enabled: root.document-loaded && !root.crop-mode
@@ -1285,7 +1343,7 @@ export component AppWindow inherits Window {
 
                     Slider {
                         minimum: 0;
-                        maximum: 300;
+                        maximum: 1000;
                         step: 1;
                         value <=> root.sharpness;
                         enabled: root.document-loaded && !root.crop-mode && !root.curve-mode;
@@ -1301,7 +1359,7 @@ export component AppWindow inherits Window {
                         }
                         Rectangle { horizontal-stretch: 1; background: transparent; }
                         Text {
-                            text: "300";
+                            text: "1000";
                             color: #6f7682;
                             font-size: 11px;
                         }
@@ -1328,10 +1386,10 @@ export component AppWindow inherits Window {
                             font-weight: 600;
                         }
                         Rectangle { horizontal-stretch: 1; background: transparent; }
-                        Text {
+                        EditableValueLabel {
                             text: root.rotation-text;
-                            color: #9fa7b4;
-                            font-size: 13px;
+                            enabled: root.document-loaded && !root.crop-mode && !root.curve-mode;
+                            accepted(t) => { root.rotation-value-submitted(t); }
                         }
                         ResetButton {
                             enabled: root.document-loaded && !root.crop-mode
@@ -1437,11 +1495,10 @@ export component AppWindow inherits Window {
                             font-weight: 600;
                         }
                         Rectangle { horizontal-stretch: 1; background: transparent; }
-                        Text {
+                        EditableValueLabel {
                             text: root.frame-width-text;
-                            color: #9fa7b4;
-                            font-size: 13px;
-                            horizontal-alignment: right;
+                            enabled: root.document-loaded && !root.crop-mode && !root.curve-mode;
+                            accepted(t) => { root.frame-width-value-submitted(t); }
                         }
                         ResetButton {
                             enabled: root.document-loaded && !root.crop-mode && !root.curve-mode
@@ -1684,6 +1741,10 @@ export component AppWindow inherits Window {
         KeyBinding {
             keys: @keys("1");
             activated => { root.actual-size-requested(); }
+        }
+        KeyBinding {
+            keys: @keys(Control + C);
+            activated => { root.copy-image-requested(); }
         }
     }
 }

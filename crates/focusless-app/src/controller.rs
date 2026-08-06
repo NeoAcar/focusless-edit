@@ -200,8 +200,20 @@ impl Controller {
             let weak_ui = weak_ui.clone();
             ui.on_cancel_export_requested(move || {
                 controller.borrow().engine.cancel_export();
+                if controller.borrow().exporting {
+                    if let Some(ui) = weak_ui.upgrade() {
+                        ui.set_status_text("Cancelling export…".into());
+                    }
+                }
+            });
+        }
+
+        {
+            let controller = Rc::clone(controller);
+            let weak_ui = weak_ui.clone();
+            ui.on_copy_image_requested(move || {
                 if let Some(ui) = weak_ui.upgrade() {
-                    ui.set_status_text("Cancelling export…".into());
+                    controller.borrow_mut().copy_image(&ui);
                 }
             });
         }
@@ -241,13 +253,42 @@ impl Controller {
         }
 
         {
-            let controller = Rc::clone(controller);
+            let controller = Rc::clone(&controller);
             let weak_ui = weak_ui.clone();
-            ui.on_reset_white_balance_requested(move || {
-                let Some(ui) = weak_ui.upgrade() else {
-                    return;
-                };
-                controller.borrow_mut().reset_white_balance(&ui);
+            ui.on_reset_temperature_requested(move || {
+                if let Some(ui) = weak_ui.upgrade() {
+                    controller.borrow_mut().reset_temperature(&ui);
+                }
+            });
+        }
+
+        {
+            let controller = Rc::clone(&controller);
+            let weak_ui = weak_ui.clone();
+            ui.on_reset_tint_requested(move || {
+                if let Some(ui) = weak_ui.upgrade() {
+                    controller.borrow_mut().reset_tint(&ui);
+                }
+            });
+        }
+
+        {
+            let controller = Rc::clone(&controller);
+            let weak_ui = weak_ui.clone();
+            ui.on_reset_shadows_requested(move || {
+                if let Some(ui) = weak_ui.upgrade() {
+                    controller.borrow_mut().reset_shadows(&ui);
+                }
+            });
+        }
+
+        {
+            let controller = Rc::clone(&controller);
+            let weak_ui = weak_ui.clone();
+            ui.on_reset_highlights_requested(move || {
+                if let Some(ui) = weak_ui.upgrade() {
+                    controller.borrow_mut().reset_highlights(&ui);
+                }
             });
         }
 
@@ -297,7 +338,7 @@ impl Controller {
                 };
                 controller
                     .borrow_mut()
-                    .preview_sharpness(&ui, amount.clamp(0.0, 300.0));
+                    .preview_sharpness(&ui, amount.clamp(0.0, 1000.0));
             });
         }
 
@@ -310,7 +351,7 @@ impl Controller {
                 };
                 controller
                     .borrow_mut()
-                    .commit_sharpness(&ui, amount.clamp(0.0, 300.0));
+                    .commit_sharpness(&ui, amount.clamp(0.0, 1000.0));
             });
         }
 
@@ -415,13 +456,135 @@ impl Controller {
         }
 
         {
-            let controller = Rc::clone(controller);
+            let controller = Rc::clone(&controller);
             let weak_ui = weak_ui.clone();
-            ui.on_reset_shadows_highlights_requested(move || {
-                let Some(ui) = weak_ui.upgrade() else {
-                    return;
-                };
-                controller.borrow_mut().reset_shadows_highlights(&ui);
+            ui.on_exposure_value_submitted(move |text| {
+                if let Some(ui) = weak_ui.upgrade() {
+                    if let Ok(val) = text.trim().parse::<f32>() {
+                        controller.borrow_mut().commit_exposure(&ui, val.clamp(-3.0, 3.0));
+                        controller.borrow_mut().queue_preview(&ui);
+                    }
+                }
+            });
+        }
+
+        {
+            let controller = Rc::clone(&controller);
+            let weak_ui = weak_ui.clone();
+            ui.on_contrast_value_submitted(move |text| {
+                if let Some(ui) = weak_ui.upgrade() {
+                    if let Ok(val) = text.trim().parse::<f32>() {
+                        controller.borrow_mut().commit_contrast(&ui, val.clamp(-100.0, 100.0));
+                        controller.borrow_mut().queue_preview(&ui);
+                    }
+                }
+            });
+        }
+
+        {
+            let controller = Rc::clone(&controller);
+            let weak_ui = weak_ui.clone();
+            ui.on_temperature_value_submitted(move |text| {
+                if let Some(ui) = weak_ui.upgrade() {
+                    if let Ok(val) = text.trim().parse::<f32>() {
+                        let mut wb = controller.borrow().document.as_ref().map(|d| d.white_balance()).unwrap_or(focusless_core::WhiteBalance::IDENTITY);
+                        wb.temperature = val.clamp(-100.0, 100.0);
+                        controller.borrow_mut().commit_white_balance(&ui, wb);
+                        controller.borrow_mut().queue_preview(&ui);
+                    }
+                }
+            });
+        }
+
+        {
+            let controller = Rc::clone(&controller);
+            let weak_ui = weak_ui.clone();
+            ui.on_tint_value_submitted(move |text| {
+                if let Some(ui) = weak_ui.upgrade() {
+                    if let Ok(val) = text.trim().parse::<f32>() {
+                        let mut wb = controller.borrow().document.as_ref().map(|d| d.white_balance()).unwrap_or(focusless_core::WhiteBalance::IDENTITY);
+                        wb.tint = val.clamp(-100.0, 100.0);
+                        controller.borrow_mut().commit_white_balance(&ui, wb);
+                        controller.borrow_mut().queue_preview(&ui);
+                    }
+                }
+            });
+        }
+
+        {
+            let controller = Rc::clone(&controller);
+            let weak_ui = weak_ui.clone();
+            ui.on_shadows_value_submitted(move |text| {
+                if let Some(ui) = weak_ui.upgrade() {
+                    if let Ok(val) = text.trim().parse::<f32>() {
+                        controller.borrow_mut().commit_shadows(&ui, val.clamp(-100.0, 100.0));
+                        controller.borrow_mut().queue_preview(&ui);
+                    }
+                }
+            });
+        }
+
+        {
+            let controller = Rc::clone(&controller);
+            let weak_ui = weak_ui.clone();
+            ui.on_highlights_value_submitted(move |text| {
+                if let Some(ui) = weak_ui.upgrade() {
+                    if let Ok(val) = text.trim().parse::<f32>() {
+                        controller.borrow_mut().commit_highlights(&ui, val.clamp(-100.0, 100.0));
+                        controller.borrow_mut().queue_preview(&ui);
+                    }
+                }
+            });
+        }
+
+        {
+            let controller = Rc::clone(&controller);
+            let weak_ui = weak_ui.clone();
+            ui.on_saturation_value_submitted(move |text| {
+                if let Some(ui) = weak_ui.upgrade() {
+                    if let Ok(val) = text.trim().parse::<f32>() {
+                        controller.borrow_mut().commit_saturation(&ui, val.clamp(-100.0, 100.0));
+                        controller.borrow_mut().queue_preview(&ui);
+                    }
+                }
+            });
+        }
+
+        {
+            let controller = Rc::clone(&controller);
+            let weak_ui = weak_ui.clone();
+            ui.on_sharpness_value_submitted(move |text| {
+                if let Some(ui) = weak_ui.upgrade() {
+                    if let Ok(val) = text.trim().parse::<f32>() {
+                        controller.borrow_mut().commit_sharpness(&ui, val.clamp(0.0, 1000.0));
+                        controller.borrow_mut().queue_preview(&ui);
+                    }
+                }
+            });
+        }
+
+        {
+            let controller = Rc::clone(&controller);
+            let weak_ui = weak_ui.clone();
+            ui.on_rotation_value_submitted(move |text| {
+                if let Some(ui) = weak_ui.upgrade() {
+                    if let Ok(val) = text.trim().parse::<f32>() {
+                        controller.borrow_mut().commit_rotation(&ui, val.clamp(-45.0, 45.0));
+                        controller.borrow_mut().queue_preview(&ui);
+                    }
+                }
+            });
+        }
+        {
+            let controller = Rc::clone(&controller);
+            let weak_ui = weak_ui.clone();
+            ui.on_frame_width_value_submitted(move |text| {
+                if let Some(ui) = weak_ui.upgrade() {
+                    if let Ok(val) = text.trim().parse::<f32>() {
+                        controller.borrow_mut().commit_frame(&ui, val.clamp(0.0, 50.0));
+                        controller.borrow_mut().queue_preview(&ui);
+                    }
+                }
             });
         }
 
@@ -903,6 +1066,30 @@ impl Controller {
                     Err(error) => self.show_error(ui, "Export failed", &error),
                 }
             }
+            EngineEvent::ClipboardReady(result) => {
+                match result {
+                    Ok(copy_result) => {
+                        match arboard::Clipboard::new() {
+                            Ok(mut ctx) => {
+                                let image = arboard::ImageData {
+                                    width: copy_result.width as usize,
+                                    height: copy_result.height as usize,
+                                    bytes: std::borrow::Cow::Owned(copy_result.rgba8),
+                                };
+                                if let Err(e) = ctx.set_image(image) {
+                                    self.show_error(ui, "Failed to copy image", &e);
+                                } else {
+                                    ui.set_status_text("Image copied to clipboard".into());
+                                }
+                            }
+                            Err(e) => {
+                                self.show_error(ui, "Failed to initialize clipboard", &e);
+                            }
+                        }
+                    }
+                    Err(error) => self.show_error(ui, "Copy failed", &error),
+                }
+            }
         }
     }
 
@@ -1080,7 +1267,7 @@ impl Controller {
         self.update_history_ui(ui);
     }
 
-    fn reset_white_balance(&mut self, ui: &AppWindow) {
+    fn reset_temperature(&mut self, ui: &AppWindow) {
         if self.crop_edit_start.is_some() || self.curve_edit_start.is_some() {
             return;
         }
@@ -1088,12 +1275,34 @@ impl Controller {
             return;
         };
         let before = document.white_balance();
-        if document
-            .commit_white_balance(before, WhiteBalance::IDENTITY)
-            .is_ok()
-        {
+        let after = focusless_core::WhiteBalance {
+            temperature: 0.0,
+            tint: before.tint,
+        };
+        if document.commit_white_balance(before, after).is_ok() {
             self.white_balance_edit_start = None;
-            self.set_white_balance_ui(ui, WhiteBalance::IDENTITY);
+            self.set_white_balance_ui(ui, after);
+            self.mark_changed();
+            self.update_history_ui(ui);
+            self.queue_preview(ui);
+        }
+    }
+
+    fn reset_tint(&mut self, ui: &AppWindow) {
+        if self.crop_edit_start.is_some() || self.curve_edit_start.is_some() {
+            return;
+        }
+        let Some(document) = self.document.as_mut() else {
+            return;
+        };
+        let before = document.white_balance();
+        let after = focusless_core::WhiteBalance {
+            temperature: before.temperature,
+            tint: 0.0,
+        };
+        if document.commit_white_balance(before, after).is_ok() {
+            self.white_balance_edit_start = None;
+            self.set_white_balance_ui(ui, after);
             self.mark_changed();
             self.update_history_ui(ui);
             self.queue_preview(ui);
@@ -1134,6 +1343,7 @@ impl Controller {
             self.show_error(ui, "Could not commit saturation", &error);
             return;
         }
+        ui.set_saturation(amount);
         ui.set_saturation_text(format_adjustment(amount).into());
         self.mark_changed();
         self.update_history_ui(ui);
@@ -1213,6 +1423,7 @@ impl Controller {
             self.show_error(ui, "Could not commit sharpness", &error);
             return;
         }
+        ui.set_sharpness(amount);
         ui.set_sharpness_text(format_nonnegative_adjustment(amount).into());
         self.mark_changed();
         self.update_history_ui(ui);
@@ -1270,6 +1481,8 @@ impl Controller {
             self.show_error(ui, "Could not commit exposure", &error);
             return;
         }
+        ui.set_exposure(value);
+        ui.set_exposure_text(format_exposure(value).into());
         self.mark_changed();
         self.update_history_ui(ui);
     }
@@ -1326,6 +1539,7 @@ impl Controller {
             self.show_error(ui, "Could not commit contrast", &error);
             return;
         }
+        ui.set_contrast(amount);
         ui.set_contrast_text(format_adjustment(amount).into());
         self.mark_changed();
         self.update_history_ui(ui);
@@ -1387,6 +1601,7 @@ impl Controller {
             self.show_error(ui, "Could not commit shadows", &error);
             return;
         }
+        ui.set_shadows(amount);
         ui.set_shadows_text(format_adjustment(amount).into());
         self.mark_changed();
         self.update_history_ui(ui);
@@ -1430,12 +1645,13 @@ impl Controller {
             self.show_error(ui, "Could not commit highlights", &error);
             return;
         }
+        ui.set_highlights(amount);
         ui.set_highlights_text(format_adjustment(amount).into());
         self.mark_changed();
         self.update_history_ui(ui);
     }
 
-    fn reset_shadows_highlights(&mut self, ui: &AppWindow) {
+    fn reset_shadows(&mut self, ui: &AppWindow) {
         if self.curve_edit_start.is_some() || self.crop_edit_start.is_some() {
             return;
         }
@@ -1443,13 +1659,30 @@ impl Controller {
             return;
         };
         let before = document.shadows_highlights();
-        if document
-            .commit_shadows_highlights(before, ShadowsHighlights::IDENTITY)
-            .is_ok()
-        {
+        let mut after = before;
+        after.shadows = 0.0;
+        if document.commit_shadows_highlights(before, after).is_ok() {
             self.shadows_highlights_edit_start = None;
             ui.set_shadows(0.0);
             ui.set_shadows_text(format_adjustment(0.0).into());
+            self.mark_changed();
+            self.update_history_ui(ui);
+            self.queue_preview(ui);
+        }
+    }
+
+    fn reset_highlights(&mut self, ui: &AppWindow) {
+        if self.curve_edit_start.is_some() || self.crop_edit_start.is_some() {
+            return;
+        }
+        let Some(document) = self.document.as_mut() else {
+            return;
+        };
+        let before = document.shadows_highlights();
+        let mut after = before;
+        after.highlights = 0.0;
+        if document.commit_shadows_highlights(before, after).is_ok() {
+            self.shadows_highlights_edit_start = None;
             ui.set_highlights(0.0);
             ui.set_highlights_text(format_adjustment(0.0).into());
             self.mark_changed();
@@ -1495,6 +1728,7 @@ impl Controller {
             self.show_error(ui, "Could not commit frame", &error);
             return;
         }
+        ui.set_frame_width(width_pct);
         ui.set_frame_width_text(format!("{:.0}%", width_pct).into());
         self.mark_changed();
         self.update_history_ui(ui);
@@ -1733,6 +1967,8 @@ impl Controller {
             self.show_error(ui, "Could not commit rotation", &error);
             return;
         }
+        ui.set_rotation_angle(degrees);
+        ui.set_rotation_text(format!("{degrees:+.1}°").into());
         document.view = ViewState::default();
         self.update_transform_ui(ui);
         self.update_image_info(ui);
@@ -1898,6 +2134,27 @@ impl Controller {
         self.update_transform_ui(ui);
         self.update_history_ui(ui);
         self.queue_preview(ui);
+    }
+
+    fn copy_image(&mut self, ui: &AppWindow) {
+        if self.exporting {
+            return;
+        }
+        if self.crop_edit_start.is_some() {
+            ui.set_status_text("Apply or cancel the crop before copying".into());
+            return;
+        }
+
+        let document = match self.document.as_ref() {
+            Some(doc) => doc,
+            None => return,
+        };
+
+        ui.set_status_text("Copying image...".into());
+        self.engine.copy_clipboard(focusless_core::CopyRequest {
+            source_path: document.source.path.clone(),
+            operations: document.operations.clone(),
+        });
     }
 
     fn undo(&mut self, ui: &AppWindow) {

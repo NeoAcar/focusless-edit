@@ -478,7 +478,7 @@ pub enum DocumentError {
     InvalidWhiteBalance,
     #[error("saturation must be finite and between -100 and +100")]
     InvalidSaturation,
-    #[error("sharpness must be finite and between 0 and 300")]
+    #[error("sharpness must be finite and between 0 and 1000")]
     InvalidSharpness,
     #[error("shadows and highlights must be finite and between -100 and +100")]
     InvalidShadowsHighlights,
@@ -1444,7 +1444,7 @@ fn validate_saturation(amount: f32) -> Result<(), DocumentError> {
 }
 
 fn validate_sharpness(amount: f32) -> Result<(), DocumentError> {
-    if amount.is_finite() && (0.0..=300.0).contains(&amount) {
+    if amount.is_finite() && (0.0..=1000.0).contains(&amount) {
         Ok(())
     } else {
         Err(DocumentError::InvalidSharpness)
@@ -1678,7 +1678,7 @@ mod tests {
             Err(DocumentError::InvalidSharpness)
         );
         assert_eq!(
-            document.preview_sharpness(300.1),
+            document.preview_sharpness(1000.1),
             Err(DocumentError::InvalidSharpness)
         );
     }

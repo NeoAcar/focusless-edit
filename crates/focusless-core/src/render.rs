@@ -59,6 +59,19 @@ pub struct ExportRequest {
     pub format: ExportFormat,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct CopyRequest {
+    pub source_path: PathBuf,
+    pub operations: Vec<Operation>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CopyResult {
+    pub width: u32,
+    pub height: u32,
+    pub rgba8: Vec<u8>,
+}
+
 #[derive(Debug, Error)]
 pub enum RenderError {
     #[error("image dimensions are invalid")]

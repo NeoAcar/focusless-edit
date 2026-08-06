@@ -181,6 +181,7 @@ fn wait_for_preview(
             Some(
                 EngineEvent::Inspected { .. }
                 | EngineEvent::ExportStarted { .. }
+                | EngineEvent::ClipboardReady(..)
                 | EngineEvent::ExportFinished { .. },
             )
             | None => thread::sleep(Duration::from_millis(2)),

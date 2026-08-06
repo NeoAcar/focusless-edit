@@ -19,7 +19,7 @@ use std::{
 
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded, select, unbounded};
 use focusless_core::{
-    CropRect, ExportFormat, ExportRequest, FrameColor, Operation, PreviewRequest, RenderError,
+    CopyRequest, CopyResult, CropRect, ExportFormat, ExportRequest, FrameColor, Operation, PreviewRequest, RenderError,
     RenderResult, ShadowsHighlights, ToneCurve, Viewport, WhiteBalance,
 };
 use tracing::{debug, error};
@@ -35,6 +35,7 @@ pub struct ImageInfo {
 pub enum EngineCommand {
     Inspect { path: PathBuf },
     Export(ExportRequest),
+    CopyClipboard(CopyRequest),
     Shutdown,
 }
 
@@ -53,6 +54,7 @@ pub enum EngineEvent {
         destination: PathBuf,
         result: Result<(), RenderError>,
     },
+    ClipboardReady(Result<CopyResult, RenderError>),
 }
 
 /// UI-facing handle for the dedicated libvips worker.
@@ -115,6 +117,11 @@ impl EngineWorker {
         self.cancel_export.store(true, Ordering::Release);
     }
 
+    pub fn copy_clipboard(&self, request: CopyRequest) {
+        self.cancel_export.store(false, Ordering::Release);
+        let _ = self.command_tx.send(EngineCommand::CopyClipboard(request));
+    }
+
     #[must_use]
     pub fn try_event(&self) -> Option<EngineEvent> {
         self.event_rx.try_recv().ok()
@@ -159,6 +166,10 @@ fn worker_loop(
                     });
                     let result = engine.export(&request, &cancel_export);
                     let _ = event_tx.send(EngineEvent::ExportFinished { destination, result });
+                }
+                Ok(EngineCommand::CopyClipboard(request)) => {
+                    let result = engine.copy_clipboard(&request, &cancel_export);
+                    let _ = event_tx.send(EngineEvent::ClipboardReady(result));
                 }
                 Ok(EngineCommand::Shutdown) | Err(_) => break,
             },
@@ -418,6 +429,26 @@ impl VipsEngine {
         }
         replace_file(&temporary, &request.destination_path)?;
         Ok(())
+    }
+
+    fn copy_clipboard(&self, request: &CopyRequest, cancelled: &AtomicBool) -> Result<CopyResult, RenderError> {
+        if cancelled.load(Ordering::Acquire) {
+            return Err(RenderError::Cancelled);
+        }
+
+        let source = load_oriented(&request.source_path)?;
+        let source = to_working_linear(&source, &self.srgb_profile)?;
+        let adjusted = apply_operations(&source, &request.operations)?;
+        let display = from_working_linear(&adjusted)?;
+        let rgba = ensure_rgba8(&display)?;
+        let info = dimensions(&rgba)?;
+        let rgba8 = rgba.write_to_memory();
+
+        Ok(CopyResult {
+            width: info.width,
+            height: info.height,
+            rgba8,
+        })
     }
 
     #[allow(dead_code)]
@@ -2154,7 +2185,7 @@ mod tests {
             .render_preview(&PreviewRequest {
                 generation: 21,
                 source_path,
-                operations: vec![Operation::Sharpness { amount: 300.0 }],
+                operations: vec![Operation::Sharpness { amount: 1000.0 }],
                 viewport: Viewport::fit(9, 3),
             })
             .unwrap();
