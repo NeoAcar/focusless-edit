@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub const PROJECT_SCHEMA_VERSION: u32 = 14;
+pub const PROJECT_SCHEMA_VERSION: u32 = 15;
 pub const MAX_HISTORY_LEN: usize = 200;
 const MIN_CROP_EXTENT: f32 = 0.01;
 const MAX_FRAME_WIDTH_PCT: f32 = 50.0;
@@ -659,6 +659,19 @@ impl ProjectDocument {
                     adjustment: ShadowsHighlights::IDENTITY,
                 },
             );
+        }
+        if self.schema_version < 15 {
+            for operation in &mut self.operations {
+                invert_shadows_highlights(operation);
+            }
+            for command in self
+                .history
+                .undo
+                .iter_mut()
+                .chain(self.history.redo.iter_mut())
+            {
+                invert_shadows_highlights_command(command);
+            }
         }
         self.schema_version = PROJECT_SCHEMA_VERSION;
         Ok(())
@@ -1467,6 +1480,30 @@ fn validate_contrast(amount: f32) -> Result<(), DocumentError> {
     }
 }
 
+fn invert_shadows_highlights(operation: &mut Operation) {
+    if let Operation::ShadowsHighlights { adjustment } = operation {
+        adjustment.shadows = -adjustment.shadows;
+        adjustment.highlights = -adjustment.highlights;
+    }
+}
+
+fn invert_shadows_highlights_command(command: &mut Command) {
+    match command {
+        Command::SetShadowsHighlights { before, after } => {
+            before.shadows = -before.shadows;
+            before.highlights = -before.highlights;
+            after.shadows = -after.shadows;
+            after.highlights = -after.highlights;
+        }
+        Command::RestoreOriginal { before, after } => {
+            for operation in before.iter_mut().chain(after.iter_mut()) {
+                invert_shadows_highlights(operation);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn validate_shadows_highlights(adjustment: ShadowsHighlights) -> Result<(), DocumentError> {
     if adjustment.shadows.is_finite()
         && (-100.0..=100.0).contains(&adjustment.shadows)
@@ -1924,6 +1961,72 @@ mod tests {
             .position(|operation| matches!(operation, Operation::Sharpness { .. }))
             .unwrap();
         assert!(saturation_index < matrix_index && matrix_index < sharpness_index);
+    }
+
+    #[test]
+    fn schema_v13_migrates_with_neutral_shadows_highlights_in_render_order() {
+        let mut document = document();
+        document.schema_version = 13;
+        document
+            .operations
+            .retain(|operation| !matches!(operation, Operation::ShadowsHighlights { .. }));
+
+        document.upgrade_to_latest().unwrap();
+
+        assert_eq!(document.schema_version, PROJECT_SCHEMA_VERSION);
+        assert_eq!(document.shadows_highlights(), ShadowsHighlights::IDENTITY);
+        let contrast_index = document
+            .operations
+            .iter()
+            .position(|operation| matches!(operation, Operation::Contrast { .. }))
+            .unwrap();
+        let adjustment_index = document
+            .operations
+            .iter()
+            .position(|operation| matches!(operation, Operation::ShadowsHighlights { .. }))
+            .unwrap();
+        let tone_curve_index = document
+            .operations
+            .iter()
+            .position(|operation| matches!(operation, Operation::ToneCurve { .. }))
+            .unwrap();
+        assert!(contrast_index < adjustment_index && adjustment_index < tone_curve_index);
+    }
+
+    #[test]
+    fn schema_v14_migrates_shadows_and_highlights_directions() {
+        let mut document = document();
+        document.schema_version = 14;
+        document
+            .commit_shadows_highlights(
+                ShadowsHighlights::IDENTITY,
+                ShadowsHighlights {
+                    shadows: 25.0,
+                    highlights: 40.0,
+                },
+            )
+            .unwrap();
+
+        document.upgrade_to_latest().unwrap();
+
+        assert_eq!(document.schema_version, PROJECT_SCHEMA_VERSION);
+        assert_eq!(
+            document.shadows_highlights(),
+            ShadowsHighlights {
+                shadows: -25.0,
+                highlights: -40.0,
+            }
+        );
+        assert!(document.undo());
+        assert_eq!(document.shadows_highlights(), ShadowsHighlights::IDENTITY);
+        assert!(document.redo());
+        assert_eq!(
+            document.shadows_highlights(),
+            ShadowsHighlights {
+                shadows: -25.0,
+                highlights: -40.0,
+            }
+        );
     }
 
     #[test]

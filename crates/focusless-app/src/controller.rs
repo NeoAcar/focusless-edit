@@ -200,10 +200,10 @@ impl Controller {
             let weak_ui = weak_ui.clone();
             ui.on_cancel_export_requested(move || {
                 controller.borrow().engine.cancel_export();
-                if controller.borrow().exporting {
-                    if let Some(ui) = weak_ui.upgrade() {
-                        ui.set_status_text("Cancelling export…".into());
-                    }
+                if controller.borrow().exporting
+                    && let Some(ui) = weak_ui.upgrade()
+                {
+                    ui.set_status_text("Cancelling export…".into());
                 }
             });
         }
@@ -253,7 +253,7 @@ impl Controller {
         }
 
         {
-            let controller = Rc::clone(&controller);
+            let controller = Rc::clone(controller);
             let weak_ui = weak_ui.clone();
             ui.on_reset_temperature_requested(move || {
                 if let Some(ui) = weak_ui.upgrade() {
@@ -263,7 +263,7 @@ impl Controller {
         }
 
         {
-            let controller = Rc::clone(&controller);
+            let controller = Rc::clone(controller);
             let weak_ui = weak_ui.clone();
             ui.on_reset_tint_requested(move || {
                 if let Some(ui) = weak_ui.upgrade() {
@@ -273,7 +273,7 @@ impl Controller {
         }
 
         {
-            let controller = Rc::clone(&controller);
+            let controller = Rc::clone(controller);
             let weak_ui = weak_ui.clone();
             ui.on_reset_shadows_requested(move || {
                 if let Some(ui) = weak_ui.upgrade() {
@@ -283,7 +283,7 @@ impl Controller {
         }
 
         {
-            let controller = Rc::clone(&controller);
+            let controller = Rc::clone(controller);
             let weak_ui = weak_ui.clone();
             ui.on_reset_highlights_requested(move || {
                 if let Some(ui) = weak_ui.upgrade() {
@@ -456,135 +456,169 @@ impl Controller {
         }
 
         {
-            let controller = Rc::clone(&controller);
+            let controller = Rc::clone(controller);
             let weak_ui = weak_ui.clone();
             ui.on_exposure_value_submitted(move |text| {
-                if let Some(ui) = weak_ui.upgrade() {
-                    if let Ok(val) = text.trim().parse::<f32>() {
-                        controller.borrow_mut().commit_exposure(&ui, val.clamp(-3.0, 3.0));
-                        controller.borrow_mut().queue_preview(&ui);
-                    }
-                }
+                let Some(ui) = weak_ui.upgrade() else {
+                    return;
+                };
+                let Some(value) = submitted_value(&ui, text.as_str(), -3.0, 3.0) else {
+                    return;
+                };
+                let mut controller = controller.borrow_mut();
+                controller.commit_exposure(&ui, value);
+                controller.queue_preview(&ui);
             });
         }
 
         {
-            let controller = Rc::clone(&controller);
+            let controller = Rc::clone(controller);
             let weak_ui = weak_ui.clone();
             ui.on_contrast_value_submitted(move |text| {
-                if let Some(ui) = weak_ui.upgrade() {
-                    if let Ok(val) = text.trim().parse::<f32>() {
-                        controller.borrow_mut().commit_contrast(&ui, val.clamp(-100.0, 100.0));
-                        controller.borrow_mut().queue_preview(&ui);
-                    }
-                }
+                let Some(ui) = weak_ui.upgrade() else {
+                    return;
+                };
+                let Some(value) = submitted_value(&ui, text.as_str(), -100.0, 100.0) else {
+                    return;
+                };
+                let mut controller = controller.borrow_mut();
+                controller.commit_contrast(&ui, value);
+                controller.queue_preview(&ui);
             });
         }
 
         {
-            let controller = Rc::clone(&controller);
+            let controller = Rc::clone(controller);
             let weak_ui = weak_ui.clone();
             ui.on_temperature_value_submitted(move |text| {
-                if let Some(ui) = weak_ui.upgrade() {
-                    if let Ok(val) = text.trim().parse::<f32>() {
-                        let mut wb = controller.borrow().document.as_ref().map(|d| d.white_balance()).unwrap_or(focusless_core::WhiteBalance::IDENTITY);
-                        wb.temperature = val.clamp(-100.0, 100.0);
-                        controller.borrow_mut().commit_white_balance(&ui, wb);
-                        controller.borrow_mut().queue_preview(&ui);
-                    }
-                }
+                let Some(ui) = weak_ui.upgrade() else {
+                    return;
+                };
+                let Some(value) = submitted_value(&ui, text.as_str(), -100.0, 100.0) else {
+                    return;
+                };
+                let mut controller = controller.borrow_mut();
+                let mut white_balance = controller
+                    .document
+                    .as_ref()
+                    .map_or(WhiteBalance::IDENTITY, ProjectDocument::white_balance);
+                white_balance.temperature = value;
+                controller.commit_white_balance(&ui, white_balance);
+                controller.queue_preview(&ui);
             });
         }
 
         {
-            let controller = Rc::clone(&controller);
+            let controller = Rc::clone(controller);
             let weak_ui = weak_ui.clone();
             ui.on_tint_value_submitted(move |text| {
-                if let Some(ui) = weak_ui.upgrade() {
-                    if let Ok(val) = text.trim().parse::<f32>() {
-                        let mut wb = controller.borrow().document.as_ref().map(|d| d.white_balance()).unwrap_or(focusless_core::WhiteBalance::IDENTITY);
-                        wb.tint = val.clamp(-100.0, 100.0);
-                        controller.borrow_mut().commit_white_balance(&ui, wb);
-                        controller.borrow_mut().queue_preview(&ui);
-                    }
-                }
+                let Some(ui) = weak_ui.upgrade() else {
+                    return;
+                };
+                let Some(value) = submitted_value(&ui, text.as_str(), -100.0, 100.0) else {
+                    return;
+                };
+                let mut controller = controller.borrow_mut();
+                let mut white_balance = controller
+                    .document
+                    .as_ref()
+                    .map_or(WhiteBalance::IDENTITY, ProjectDocument::white_balance);
+                white_balance.tint = value;
+                controller.commit_white_balance(&ui, white_balance);
+                controller.queue_preview(&ui);
             });
         }
 
         {
-            let controller = Rc::clone(&controller);
+            let controller = Rc::clone(controller);
             let weak_ui = weak_ui.clone();
             ui.on_shadows_value_submitted(move |text| {
-                if let Some(ui) = weak_ui.upgrade() {
-                    if let Ok(val) = text.trim().parse::<f32>() {
-                        controller.borrow_mut().commit_shadows(&ui, val.clamp(-100.0, 100.0));
-                        controller.borrow_mut().queue_preview(&ui);
-                    }
-                }
+                let Some(ui) = weak_ui.upgrade() else {
+                    return;
+                };
+                let Some(value) = submitted_value(&ui, text.as_str(), -100.0, 100.0) else {
+                    return;
+                };
+                let mut controller = controller.borrow_mut();
+                controller.commit_shadows(&ui, value);
+                controller.queue_preview(&ui);
             });
         }
 
         {
-            let controller = Rc::clone(&controller);
+            let controller = Rc::clone(controller);
             let weak_ui = weak_ui.clone();
             ui.on_highlights_value_submitted(move |text| {
-                if let Some(ui) = weak_ui.upgrade() {
-                    if let Ok(val) = text.trim().parse::<f32>() {
-                        controller.borrow_mut().commit_highlights(&ui, val.clamp(-100.0, 100.0));
-                        controller.borrow_mut().queue_preview(&ui);
-                    }
-                }
+                let Some(ui) = weak_ui.upgrade() else {
+                    return;
+                };
+                let Some(value) = submitted_value(&ui, text.as_str(), -100.0, 100.0) else {
+                    return;
+                };
+                let mut controller = controller.borrow_mut();
+                controller.commit_highlights(&ui, value);
+                controller.queue_preview(&ui);
             });
         }
 
         {
-            let controller = Rc::clone(&controller);
+            let controller = Rc::clone(controller);
             let weak_ui = weak_ui.clone();
             ui.on_saturation_value_submitted(move |text| {
-                if let Some(ui) = weak_ui.upgrade() {
-                    if let Ok(val) = text.trim().parse::<f32>() {
-                        controller.borrow_mut().commit_saturation(&ui, val.clamp(-100.0, 100.0));
-                        controller.borrow_mut().queue_preview(&ui);
-                    }
-                }
+                let Some(ui) = weak_ui.upgrade() else {
+                    return;
+                };
+                let Some(value) = submitted_value(&ui, text.as_str(), -100.0, 100.0) else {
+                    return;
+                };
+                let mut controller = controller.borrow_mut();
+                controller.commit_saturation(&ui, value);
+                controller.queue_preview(&ui);
             });
         }
 
         {
-            let controller = Rc::clone(&controller);
+            let controller = Rc::clone(controller);
             let weak_ui = weak_ui.clone();
             ui.on_sharpness_value_submitted(move |text| {
-                if let Some(ui) = weak_ui.upgrade() {
-                    if let Ok(val) = text.trim().parse::<f32>() {
-                        controller.borrow_mut().commit_sharpness(&ui, val.clamp(0.0, 1000.0));
-                        controller.borrow_mut().queue_preview(&ui);
-                    }
-                }
+                let Some(ui) = weak_ui.upgrade() else {
+                    return;
+                };
+                let Some(value) = submitted_value(&ui, text.as_str(), 0.0, 1000.0) else {
+                    return;
+                };
+                let mut controller = controller.borrow_mut();
+                controller.commit_sharpness(&ui, value);
+                controller.queue_preview(&ui);
             });
         }
 
         {
-            let controller = Rc::clone(&controller);
+            let controller = Rc::clone(controller);
             let weak_ui = weak_ui.clone();
             ui.on_rotation_value_submitted(move |text| {
-                if let Some(ui) = weak_ui.upgrade() {
-                    if let Ok(val) = text.trim().parse::<f32>() {
-                        controller.borrow_mut().commit_rotation(&ui, val.clamp(-45.0, 45.0));
-                        controller.borrow_mut().queue_preview(&ui);
-                    }
-                }
+                let Some(ui) = weak_ui.upgrade() else {
+                    return;
+                };
+                let Some(value) = submitted_value(&ui, text.as_str(), -45.0, 45.0) else {
+                    return;
+                };
+                controller.borrow_mut().commit_rotation(&ui, value);
             });
         }
         {
-            let controller = Rc::clone(&controller);
+            let controller = Rc::clone(controller);
             let weak_ui = weak_ui.clone();
             ui.on_frame_width_value_submitted(move |text| {
-                if let Some(ui) = weak_ui.upgrade() {
-                    if let Ok(val) = text.trim().parse::<f32>() {
-                        controller.borrow_mut().commit_frame(&ui, val.clamp(0.0, 50.0));
-                        controller.borrow_mut().queue_preview(&ui);
-                    }
-                }
+                let Some(ui) = weak_ui.upgrade() else {
+                    return;
+                };
+                let Some(value) = submitted_value(&ui, text.as_str(), 0.0, 50.0) else {
+                    return;
+                };
+                let mut controller = controller.borrow_mut();
+                controller.commit_frame(&ui, value);
+                controller.queue_preview(&ui);
             });
         }
 
@@ -719,6 +753,17 @@ impl Controller {
                 controller
                     .borrow_mut()
                     .commit_rotation(&ui, degrees.clamp(-45.0, 45.0));
+            });
+        }
+
+        {
+            let controller = Rc::clone(controller);
+            let weak_ui = weak_ui.clone();
+            ui.on_rotate_quarter_requested(move |delta| {
+                let Some(ui) = weak_ui.upgrade() else {
+                    return;
+                };
+                controller.borrow_mut().rotate_quarter_turn(&ui, delta);
             });
         }
 
@@ -1066,30 +1111,26 @@ impl Controller {
                     Err(error) => self.show_error(ui, "Export failed", &error),
                 }
             }
-            EngineEvent::ClipboardReady(result) => {
-                match result {
-                    Ok(copy_result) => {
-                        match arboard::Clipboard::new() {
-                            Ok(mut ctx) => {
-                                let image = arboard::ImageData {
-                                    width: copy_result.width as usize,
-                                    height: copy_result.height as usize,
-                                    bytes: std::borrow::Cow::Owned(copy_result.rgba8),
-                                };
-                                if let Err(e) = ctx.set_image(image) {
-                                    self.show_error(ui, "Failed to copy image", &e);
-                                } else {
-                                    ui.set_status_text("Image copied to clipboard".into());
-                                }
-                            }
-                            Err(e) => {
-                                self.show_error(ui, "Failed to initialize clipboard", &e);
-                            }
+            EngineEvent::ClipboardReady(result) => match result {
+                Ok(copy_result) => match arboard::Clipboard::new() {
+                    Ok(mut ctx) => {
+                        let image = arboard::ImageData {
+                            width: copy_result.width as usize,
+                            height: copy_result.height as usize,
+                            bytes: std::borrow::Cow::Owned(copy_result.rgba8),
+                        };
+                        if let Err(e) = ctx.set_image(image) {
+                            self.show_error(ui, "Failed to copy image", &e);
+                        } else {
+                            ui.set_status_text("Image copied to clipboard".into());
                         }
                     }
-                    Err(error) => self.show_error(ui, "Copy failed", &error),
-                }
-            }
+                    Err(e) => {
+                        self.show_error(ui, "Failed to initialize clipboard", &e);
+                    }
+                },
+                Err(error) => self.show_error(ui, "Copy failed", &error),
+            },
         }
     }
 
@@ -1212,7 +1253,7 @@ impl Controller {
         ui.set_sharpness_text(format_nonnegative_adjustment(document.sharpness()).into());
         let (frame_w, frame_c) = document.frame();
         ui.set_frame_width(frame_w);
-        ui.set_frame_width_text(format!("{:.0}%", frame_w).into());
+        ui.set_frame_width_text(format!("{frame_w:.0}").into());
         ui.set_frame_color_r(i32::from(frame_c.r));
         ui.set_frame_color_g(i32::from(frame_c.g));
         ui.set_frame_color_b(i32::from(frame_c.b));
@@ -1706,7 +1747,7 @@ impl Controller {
             self.show_error(ui, "Could not apply frame", &error);
             return;
         }
-        ui.set_frame_width_text(format!("{:.0}%", width_pct).into());
+        ui.set_frame_width_text(format!("{width_pct:.0}").into());
         self.mark_changed();
         self.queue_preview(ui);
     }
@@ -1729,7 +1770,7 @@ impl Controller {
             return;
         }
         ui.set_frame_width(width_pct);
-        ui.set_frame_width_text(format!("{:.0}%", width_pct).into());
+        ui.set_frame_width_text(format!("{width_pct:.0}").into());
         self.mark_changed();
         self.update_history_ui(ui);
     }
@@ -1768,7 +1809,7 @@ impl Controller {
         {
             self.frame_edit_start = None;
             ui.set_frame_width(0.0);
-            ui.set_frame_width_text("0%".into());
+            ui.set_frame_width_text("0".into());
             ui.set_frame_color_r(255);
             ui.set_frame_color_g(255);
             ui.set_frame_color_b(255);
@@ -1816,7 +1857,7 @@ impl Controller {
         ui.set_sharpness_text(format_nonnegative_adjustment(0.0).into());
         self.set_curve_ui(ui, ToneCurve::IDENTITY);
         ui.set_frame_width(0.0);
-        ui.set_frame_width_text("0%".into());
+        ui.set_frame_width_text("0".into());
         ui.set_frame_color_r(255);
         ui.set_frame_color_g(255);
         ui.set_frame_color_b(255);
@@ -1968,7 +2009,7 @@ impl Controller {
             return;
         }
         ui.set_rotation_angle(degrees);
-        ui.set_rotation_text(format!("{degrees:+.1}°").into());
+        ui.set_rotation_text(format!("{degrees:+.1}").into());
         document.view = ViewState::default();
         self.update_transform_ui(ui);
         self.update_image_info(ui);
@@ -1987,6 +2028,30 @@ impl Controller {
         }
         self.rotation_edit_start = Some(before);
         self.commit_rotation(ui, 0.0);
+    }
+
+    fn rotate_quarter_turn(&mut self, ui: &AppWindow, delta: i32) {
+        if self.crop_edit_start.is_some() || self.curve_edit_start.is_some() {
+            return;
+        }
+        let Some(document) = self.document.as_mut() else {
+            return;
+        };
+        let Ok(delta) = i8::try_from(delta) else {
+            return;
+        };
+        if let Err(error) = document.rotate_by(delta) {
+            self.show_error(ui, "Could not rotate photo", &error);
+            return;
+        }
+        self.rotation_edit_start = None;
+        document.view = ViewState::default();
+        self.update_transform_ui(ui);
+        self.update_image_info(ui);
+        self.mark_changed();
+        self.update_history_ui(ui);
+        self.queue_preview(ui);
+        ui.set_status_text("Photo rotated 90 degrees".into());
     }
 
     fn start_crop(&mut self, ui: &AppWindow) {
@@ -2198,7 +2263,7 @@ impl Controller {
             ui.set_sharpness_text(format_nonnegative_adjustment(sharpness).into());
             self.set_curve_ui(ui, curve);
             ui.set_frame_width(frame_w);
-            ui.set_frame_width_text(format!("{:.0}%", frame_w).into());
+            ui.set_frame_width_text(format!("{frame_w:.0}").into());
             ui.set_frame_color_r(i32::from(frame_c.r));
             ui.set_frame_color_g(i32::from(frame_c.g));
             ui.set_frame_color_b(i32::from(frame_c.b));
@@ -2251,7 +2316,7 @@ impl Controller {
             ui.set_sharpness_text(format_nonnegative_adjustment(sharpness).into());
             self.set_curve_ui(ui, curve);
             ui.set_frame_width(frame_w);
-            ui.set_frame_width_text(format!("{:.0}%", frame_w).into());
+            ui.set_frame_width_text(format!("{frame_w:.0}").into());
             ui.set_frame_color_r(i32::from(frame_c.r));
             ui.set_frame_color_g(i32::from(frame_c.g));
             ui.set_frame_color_b(i32::from(frame_c.b));
@@ -2534,7 +2599,7 @@ impl Controller {
         };
         let degrees = document.straighten_degrees();
         ui.set_rotation_angle(degrees);
-        ui.set_rotation_text(format!("{degrees:+.1}°").into());
+        ui.set_rotation_text(format!("{degrees:+.1}").into());
         self.set_crop_ui(ui, document.crop_rect());
     }
 
@@ -2640,11 +2705,41 @@ fn export_format(path: &Path) -> Option<ExportFormat> {
     }
 }
 
+fn submitted_value(ui: &AppWindow, text: &str, minimum: f32, maximum: f32) -> Option<f32> {
+    let Some(value) = parse_numeric_value(text) else {
+        ui.set_status_text("Enter a valid numeric value".into());
+        return None;
+    };
+    Some(value.clamp(minimum, maximum))
+}
+
+fn parse_numeric_value(text: &str) -> Option<f32> {
+    let trimmed = text.trim();
+    let mut has_digit = false;
+    let mut has_decimal_separator = false;
+    for (index, character) in trimmed.chars().enumerate() {
+        match character {
+            '0'..='9' => has_digit = true,
+            '+' | '-' if index == 0 => {}
+            '.' | ',' if !has_decimal_separator => has_decimal_separator = true,
+            _ => return None,
+        }
+    }
+    if !has_digit {
+        return None;
+    }
+    let normalized = trimmed.replace(',', ".");
+    normalized
+        .parse::<f32>()
+        .ok()
+        .filter(|value| value.is_finite())
+}
+
 fn format_exposure(value: f32) -> String {
     if value > 0.0 {
-        format!("+{value:.1} EV")
+        format!("+{value:.1}")
     } else {
-        format!("{value:.1} EV")
+        format!("{value:.1}")
     }
 }
 
@@ -2950,5 +3045,18 @@ mod crop_tests {
         let resized = crop_from_gesture(square, 7, -0.2, 0.0, Some(1.0)).unwrap();
         assert!((resized.width - resized.height).abs() < 0.0001);
         assert!((resized.y - 0.3).abs() < 0.0001);
+    }
+
+    #[test]
+    fn numeric_input_accepts_only_numbers_and_decimal_comma() {
+        assert_eq!(parse_numeric_value("+1.2"), Some(1.2));
+        assert_eq!(parse_numeric_value("-12"), Some(-12.0));
+        assert_eq!(parse_numeric_value("7,5"), Some(7.5));
+        assert_eq!(parse_numeric_value("+1.2 EV"), None);
+        assert_eq!(parse_numeric_value("-12°"), None);
+        assert_eq!(parse_numeric_value("7.5%"), None);
+        assert_eq!(parse_numeric_value("1e2"), None);
+        assert_eq!(parse_numeric_value("not a number"), None);
+        assert_eq!(parse_numeric_value("NaN"), None);
     }
 }

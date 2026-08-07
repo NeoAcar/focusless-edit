@@ -19,8 +19,9 @@ use std::{
 
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded, select, unbounded};
 use focusless_core::{
-    CopyRequest, CopyResult, CropRect, ExportFormat, ExportRequest, FrameColor, Operation, PreviewRequest, RenderError,
-    RenderResult, ShadowsHighlights, ToneCurve, Viewport, WhiteBalance,
+    CopyRequest, CopyResult, CropRect, ExportFormat, ExportRequest, FrameColor, Operation,
+    PreviewRequest, RenderError, RenderResult, ShadowsHighlights, ToneCurve, Viewport,
+    WhiteBalance,
 };
 use tracing::{debug, error};
 use vips_compat::{VipsApp, VipsError, VipsImage, ops};
@@ -431,7 +432,11 @@ impl VipsEngine {
         Ok(())
     }
 
-    fn copy_clipboard(&self, request: &CopyRequest, cancelled: &AtomicBool) -> Result<CopyResult, RenderError> {
+    fn copy_clipboard(
+        &self,
+        request: &CopyRequest,
+        cancelled: &AtomicBool,
+    ) -> Result<CopyResult, RenderError> {
         if cancelled.load(Ordering::Acquire) {
             return Err(RenderError::Cancelled);
         }
@@ -723,7 +728,7 @@ fn apply_operations_scaled(
         })
         .unwrap_or_default();
     if !shadows_highlights.is_identity() {
-        current = apply_shadows_highlights_llf(&current, shadows_highlights)?;
+        current = apply_shadows_highlights_guided(&current, shadows_highlights)?;
     }
     let tone_curve = operations
         .iter()
@@ -1077,285 +1082,113 @@ fn apply_contrast_oklab(image: &VipsImage, amount: f32) -> Result<VipsImage, Ren
     join_alpha(contrasted, alpha)
 }
 
-/// Local Laplacian Filter (Paris et al. 2011) for Highlights and Shadows.
+/// Edge-aware shadows/highlights adjustment on OKLab lightness.
 ///
-/// The algorithm:
-///
-/// 1. Extract luminance *L* from OKLab and map it to log-luminance.
-/// 2. Build smooth shadow and highlight masks in log space.
-/// 3. Construct a modified Laplacian pyramid whose large-scale layers are
-///    shifted by the mask-weighted adjustment while fine-detail layers are
-///    preserved (identity remapping).
-/// 4. Collapse the modified pyramid and reconstruct RGB by scaling each
-///    channel by the ratio of the new luminance to the original.
-///
-/// All pyramid operations use libvips vectorised primitives — no per-pixel
-/// Rust loops.
-fn apply_shadows_highlights_llf(
+/// A self-guided Gaussian filter estimates a locally smooth log-lightness
+/// base while preserving strong edges. Shadow and highlight masks come from
+/// that base, but their shifts are applied to the original lightness so fine
+/// detail is retained. This is the fast guided-filter form of local tone
+/// mapping: it avoids the halos of a plain blurred mask and the cost of a
+/// multi-level Laplacian reconstruction.
+fn apply_shadows_highlights_guided(
     image: &VipsImage,
     adjustment: ShadowsHighlights,
 ) -> Result<VipsImage, RenderError> {
-    /// Small constant preventing log(0).
     const EPSILON: f64 = 1e-4;
-    /// Detail / edge threshold in log space. Values < σ are treated as
-    /// fine detail (identity remap); values ≥ σ are large-scale structure.
-    const SIGMA: f64 = 0.10;
-    /// Maximum adjustment amplitude in log stops.
-    const MAX_ALPHA: f64 = 0.8;
-    /// Maximum number of pyramid levels; capped further by image size below.
-    const MAX_LEVELS: u32 = 5;
-
-    // Slider values [-100, 100] → log-luminance shifts.
-    // Shadows positive  → lift.  Highlights positive → compress (intentional
-    // inversion: +100 highlights means "recover bright areas").
-    let alpha_s = f64::from(adjustment.shadows) / 100.0 * MAX_ALPHA;
-    let alpha_h = -f64::from(adjustment.highlights) / 100.0 * MAX_ALPHA;
-
-    let (color, alpha_channel) = split_color_and_alpha(image, "shadows/highlights")?;
-
-    // --- Phase 1: log-luminance extraction via OKLab L channel ---
-    let oklab = linear_rgb_to_oklab(&color)?;
-    let lum = ops::extract_band(&oklab, 0).map_err(vips_error)?;
-
-    // log_l = log(L + ε)
-    let lum_eps = ops::linear(&lum, &mut [1.0], &mut [EPSILON]).map_err(vips_error)?;
-    let log_l = ops::math(&lum_eps, ops::OperationMath::Log).map_err(vips_error)?;
-
-    // --- Phase 2: shadow & highlight masks (smooth in log space) ---
-    // Mid-grey ≈ 18 % reflectance in OKLab L ≈ 0.50; in log: log(0.5 + ε).
-    let mid_log = (0.5 + EPSILON).ln();
-    // Range in log stops over which each mask transitions from 1 to 0.
+    const GUIDED_EPSILON: f64 = 0.04;
     const MASK_RANGE: f64 = 2.5;
+    const MAX_SHIFT: f64 = 1.0;
 
-    // Shadow mask: 1 in deep shadows, smoothly 0 at mid-grey and above.
-    //   raw_s = clamp((mid_log - log_l) / MASK_RANGE, 0, 1)
-    //   M_s   = smoothstep(raw_s) = raw_s² * (3 - 2*raw_s)
+    let (color, alpha) = split_color_and_alpha(image, "shadows/highlights")?;
+    let oklab = linear_rgb_to_oklab(&color)?;
+    let lightness = ops::extract_band(&oklab, 0).map_err(vips_error)?;
+    let chroma = ops::extract_band_with_opts(&oklab, 1, &ops::ExtractBandOptions { n: 2 })
+        .map_err(vips_error)?;
+
+    // The mask domain is display-referred OKLab L. Extended-range samples are
+    // used safely for mask construction, then restored unchanged below.
+    let bounded_lightness = clamp_image(&lightness, EPSILON, 1.0)?;
+    let log_lightness =
+        ops::math(&bounded_lightness, ops::OperationMath::Log).map_err(vips_error)?;
+
+    // Scale the local neighborhood with the current working image, so fitted
+    // proxies and full-resolution exports use the same relative radius.
+    let info = dimensions(image)?;
+    let sigma = (f64::from(info.width.min(info.height)) / 300.0).clamp(1.0, 32.0);
+    let mean = ops::gaussblur(&log_lightness, sigma).map_err(vips_error)?;
+    let squared = ops::multiply(&log_lightness, &log_lightness).map_err(vips_error)?;
+    let correlation = ops::gaussblur(&squared, sigma).map_err(vips_error)?;
+    let mean_squared = ops::multiply(&mean, &mean).map_err(vips_error)?;
+    let variance = ops::subtract(&correlation, &mean_squared).map_err(vips_error)?;
+    let variance = clamp_image(&variance, 0.0, f64::from(f32::MAX))?;
+    let denominator =
+        ops::linear(&variance, &mut [1.0], &mut [GUIDED_EPSILON]).map_err(vips_error)?;
+    let coefficient = ops::divide(&variance, &denominator).map_err(vips_error)?;
+    let coefficient_mean = ops::gaussblur(&coefficient, sigma).map_err(vips_error)?;
+    let coefficient_times_mean = ops::multiply(&coefficient, &mean).map_err(vips_error)?;
+    let intercept = ops::subtract(&mean, &coefficient_times_mean).map_err(vips_error)?;
+    let intercept_mean = ops::gaussblur(&intercept, sigma).map_err(vips_error)?;
+    let guided_part = ops::multiply(&coefficient_mean, &log_lightness).map_err(vips_error)?;
+    let local_base = ops::add(&guided_part, &intercept_mean).map_err(vips_error)?;
+
+    let mid_log = 0.5_f64.ln();
     let shadow_raw = ops::linear(
-        &log_l,
+        &local_base,
         &mut [-1.0 / MASK_RANGE],
         &mut [mid_log / MASK_RANGE],
     )
     .map_err(vips_error)?;
-    let zero = ops::linear(&shadow_raw, &mut [0.0], &mut [0.0]).map_err(vips_error)?;
-    let one = ops::linear(&shadow_raw, &mut [0.0], &mut [1.0]).map_err(vips_error)?;
-    let shadow_raw = ops::ifthenelse(
-        &ops::relational_const(&shadow_raw, ops::OperationRelational::Less, &mut [0.0])
-            .map_err(vips_error)?,
-        &zero,
-        &shadow_raw,
-    )
-    .map_err(vips_error)?;
-    let shadow_raw = ops::ifthenelse(
-        &ops::relational_const(&shadow_raw, ops::OperationRelational::More, &mut [1.0])
-            .map_err(vips_error)?,
-        &one,
-        &shadow_raw,
-    )
-    .map_err(vips_error)?;
-    // smoothstep: t² * (3 - 2t)
-    let shadow_sq = ops::multiply(&shadow_raw, &shadow_raw).map_err(vips_error)?;
-    let shadow_3m2t = ops::linear(&shadow_raw, &mut [-2.0], &mut [3.0]).map_err(vips_error)?;
-    let mask_s = ops::multiply(&shadow_sq, &shadow_3m2t).map_err(vips_error)?;
-
-    // Highlight mask: 1 in bright highlights, smoothly 0 at mid-grey and below.
     let highlight_raw = ops::linear(
-        &log_l,
+        &local_base,
         &mut [1.0 / MASK_RANGE],
         &mut [-mid_log / MASK_RANGE],
     )
     .map_err(vips_error)?;
-    let highlight_raw = ops::ifthenelse(
-        &ops::relational_const(&highlight_raw, ops::OperationRelational::Less, &mut [0.0])
-            .map_err(vips_error)?,
-        &zero,
-        &highlight_raw,
-    )
-    .map_err(vips_error)?;
-    let highlight_raw = ops::ifthenelse(
-        &ops::relational_const(&highlight_raw, ops::OperationRelational::More, &mut [1.0])
-            .map_err(vips_error)?,
-        &one,
-        &highlight_raw,
-    )
-    .map_err(vips_error)?;
-    let highlight_sq = ops::multiply(&highlight_raw, &highlight_raw).map_err(vips_error)?;
-    let highlight_3m2t =
-        ops::linear(&highlight_raw, &mut [-2.0], &mut [3.0]).map_err(vips_error)?;
-    let mask_h = ops::multiply(&highlight_sq, &highlight_3m2t).map_err(vips_error)?;
+    let shadow_mask = smoothstep_image(&clamp_image(&shadow_raw, 0.0, 1.0)?)?;
+    let highlight_mask = smoothstep_image(&clamp_image(&highlight_raw, 0.0, 1.0)?)?;
 
-    // Sever the upstream graph to prevent lazy evaluation explosion
-    let log_l = ops::cache(&log_l).map_err(vips_error)?;
+    let shadow_shift = -f64::from(adjustment.shadows) / 100.0 * MAX_SHIFT;
+    let highlight_shift = f64::from(adjustment.highlights) / 100.0 * MAX_SHIFT;
+    let shadow_shifted =
+        ops::linear(&shadow_mask, &mut [shadow_shift], &mut [0.0]).map_err(vips_error)?;
+    let highlight_shifted =
+        ops::linear(&highlight_mask, &mut [highlight_shift], &mut [0.0]).map_err(vips_error)?;
+    let shift = ops::add(&shadow_shifted, &highlight_shifted).map_err(vips_error)?;
+    let adjusted_log = ops::add(&log_lightness, &shift).map_err(vips_error)?;
+    let adjusted_lightness =
+        ops::math(&adjusted_log, ops::OperationMath::Exp).map_err(vips_error)?;
 
-    // base_shift = α_s * M_s + α_h * M_h  (per-pixel global shift)
-    let shifted_s = ops::linear(&mask_s, &mut [alpha_s], &mut [0.0]).map_err(vips_error)?;
-    let shifted_h = ops::linear(&mask_h, &mut [alpha_h], &mut [0.0]).map_err(vips_error)?;
-    let base_shift = ops::add(&shifted_s, &shifted_h).map_err(vips_error)?;
-    let base_shift = ops::cache(&base_shift).map_err(vips_error)?;
-
-    // --- Phase 3: Local Laplacian pyramid ---
-    // Determine safe number of levels based on the smallest image dimension.
-    let info = dimensions(image)?;
-    let min_dim = info.width.min(info.height);
-    // Each level halves the dimension; stop before any level would be < 8 px.
-    let n_levels = {
-        let mut n = 0u32;
-        let mut dim = min_dim;
-        while n < MAX_LEVELS && dim >= 16 {
-            n += 1;
-            dim /= 2;
-        }
-        n.max(1)
-    };
-
-    // Build Gaussian pyramid of log_l and base_shift together.
-    let mut gauss_l: Vec<VipsImage> = Vec::with_capacity(n_levels as usize + 1);
-    let mut gauss_shift: Vec<VipsImage> = Vec::with_capacity(n_levels as usize + 1);
-    gauss_l.push(ops::copy(&log_l).map_err(vips_error)?);
-    gauss_shift.push(ops::copy(&base_shift).map_err(vips_error)?);
-    for _ in 0..n_levels {
-        let prev_l = &gauss_l[gauss_l.len() - 1];
-        let blurred_l = ops::gaussblur(prev_l, 1.0).map_err(vips_error)?;
-        let downsampled_l = ops::resize(&blurred_l, 0.5).map_err(vips_error)?;
-        let downsampled_l = ops::cache(&downsampled_l).map_err(vips_error)?;
-        gauss_l.push(downsampled_l);
-
-        let prev_shift = &gauss_shift[gauss_shift.len() - 1];
-        let blurred_shift = ops::gaussblur(prev_shift, 1.0).map_err(vips_error)?;
-        let downsampled_shift = ops::resize(&blurred_shift, 0.5).map_err(vips_error)?;
-        let downsampled_shift = ops::cache(&downsampled_shift).map_err(vips_error)?;
-        gauss_shift.push(downsampled_shift);
-    }
-
-    // Build Laplacian pyramid for original log_l and remapped log_l in one
-    // pass, accumulating modified_log_l through pyramid collapse.
-    //
-    // Modified Laplacian (Paris et al.): For each level k,
-    //   L_orig[k]     = G_l[k] - upsample(G_l[k+1])
-    //   remapped G[k] = G_l[k] + remap_shift[k]
-    //   L_mod[k]      = remapped_G[k] - upsample(remapped_G[k+1])
-    //                 = L_orig[k] + (remap_shift[k] - upsample(remap_shift[k+1]))
-    //
-    // Collapse: start from coarsest remapped level and add finer residuals.
-    // Start: modified_coarse = G_l[N] + G_shift[N]
-    let modified = ops::add(&gauss_l[n_levels as usize], &gauss_shift[n_levels as usize])
+    // Preserve extended-range lightness exactly. Only the documented 0..1
+    // adjustment domain participates in the local tone mapping.
+    let below = ops::relational_const(&lightness, ops::OperationRelational::Less, &mut [0.0])
         .map_err(vips_error)?;
-    let mut modified = ops::cache(&modified).map_err(vips_error)?;
-
-    for k in (0..n_levels as usize).rev() {
-        let target = dimensions(&gauss_l[k])?;
-
-        let upsampled_mod = ops::resize(&modified, 2.0).map_err(vips_error)?;
-        let upsampled_mod = ops::extract_area(
-            &upsampled_mod,
-            0,
-            0,
-            target.width as i32,
-            target.height as i32,
-        )
+    let above = ops::relational_const(&lightness, ops::OperationRelational::More, &mut [1.0])
         .map_err(vips_error)?;
+    let adjusted_lightness =
+        ops::ifthenelse(&below, &lightness, &adjusted_lightness).map_err(vips_error)?;
+    let adjusted_lightness =
+        ops::ifthenelse(&above, &lightness, &adjusted_lightness).map_err(vips_error)?;
 
-        let upsampled_l = ops::resize(&gauss_l[k + 1], 2.0).map_err(vips_error)?;
-        let upsampled_l = ops::extract_area(
-            &upsampled_l,
-            0,
-            0,
-            target.width as i32,
-            target.height as i32,
-        )
+    let adjusted_oklab = ops::bandjoin(&mut [adjusted_lightness, chroma]).map_err(vips_error)?;
+    let adjusted_color = oklab_to_linear_rgb(&adjusted_oklab)?;
+    join_alpha(adjusted_color, alpha)
+}
+
+fn clamp_image(image: &VipsImage, minimum: f64, maximum: f64) -> Result<VipsImage, RenderError> {
+    let minimum_image = ops::linear(image, &mut [0.0], &mut [minimum]).map_err(vips_error)?;
+    let maximum_image = ops::linear(image, &mut [0.0], &mut [maximum]).map_err(vips_error)?;
+    let below = ops::relational_const(image, ops::OperationRelational::Less, &mut [minimum])
         .map_err(vips_error)?;
-
-        let upsampled_shift = ops::resize(&gauss_shift[k + 1], 2.0).map_err(vips_error)?;
-        let upsampled_shift = ops::extract_area(
-            &upsampled_shift,
-            0,
-            0,
-            target.width as i32,
-            target.height as i32,
-        )
+    let above = ops::relational_const(image, ops::OperationRelational::More, &mut [maximum])
         .map_err(vips_error)?;
+    let clamped = ops::ifthenelse(&below, &minimum_image, image).map_err(vips_error)?;
+    ops::ifthenelse(&above, &maximum_image, &clamped).map_err(vips_error)
+}
 
-        let l_orig = ops::subtract(&gauss_l[k], &upsampled_l).map_err(vips_error)?;
-        let l_shift = ops::subtract(&gauss_shift[k], &upsampled_shift).map_err(vips_error)?;
-
-        // To prevent halos, the shift must be sharp at edges.
-        // To preserve micro-contrast, the shift's high frequencies (l_shift)
-        // should be discarded in smooth regions (fine details).
-        // alpha = clamp(|L_orig| / SIGMA, 0, 1)
-        let abs_orig = ops::abs(&l_orig).map_err(vips_error)?;
-        let raw_alpha =
-            ops::linear(&abs_orig, &mut [1.0 / SIGMA], &mut [0.0]).map_err(vips_error)?;
-
-        let zero = ops::linear(&raw_alpha, &mut [0.0], &mut [0.0]).map_err(vips_error)?;
-        let one = ops::linear(&raw_alpha, &mut [0.0], &mut [1.0]).map_err(vips_error)?;
-        let alpha = ops::ifthenelse(
-            &ops::relational_const(&raw_alpha, ops::OperationRelational::Less, &mut [0.0])
-                .map_err(vips_error)?,
-            &zero,
-            &raw_alpha,
-        )
-        .map_err(vips_error)?;
-        let alpha = ops::ifthenelse(
-            &ops::relational_const(&alpha, ops::OperationRelational::More, &mut [1.0])
-                .map_err(vips_error)?,
-            &one,
-            &alpha,
-        )
-        .map_err(vips_error)?;
-
-        // L_mod = L_orig + L_shift * alpha
-        let blended_shift = ops::multiply(&l_shift, &alpha).map_err(vips_error)?;
-        let l_mod = ops::add(&l_orig, &blended_shift).map_err(vips_error)?;
-
-        let next_modified = ops::add(&upsampled_mod, &l_mod).map_err(vips_error)?;
-        modified = ops::cache(&next_modified).map_err(vips_error)?;
-    }
-
-    // `modified` is now the modified log-luminance at full resolution.
-    let log_l_modified = modified;
-
-    // --- Phase 4: Reconstruction ---
-    // L_new = exp(log_l_modified) - ε
-    let l_new_eps = ops::math(&log_l_modified, ops::OperationMath::Exp).map_err(vips_error)?;
-    let l_new = ops::linear(&l_new_eps, &mut [1.0], &mut [-EPSILON]).map_err(vips_error)?;
-
-    // Scale each RGB channel by (L_new / (L_orig + ε))^3 to preserve chrominance,
-    // because L is OKLab Lightness (roughly Y^(1/3)).
-    let l_orig_eps = ops::linear(&lum, &mut [1.0], &mut [EPSILON]).map_err(vips_error)?;
-    let ratio = ops::divide(&l_new, &l_orig_eps).map_err(vips_error)?;
-    let ratio_sq = ops::multiply(&ratio, &ratio).map_err(vips_error)?;
-    let ratio_cubed = ops::multiply(&ratio_sq, &ratio).map_err(vips_error)?;
-
-    // Clamp ratio to a sane range to prevent runaway near-black pixels.
-    let ratio_clamped = ops::ifthenelse(
-        &ops::relational_const(&ratio_cubed, ops::OperationRelational::Less, &mut [0.0])
-            .map_err(vips_error)?,
-        &zero,
-        &ratio_cubed,
-    )
-    .map_err(vips_error)?;
-    let ratio_max = 16.0;
-    let ratio_clamped = ops::ifthenelse(
-        &ops::relational_const(
-            &ratio_clamped,
-            ops::OperationRelational::More,
-            &mut [ratio_max],
-        )
-        .map_err(vips_error)?,
-        &ops::linear(&zero, &mut [0.0], &mut [ratio_max]).map_err(vips_error)?,
-        &ratio_clamped,
-    )
-    .map_err(vips_error)?;
-
-    // Apply ratio to each color band individually.
-    let mut adjusted_bands: Vec<VipsImage> = Vec::with_capacity(3);
-    for band_idx in 0..3 {
-        let band = ops::extract_band(&color, band_idx).map_err(vips_error)?;
-        let scaled = ops::multiply(&band, &ratio_clamped).map_err(vips_error)?;
-        adjusted_bands.push(scaled);
-    }
-    let adjusted_color = ops::bandjoin(&mut adjusted_bands).map_err(vips_error)?;
-
-    join_alpha(adjusted_color, alpha_channel)
+fn smoothstep_image(image: &VipsImage) -> Result<VipsImage, RenderError> {
+    let squared = ops::multiply(image, image).map_err(vips_error)?;
+    let three_minus_twice = ops::linear(image, &mut [-2.0], &mut [3.0]).map_err(vips_error)?;
+    ops::multiply(&squared, &three_minus_twice).map_err(vips_error)
 }
 
 fn apply_sharpness_oklab(
@@ -1909,6 +1742,23 @@ mod tests {
         assert_eq!(result.rgba8[7], 128, "exposure must preserve alpha");
         assert_eq!(engine.fit_source_builds, 1);
 
+        let copied = engine
+            .copy_clipboard(
+                &CopyRequest {
+                    source_path: source_path.clone(),
+                    operations: vec![Operation::Exposure { ev: 1.0 }],
+                },
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+        assert_eq!((copied.width, copied.height), (2, 2));
+        assert_eq!(copied.rgba8.len(), 2 * 2 * 4);
+        assert!(
+            (i16::from(copied.rgba8[0]) - i16::from(expected_srgb_exposure(64, 1.0))).abs() <= 1,
+            "clipboard copy must contain the full-resolution edited image"
+        );
+        assert_eq!(copied.rgba8[7], 128, "clipboard copy must preserve alpha");
+
         let framed = engine
             .render_preview(&PreviewRequest {
                 generation: 8,
@@ -2403,7 +2253,7 @@ mod tests {
     }
 
     #[test]
-    fn local_laplacian_shadows_and_highlights_behaves_correctly() {
+    fn guided_shadows_and_highlights_behaves_correctly() {
         let directory = tempfile::tempdir().unwrap();
         let source_path = directory.path().join("llf-test.png");
 
@@ -2437,16 +2287,15 @@ mod tests {
             })
             .unwrap();
         for (i, (&actual, &expected)) in baseline.rgba8.iter().zip(&pixels).enumerate() {
-            // Because of the log space and pyramid reconstruction, there might be
-            // tiny floating point differences even at identity, but they should be <= 1.
+            // Color-space round trips may introduce a one-code-value difference.
             assert!(
                 (i16::from(actual) - i16::from(expected)).abs() <= 1,
-                "identity LLF changed pixel {i}: expected {expected}, got {actual}"
+                "identity adjustment changed pixel {i}: expected {expected}, got {actual}"
             );
         }
 
-        // 2. Shadows lifting (+50)
-        let lifted_shadows = engine
+        // 2. Positive Shadows darkens dark areas.
+        let deepened_shadows = engine
             .render_preview(&PreviewRequest {
                 generation: 2,
                 source_path: source_path.clone(),
@@ -2464,29 +2313,46 @@ mod tests {
         let bright_idx = 8; // Third pixel is bright
 
         assert!(
-            lifted_shadows.rgba8[dark_idx] > baseline.rgba8[dark_idx] + 5,
-            "positive shadows must significantly lift the dark sample. baseline: {}, lifted: {}",
+            deepened_shadows.rgba8[dark_idx] <= baseline.rgba8[dark_idx] - 5,
+            "positive shadows must darken the dark sample. baseline: {}, deepened: {}",
             baseline.rgba8[dark_idx],
-            lifted_shadows.rgba8[dark_idx]
+            deepened_shadows.rgba8[dark_idx]
         );
         assert_eq!(
-            lifted_shadows.rgba8[dark_idx + 3],
+            deepened_shadows.rgba8[dark_idx + 3],
             200,
-            "LLF must preserve alpha"
+            "shadows adjustment must preserve alpha"
         );
         assert!(
-            (i16::from(lifted_shadows.rgba8[bright_idx]) - i16::from(baseline.rgba8[bright_idx]))
+            (i16::from(deepened_shadows.rgba8[bright_idx]) - i16::from(baseline.rgba8[bright_idx]))
                 .abs()
                 <= 2,
             "positive shadows should barely affect bright samples"
         );
 
-        // 3. Highlights compression (-50) (meaning positive slider value 50, but let's test -50 to make it darker)
-        // Wait, spec says: slider +100 means "recover bright areas" (make them darker).
-        // Let's set highlights: 50.0, this should make bright areas darker.
-        let recovered_highlights = engine
+        let lifted_shadows = engine
             .render_preview(&PreviewRequest {
                 generation: 3,
+                source_path: source_path.clone(),
+                operations: vec![Operation::ShadowsHighlights {
+                    adjustment: ShadowsHighlights {
+                        shadows: -50.0,
+                        highlights: 0.0,
+                    },
+                }],
+                viewport: Viewport::fit(3, 2),
+            })
+            .unwrap();
+        assert!(
+            lifted_shadows.rgba8[dark_idx] > baseline.rgba8[dark_idx] + 5,
+            "negative shadows must lift the dark sample"
+        );
+
+        // 3. Positive Highlights brightens bright areas, matching the
+        // conventional direction used by photo editors.
+        let lifted_highlights = engine
+            .render_preview(&PreviewRequest {
+                generation: 4,
                 source_path: source_path.clone(),
                 operations: vec![Operation::ShadowsHighlights {
                     adjustment: ShadowsHighlights {
@@ -2499,22 +2365,71 @@ mod tests {
             .unwrap();
 
         assert!(
-            recovered_highlights.rgba8[bright_idx] < baseline.rgba8[bright_idx] - 10,
-            "positive highlights slider must darken the bright sample. baseline: {}, recovered: {}",
+            lifted_highlights.rgba8[bright_idx] > baseline.rgba8[bright_idx] + 10,
+            "positive highlights must brighten the bright sample. baseline: {}, lifted: {}",
             baseline.rgba8[bright_idx],
-            recovered_highlights.rgba8[bright_idx]
+            lifted_highlights.rgba8[bright_idx]
         );
         assert_eq!(
-            recovered_highlights.rgba8[bright_idx + 3],
+            lifted_highlights.rgba8[bright_idx + 3],
             100,
-            "LLF must preserve alpha"
+            "highlights adjustment must preserve alpha"
         );
         assert!(
-            (i16::from(recovered_highlights.rgba8[dark_idx]) - i16::from(baseline.rgba8[dark_idx]))
+            (i16::from(lifted_highlights.rgba8[dark_idx]) - i16::from(baseline.rgba8[dark_idx]))
                 .abs()
                 <= 2,
             "highlights slider should barely affect dark samples"
         );
+
+        let recovered_highlights = engine
+            .render_preview(&PreviewRequest {
+                generation: 5,
+                source_path: source_path.clone(),
+                operations: vec![Operation::ShadowsHighlights {
+                    adjustment: ShadowsHighlights {
+                        shadows: 0.0,
+                        highlights: -50.0,
+                    },
+                }],
+                viewport: Viewport::fit(3, 2),
+            })
+            .unwrap();
+        assert!(
+            recovered_highlights.rgba8[bright_idx] < baseline.rgba8[bright_idx] - 10,
+            "negative highlights must recover the bright sample"
+        );
+
+        let mut extended_bytes = Vec::new();
+        for value in [-0.1_f32, -0.1, -0.1, 1.1, 1.1, 1.1] {
+            extended_bytes.extend_from_slice(&value.to_ne_bytes());
+        }
+        let extended =
+            VipsImage::new_from_memory_copy(&extended_bytes, 2, 1, 3, ops::BandFormat::Float)
+                .unwrap();
+        let preserved = apply_shadows_highlights_guided(
+            &extended,
+            ShadowsHighlights {
+                shadows: 100.0,
+                highlights: 100.0,
+            },
+        )
+        .unwrap();
+        let preserved = ops::cast(&preserved, ops::BandFormat::Float).unwrap();
+        let preserved_bytes = preserved.write_to_memory();
+        let preserved_values = preserved_bytes
+            .chunks_exact(size_of::<f32>())
+            .map(|bytes| f32::from_ne_bytes(bytes.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        for (actual, expected) in preserved_values
+            .iter()
+            .zip([-0.1_f32, -0.1, -0.1, 1.1, 1.1, 1.1])
+        {
+            assert!(
+                actual.is_finite() && (*actual - expected).abs() < 2.0e-5,
+                "shadows/highlights changed extended-range value {expected} to {actual}"
+            );
+        }
     }
 
     #[test]

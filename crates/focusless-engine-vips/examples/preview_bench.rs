@@ -7,7 +7,8 @@ use std::{
 };
 
 use focusless_core::{
-    CropRect, FrameColor, Operation, PreviewRequest, ToneCurve, Viewport, WhiteBalance,
+    CropRect, FrameColor, Operation, PreviewRequest, ShadowsHighlights, ToneCurve, Viewport,
+    WhiteBalance,
 };
 use focusless_engine_vips::{EngineEvent, EngineWorker};
 
@@ -80,6 +81,15 @@ fn main() -> Result<(), Box<dyn Error>> {
             ),
             ("exposure", vec![Operation::Exposure { ev: 1.25 }]),
             ("contrast", vec![Operation::Contrast { amount: 40.0 }]),
+            (
+                "shadows_highlights",
+                vec![Operation::ShadowsHighlights {
+                    adjustment: ShadowsHighlights {
+                        shadows: 45.0,
+                        highlights: 35.0,
+                    },
+                }],
+            ),
             (
                 "tone_curve",
                 vec![Operation::ToneCurve {

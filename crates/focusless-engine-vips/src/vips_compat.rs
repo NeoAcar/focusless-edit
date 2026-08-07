@@ -132,11 +132,6 @@ pub mod ops {
         image.copy()
     }
 
-    pub fn cache(image: &VipsImage) -> Result<VipsImage> {
-        let mut cloned = image.clone();
-        cloned.tilecache()
-    }
-
     pub fn premultiply(image: &VipsImage) -> Result<VipsImage> {
         image.premultiply()
     }

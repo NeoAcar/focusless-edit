@@ -632,6 +632,86 @@ mod tests {
     }
 
     #[test]
+    fn version_thirteen_project_gets_neutral_shadows_highlights_in_render_order() {
+        let directory = tempdir().unwrap();
+        let project_path = directory.path().join("version-thirteen.focusless");
+        let image_path = directory.path().join("image.jpg");
+        let mut document = ProjectDocument::new(source(image_path));
+        document.schema_version = 13;
+        document
+            .operations
+            .retain(|operation| !matches!(operation, Operation::ShadowsHighlights { .. }));
+        fs::write(&project_path, serde_json::to_vec_pretty(&document).unwrap()).unwrap();
+
+        let restored = load_project(&project_path).unwrap();
+
+        assert_eq!(restored.schema_version, PROJECT_SCHEMA_VERSION);
+        assert_eq!(
+            restored.shadows_highlights(),
+            focusless_core::ShadowsHighlights::IDENTITY
+        );
+        let contrast_index = restored
+            .operations
+            .iter()
+            .position(|operation| matches!(operation, Operation::Contrast { .. }))
+            .unwrap();
+        let adjustment_index = restored
+            .operations
+            .iter()
+            .position(|operation| matches!(operation, Operation::ShadowsHighlights { .. }))
+            .unwrap();
+        let tone_curve_index = restored
+            .operations
+            .iter()
+            .position(|operation| matches!(operation, Operation::ToneCurve { .. }))
+            .unwrap();
+        assert!(contrast_index < adjustment_index && adjustment_index < tone_curve_index);
+    }
+
+    #[test]
+    fn version_fourteen_project_preserves_shadows_highlights_appearance() {
+        let directory = tempdir().unwrap();
+        let project_path = directory.path().join("version-fourteen.focusless");
+        let image_path = directory.path().join("image.jpg");
+        let mut document = ProjectDocument::new(source(image_path));
+        document.schema_version = 14;
+        document
+            .commit_shadows_highlights(
+                focusless_core::ShadowsHighlights::IDENTITY,
+                focusless_core::ShadowsHighlights {
+                    shadows: 25.0,
+                    highlights: 40.0,
+                },
+            )
+            .unwrap();
+        fs::write(&project_path, serde_json::to_vec_pretty(&document).unwrap()).unwrap();
+
+        let mut restored = load_project(&project_path).unwrap();
+
+        assert_eq!(restored.schema_version, PROJECT_SCHEMA_VERSION);
+        assert_eq!(
+            restored.shadows_highlights(),
+            focusless_core::ShadowsHighlights {
+                shadows: -25.0,
+                highlights: -40.0,
+            }
+        );
+        assert!(restored.undo());
+        assert_eq!(
+            restored.shadows_highlights(),
+            focusless_core::ShadowsHighlights::IDENTITY
+        );
+        assert!(restored.redo());
+        assert_eq!(
+            restored.shadows_highlights(),
+            focusless_core::ShadowsHighlights {
+                shadows: -25.0,
+                highlights: -40.0,
+            }
+        );
+    }
+
+    #[test]
     fn failed_temp_file_is_discoverable_without_replacing_project() {
         let directory = tempdir().unwrap();
         let project_path = directory.path().join("edit.focusless");

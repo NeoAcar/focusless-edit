@@ -10,9 +10,10 @@ The project currently contains its first working vertical slice:
 - Fit, 100% view, zoom, and pan
 - Live Temperature and Tint white-balance adjustment
 - Perceptual Contrast adjustment from `-100` to `+100`
+- Edge-aware Shadows and Highlights adjustments from `-100` to `+100`
 - Perceptual Saturation adjustment from `-100` to `+100`
 - One-click Matrix-inspired cinematic look
-- Luminance-only Sharpness adjustment from `0` to `300`
+- Luminance-only Sharpness adjustment from `0` to `1000`
 - Live exposure adjustment from `-3 EV` to `+3 EV`
 - Interactive five-point tone curve drawn directly over the photo
 - Non-destructive ±45-degree straighten dial
@@ -127,6 +128,7 @@ directory. Unsaved work uses a recovery project below the XDG data directory.
 | Import | `Ctrl+O` |
 | Save / Save As | `Ctrl+S` / `Ctrl+Shift+S` |
 | Export | `Ctrl+E` |
+| Copy edited image | `Ctrl+C` |
 | Undo / Redo | `Ctrl+Z` / `Ctrl+Y` |
 | Fit / 100% | `0` / `1` |
 | Zoom | Mouse wheel |
@@ -139,7 +141,9 @@ The crop tool includes Free, 1:1, 4:3, and 16:9 modes plus a full-image reset.
 Crop and straighten rotation are stored non-destructively in the project and
 applied to full-resolution exports. Temperature and Tint use CAT16 chromatic
 adaptation in linear RGB and preserve alpha. Contrast reshapes OKLab
-lightness while leaving chroma and extended-range values intact. Saturation scales OKLab
+lightness while leaving chroma and extended-range values intact. Shadows and
+Highlights use an edge-aware guided filter over log OKLab lightness, preserving
+fine detail, chroma, alpha, and extended-range values. Saturation scales OKLab
 chroma while preserving perceptual lightness and hue. The Matrix look retains
 30% chroma and applies smooth green/cyan shadow, green midtone, and yellow
 highlight biases in OKLab. Sharpness uses a

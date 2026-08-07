@@ -48,7 +48,7 @@ CPU pool for image computation.
 
 `ProjectDocument` persists:
 
-- Schema version (currently version 13; version 1–12 projects migrate on load)
+- Schema version (currently version 15; version 1–14 projects migrate on load)
 - Source photo path and sampled BLAKE3 fingerprint
 - Ordered non-destructive operation list
 - Zoom and normalized center coordinates
@@ -62,7 +62,7 @@ synchronization cannot block the UI.
 Geometry and tonal operations use a stable render order: EXIF orientation,
 ICC conversion to the working space, quarter-turn rotation, auto-cropped
 straighten rotation, normalized crop, white balance, exposure, contrast, the
-tone curve, saturation, then the optional Matrix look. A crop
+Shadows/Highlights adjustment, tone curve, saturation, then the optional Matrix look. A crop
 rectangle is stored as normalized coordinates so it remains independent of
 source resolution. Sharpness follows the tonal operations, and the frame is
 added last before preview resizing or output conversion. Rotating an existing
@@ -98,6 +98,16 @@ Contrast applies a symmetric power curve around `0.5` to OKLab lightness. The
 to stronger separation of shadows and highlights. OKLab chroma, alpha, and
 extended-range lightness values outside `0..1` remain unchanged.
 
+Shadows and Highlights use a self-guided Gaussian filter to estimate an
+edge-aware local base in log OKLab lightness. Smooth shadow and highlight masks
+are derived from that base, while their shifts are applied to the original
+lightness so fine detail is retained. The neighborhood radius scales with the
+working-image dimensions, keeping fit previews and full-resolution output
+visually consistent. OKLab chroma and alpha remain separate, and lightness
+outside `0..1` passes through unchanged. Positive Shadows deepens dark areas
+while negative Shadows lifts them; positive Highlights brightens light areas
+while negative Highlights recovers them.
+
 Saturation converts linear sRGB to OKLab, scales only the `a` and `b` chroma
 axes, then converts back to linear sRGB. The `-100..+100` control maps to a
 `0..2` chroma multiplier, so `-100` is neutral gray, `0` is identity, and
@@ -113,8 +123,8 @@ Lightness is bounded only for selecting the tonal bias; extended-range color
 values are not clipped.
 
 Sharpness applies a full-resolution unsharp mask only to OKLab lightness:
-`L' = L + gain × (L - GaussianBlur(L, 1 px))`. The `0..300` control maps to a
-`0..3` gain. Detail below a fixed `0.003` OKLab-lightness threshold is left
+`L' = L + gain × (L - GaussianBlur(L, 1 px))`. The `0..1000` control maps to a
+`0..10` gain. Detail below a fixed `0.003` OKLab-lightness threshold is left
 unchanged to avoid amplifying low-level noise. Chroma and alpha remain
 separate, which prevents colored sharpening halos.
 
@@ -136,8 +146,8 @@ the original rectangle without modifying history or autosave state.
 ## Thread model
 
 - UI thread: Slint event loop and small state transitions.
-- Render worker: owns libvips objects and handles inspection, preview, and
-  export.
+- Render worker: owns libvips objects and handles inspection, preview,
+  full-resolution clipboard copies, and export.
 - libvips pool: distributes tile and scanline computation across CPU cores.
 - Storage worker: serializes project writes and retains only the newest queued
   autosave snapshot.
