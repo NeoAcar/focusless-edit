@@ -1022,116 +1022,6 @@ export component AppWindow inherits Window {
                         alignment: start;
 
                     Text {
-                        text: "GEOMETRY";
-                        color: #828a97;
-                        font-size: 11px;
-                        font-weight: 700;
-                    }
-
-                    HorizontalLayout {
-                        spacing: 8px;
-                        Text {
-                            text: "Rotation";
-                            color: root.document-loaded ? #eef1f6 : #777d87;
-                            font-size: 14px;
-                            font-weight: 600;
-                        }
-                        Rectangle { horizontal-stretch: 1; background: transparent; }
-                        EditableValueLabel {
-                            text: root.rotation-text;
-                            suffix: "°";
-                            enabled: root.document-loaded && !root.crop-mode && !root.curve-mode;
-                            accepted(t) => { root.rotation-value-submitted(t); }
-                            editing-changed(active) => { root.value-input-active = active; }
-                        }
-                        ResetButton {
-                            enabled: root.document-loaded && !root.crop-mode
-                                && !root.curve-mode && abs(root.rotation-angle) > 0.001;
-                            clicked => { root.reset-rotation-requested(); }
-                        }
-                    }
-
-                    ActionButton {
-                        text: root.rotation-mode ? "Done" : "Rotate";
-                        selected: root.rotation-mode;
-                        enabled: root.document-loaded && !root.crop-mode && !root.curve-mode;
-                        clicked => { root.rotation-mode = !root.rotation-mode; }
-                    }
-
-                    HorizontalLayout {
-                        spacing: 8px;
-                        Text {
-                            text: "Crop";
-                            color: root.document-loaded ? #eef1f6 : #777d87;
-                            font-size: 14px;
-                            font-weight: 600;
-                        }
-                        Rectangle { horizontal-stretch: 1; background: transparent; }
-                        Text {
-                            text: root.crop-text;
-                            color: #9fa7b4;
-                            font-size: 12px;
-                        }
-                    }
-
-                    if !root.crop-mode: ActionButton {
-                        text: "Crop Photo";
-                        enabled: root.document-loaded && !root.curve-mode;
-                        clicked => {
-                            root.rotation-mode = false;
-                            root.crop-requested();
-                        }
-                    }
-
-                    if root.crop-mode: HorizontalLayout {
-                        spacing: 6px;
-                        ActionButton {
-                            text: "Free";
-                            selected: root.crop-aspect-mode == 0;
-                            clicked => { root.crop-aspect-requested(-1); }
-                        }
-                        ResetButton {
-                            clicked => { root.crop-aspect-requested(0); }
-                        }
-                    }
-
-                    if root.crop-mode: HorizontalLayout {
-                        spacing: 6px;
-                        ActionButton {
-                            text: "1:1";
-                            selected: root.crop-aspect-mode == 1;
-                            clicked => { root.crop-aspect-requested(1); }
-                        }
-                        ActionButton {
-                            text: "4:3";
-                            selected: root.crop-aspect-mode == 2;
-                            clicked => { root.crop-aspect-requested(4 / 3); }
-                        }
-                        ActionButton {
-                            text: "16:9";
-                            selected: root.crop-aspect-mode == 3;
-                            clicked => { root.crop-aspect-requested(16 / 9); }
-                        }
-                    }
-
-                    if root.crop-mode: HorizontalLayout {
-                        spacing: 8px;
-                        ActionButton {
-                            text: "Cancel";
-                            clicked => { root.crop-cancel-requested(); }
-                        }
-                        ActionButton {
-                            text: "Apply Crop";
-                            primary: true;
-                            clicked => { root.crop-apply-requested(); }
-                        }
-                    }
-
-                    Rectangle {
-                        height: 1px;
-                        background: #343840;
-                    }
-                    Text {
                         text: "ADJUSTMENTS";
                         color: #828a97;
                         font-size: 11px;
@@ -1591,6 +1481,116 @@ export component AppWindow inherits Window {
                     }
 
 
+                    Text {
+                        text: "GEOMETRY";
+                        color: #828a97;
+                        font-size: 11px;
+                        font-weight: 700;
+                    }
+
+                    HorizontalLayout {
+                        spacing: 8px;
+                        Text {
+                            text: "Rotation";
+                            color: root.document-loaded ? #eef1f6 : #777d87;
+                            font-size: 14px;
+                            font-weight: 600;
+                        }
+                        Rectangle { horizontal-stretch: 1; background: transparent; }
+                        EditableValueLabel {
+                            text: root.rotation-text;
+                            suffix: "°";
+                            enabled: root.document-loaded && !root.crop-mode && !root.curve-mode;
+                            accepted(t) => { root.rotation-value-submitted(t); }
+                            editing-changed(active) => { root.value-input-active = active; }
+                        }
+                        ResetButton {
+                            enabled: root.document-loaded && !root.crop-mode
+                                && !root.curve-mode && abs(root.rotation-angle) > 0.001;
+                            clicked => { root.reset-rotation-requested(); }
+                        }
+                    }
+
+                    ActionButton {
+                        text: root.rotation-mode ? "Done" : "Rotate";
+                        selected: root.rotation-mode;
+                        enabled: root.document-loaded && !root.crop-mode && !root.curve-mode;
+                        clicked => { root.rotation-mode = !root.rotation-mode; }
+                    }
+
+                    HorizontalLayout {
+                        spacing: 8px;
+                        Text {
+                            text: "Crop";
+                            color: root.document-loaded ? #eef1f6 : #777d87;
+                            font-size: 14px;
+                            font-weight: 600;
+                        }
+                        Rectangle { horizontal-stretch: 1; background: transparent; }
+                        Text {
+                            text: root.crop-text;
+                            color: #9fa7b4;
+                            font-size: 12px;
+                        }
+                    }
+
+                    if !root.crop-mode: ActionButton {
+                        text: "Crop Photo";
+                        enabled: root.document-loaded && !root.curve-mode;
+                        clicked => {
+                            root.rotation-mode = false;
+                            root.crop-requested();
+                        }
+                    }
+
+                    if root.crop-mode: HorizontalLayout {
+                        spacing: 6px;
+                        ActionButton {
+                            text: "Free";
+                            selected: root.crop-aspect-mode == 0;
+                            clicked => { root.crop-aspect-requested(-1); }
+                        }
+                        ResetButton {
+                            clicked => { root.crop-aspect-requested(0); }
+                        }
+                    }
+
+                    if root.crop-mode: HorizontalLayout {
+                        spacing: 6px;
+                        ActionButton {
+                            text: "1:1";
+                            selected: root.crop-aspect-mode == 1;
+                            clicked => { root.crop-aspect-requested(1); }
+                        }
+                        ActionButton {
+                            text: "4:3";
+                            selected: root.crop-aspect-mode == 2;
+                            clicked => { root.crop-aspect-requested(4 / 3); }
+                        }
+                        ActionButton {
+                            text: "16:9";
+                            selected: root.crop-aspect-mode == 3;
+                            clicked => { root.crop-aspect-requested(16 / 9); }
+                        }
+                    }
+
+                    if root.crop-mode: HorizontalLayout {
+                        spacing: 8px;
+                        ActionButton {
+                            text: "Cancel";
+                            clicked => { root.crop-cancel-requested(); }
+                        }
+                        ActionButton {
+                            text: "Apply Crop";
+                            primary: true;
+                            clicked => { root.crop-apply-requested(); }
+                        }
+                    }
+
+                    Rectangle {
+                        height: 1px;
+                        background: #343840;
+                    }
                     Text {
                         text: "FRAME";
                         color: #828a97;
