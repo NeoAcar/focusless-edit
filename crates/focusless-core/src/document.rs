@@ -648,15 +648,15 @@ impl ProjectDocument {
                 .iter()
                 .any(|operation| matches!(operation, Operation::ShadowsHighlights { .. }))
         {
-            // Insert between Contrast and ToneCurve.
+            // Insert between Exposure and Contrast.
             let index = self
                 .operations
                 .iter()
-                .rposition(|operation| matches!(operation, Operation::Contrast { .. }))
+                .rposition(|operation| matches!(operation, Operation::Exposure { .. }))
                 .map_or(
                     self.operations
                         .iter()
-                        .position(|operation| matches!(operation, Operation::ToneCurve { .. }))
+                        .position(|operation| matches!(operation, Operation::Contrast { .. }))
                         .unwrap_or(self.operations.len()),
                     |index| index + 1,
                 );
@@ -2020,22 +2020,22 @@ mod tests {
 
         assert_eq!(document.schema_version, PROJECT_SCHEMA_VERSION);
         assert_eq!(document.shadows_highlights(), ShadowsHighlights::IDENTITY);
-        let contrast_index = document
+        let exposure_index = document
             .operations
             .iter()
-            .position(|operation| matches!(operation, Operation::Contrast { .. }))
+            .position(|operation| matches!(operation, Operation::Exposure { .. }))
             .unwrap();
         let adjustment_index = document
             .operations
             .iter()
             .position(|operation| matches!(operation, Operation::ShadowsHighlights { .. }))
             .unwrap();
-        let tone_curve_index = document
+        let contrast_index = document
             .operations
             .iter()
-            .position(|operation| matches!(operation, Operation::ToneCurve { .. }))
+            .position(|operation| matches!(operation, Operation::Contrast { .. }))
             .unwrap();
-        assert!(contrast_index < adjustment_index && adjustment_index < tone_curve_index);
+        assert!(exposure_index < adjustment_index && adjustment_index < contrast_index);
     }
 
     #[test]

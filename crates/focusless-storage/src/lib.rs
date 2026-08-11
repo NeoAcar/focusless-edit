@@ -650,22 +650,22 @@ mod tests {
             restored.shadows_highlights(),
             focusless_core::ShadowsHighlights::IDENTITY
         );
-        let contrast_index = restored
+        let exposure_index = restored
             .operations
             .iter()
-            .position(|operation| matches!(operation, Operation::Contrast { .. }))
+            .position(|operation| matches!(operation, Operation::Exposure { .. }))
             .unwrap();
         let adjustment_index = restored
             .operations
             .iter()
             .position(|operation| matches!(operation, Operation::ShadowsHighlights { .. }))
             .unwrap();
-        let tone_curve_index = restored
+        let contrast_index = restored
             .operations
             .iter()
-            .position(|operation| matches!(operation, Operation::ToneCurve { .. }))
+            .position(|operation| matches!(operation, Operation::Contrast { .. }))
             .unwrap();
-        assert!(contrast_index < adjustment_index && adjustment_index < tone_curve_index);
+        assert!(exposure_index < adjustment_index && adjustment_index < contrast_index);
     }
 
     #[test]

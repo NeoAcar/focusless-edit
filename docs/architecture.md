@@ -64,8 +64,8 @@ synchronization cannot block the UI.
 
 Geometry and tonal operations use a stable render order: EXIF orientation,
 ICC conversion to the working space, quarter-turn rotation, auto-cropped
-straighten rotation, normalized crop, white balance, exposure, contrast, the
-Shadows/Highlights adjustment, tone curve, saturation, then the optional Matrix look. A crop
+straighten rotation, normalized crop, white balance, exposure, the
+Shadows/Highlights adjustment, contrast, tone curve, saturation, then the optional Matrix look. A crop
 rectangle is stored as normalized coordinates so it remains independent of
 source resolution. Sharpness follows the tonal operations, and the frame is
 added last before preview resizing or output conversion. Rotating an existing

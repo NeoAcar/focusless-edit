@@ -795,17 +795,6 @@ fn apply_operations_through_shadows_highlights_scaled(
     if exposure_ev.abs() > f32::EPSILON {
         current = apply_exposure_linear(&current, exposure_ev)?;
     }
-    let contrast = operations
-        .iter()
-        .rev()
-        .find_map(|operation| match *operation {
-            Operation::Contrast { amount } => Some(amount),
-            _ => None,
-        })
-        .unwrap_or(0.0);
-    if contrast.abs() > f32::EPSILON {
-        current = apply_contrast_oklab(&current, contrast)?;
-    }
     let shadows_highlights = operations
         .iter()
         .rev()
@@ -826,6 +815,17 @@ fn apply_operations_after_shadows_highlights_scaled(
     operations: &[Operation],
     source_scale: f32,
 ) -> Result<VipsImage, RenderError> {
+    let contrast = operations
+        .iter()
+        .rev()
+        .find_map(|operation| match *operation {
+            Operation::Contrast { amount } => Some(amount),
+            _ => None,
+        })
+        .unwrap_or(0.0);
+    if contrast.abs() > f32::EPSILON {
+        current = apply_contrast_oklab(&current, contrast)?;
+    }
     let tone_curve = operations
         .iter()
         .rev()
