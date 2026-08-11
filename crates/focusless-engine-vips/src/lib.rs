@@ -239,7 +239,17 @@ impl VipsEngine {
 
     fn render_preview(&mut self, request: &PreviewRequest) -> Result<RenderResult, RenderError> {
         validate_viewport(request.viewport)?;
-        if request.viewport.zoom <= 0.0 || self.fit_source_supports(request) {
+        if request.viewport.zoom <= 0.0 {
+            return self.render_source_proxy_preview(request);
+        }
+        // A restored project stores its effective fit zoom rather than the
+        // `0.0` fit sentinel. Materialize the fit source before choosing the
+        // preview path so reopening a project does not accidentally send
+        // every adjustment through the full-resolution pipeline.
+        if self.fit_source.is_none() {
+            self.materialize_fit_source(request)?;
+        }
+        if self.fit_source_supports(request) {
             return self.render_source_proxy_preview(request);
         }
         let base_operations = request
@@ -298,6 +308,26 @@ impl VipsEngine {
         &mut self,
         request: &PreviewRequest,
     ) -> Result<RenderResult, RenderError> {
+        self.materialize_fit_source(request)?;
+        let source = self
+            .fit_source
+            .as_ref()
+            .expect("fit-preview source was initialized");
+        let adjusted =
+            apply_operations_scaled(&source.image, &request.operations, source.source_scale)?;
+        let proxy_viewport = Viewport {
+            zoom: if request.viewport.zoom <= 0.0 {
+                0.0
+            } else {
+                request.viewport.zoom / source.source_scale
+            },
+            ..request.viewport
+        };
+        let (visible, proxy_zoom) = render_viewport(&adjusted, proxy_viewport)?;
+        finalize_preview(request, visible, source.source_scale * proxy_zoom)
+    }
+
+    fn materialize_fit_source(&mut self, request: &PreviewRequest) -> Result<(), RenderError> {
         let rebuild_source = self.fit_source.as_ref().is_none_or(|source| {
             source.source_path != request.source_path
                 || source.output_width != request.viewport.output_width
@@ -332,22 +362,7 @@ impl VipsEngine {
                 "materialized color-managed fit-preview source"
             );
         }
-        let source = self
-            .fit_source
-            .as_ref()
-            .expect("fit-preview source was initialized");
-        let adjusted =
-            apply_operations_scaled(&source.image, &request.operations, source.source_scale)?;
-        let proxy_viewport = Viewport {
-            zoom: if request.viewport.zoom <= 0.0 {
-                0.0
-            } else {
-                request.viewport.zoom / source.source_scale
-            },
-            ..request.viewport
-        };
-        let (visible, proxy_zoom) = render_viewport(&adjusted, proxy_viewport)?;
-        finalize_preview(request, visible, source.source_scale * proxy_zoom)
+        Ok(())
     }
 }
 
@@ -2430,6 +2445,39 @@ mod tests {
                 "shadows/highlights changed extended-range value {expected} to {actual}"
             );
         }
+    }
+
+    #[test]
+    fn restored_fit_zoom_uses_the_source_proxy_on_the_first_preview() {
+        let directory = tempfile::tempdir().unwrap();
+        let source_path = directory.path().join("restored-fit.png");
+        let pixels = vec![128_u8; 120 * 80 * 4];
+        let image =
+            VipsImage::new_from_memory_copy(&pixels, 120, 80, 4, ops::BandFormat::Uchar).unwrap();
+        ops::pngsave(&image, source_path.to_str().unwrap()).unwrap();
+
+        let mut engine = VipsEngine::new().unwrap();
+        let result = engine
+            .render_preview(&PreviewRequest {
+                generation: 1,
+                source_path,
+                operations: vec![Operation::Exposure { ev: 0.5 }],
+                viewport: Viewport {
+                    output_width: 70,
+                    output_height: 50,
+                    zoom: 0.58,
+                    center_x: 0.5,
+                    center_y: 0.5,
+                },
+            })
+            .unwrap();
+
+        assert_eq!((result.width, result.height), (70, 50));
+        assert_eq!(engine.fit_source_builds, 1);
+        assert!(
+            engine.preview_pipeline.is_none(),
+            "a restored fit zoom must not build the full-resolution preview pipeline"
+        );
     }
 
     #[test]
