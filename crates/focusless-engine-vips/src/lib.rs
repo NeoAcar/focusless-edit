@@ -190,9 +190,12 @@ struct VipsEngine {
     app: VipsApp,
     srgb_profile: PathBuf,
     fit_source: Option<FitSource>,
+    fit_adjustment_cache: Option<FitAdjustmentCache>,
     preview_pipeline: Option<PreviewPipeline>,
     #[cfg(test)]
     fit_source_builds: usize,
+    #[cfg(test)]
+    fit_adjustment_builds: usize,
 }
 
 struct FitSource {
@@ -205,6 +208,14 @@ struct FitSource {
 
 struct PreviewPipeline {
     source_path: PathBuf,
+    operations: Vec<Operation>,
+    image: VipsImage,
+}
+
+struct FitAdjustmentCache {
+    source_path: PathBuf,
+    output_width: u32,
+    output_height: u32,
     operations: Vec<Operation>,
     image: VipsImage,
 }
@@ -224,14 +235,18 @@ impl VipsEngine {
             app,
             srgb_profile,
             fit_source: None,
+            fit_adjustment_cache: None,
             preview_pipeline: None,
             #[cfg(test)]
             fit_source_builds: 0,
+            #[cfg(test)]
+            fit_adjustment_builds: 0,
         })
     }
 
     fn inspect(&mut self, path: &Path) -> Result<ImageInfo, RenderError> {
         self.fit_source = None;
+        self.fit_adjustment_cache = None;
         self.preview_pipeline = None;
         let source = load_oriented(path)?;
         dimensions(&source)
@@ -313,8 +328,56 @@ impl VipsEngine {
             .fit_source
             .as_ref()
             .expect("fit-preview source was initialized");
-        let adjusted =
-            apply_operations_scaled(&source.image, &request.operations, source.source_scale)?;
+        let source_image = source.image.clone();
+        let source_scale = source.source_scale;
+        let adjusted = if shadows_highlights_active(&request.operations) {
+            let cached_operations = operations_through_shadows_highlights(&request.operations);
+            let rebuild_cache = self.fit_adjustment_cache.as_ref().is_none_or(|cache| {
+                cache.source_path != request.source_path
+                    || cache.output_width != request.viewport.output_width
+                    || cache.output_height != request.viewport.output_height
+                    || cache.operations != cached_operations
+            });
+            if rebuild_cache {
+                let image = apply_operations_through_shadows_highlights_scaled(
+                    &source_image,
+                    &request.operations,
+                )?;
+                let image = image.copy_memory().map_err(vips_error)?;
+                self.fit_adjustment_cache = Some(FitAdjustmentCache {
+                    source_path: request.source_path.clone(),
+                    output_width: request.viewport.output_width,
+                    output_height: request.viewport.output_height,
+                    operations: cached_operations,
+                    image,
+                });
+                #[cfg(test)]
+                {
+                    self.fit_adjustment_builds += 1;
+                }
+                debug!(
+                    generation = request.generation,
+                    "materialized shadows/highlights fit-preview stage"
+                );
+            } else {
+                debug!(
+                    generation = request.generation,
+                    "reusing shadows/highlights fit-preview stage"
+                );
+            }
+            let cached = self
+                .fit_adjustment_cache
+                .as_ref()
+                .expect("fit adjustment cache was initialized");
+            apply_operations_after_shadows_highlights_scaled(
+                cached.image.clone(),
+                &request.operations,
+                source_scale,
+            )?
+        } else {
+            self.fit_adjustment_cache = None;
+            apply_operations_scaled(&source_image, &request.operations, source_scale)?
+        };
         let proxy_viewport = Viewport {
             zoom: if request.viewport.zoom <= 0.0 {
                 0.0
@@ -334,6 +397,7 @@ impl VipsEngine {
                 || source.output_height != request.viewport.output_height
         });
         if rebuild_source {
+            self.fit_adjustment_cache = None;
             let source = load_oriented(&request.source_path)?;
             let source = to_working_linear(&source, &self.srgb_profile)?;
             let info = dimensions(&source)?;
@@ -658,6 +722,14 @@ fn apply_operations_scaled(
     operations: &[Operation],
     source_scale: f32,
 ) -> Result<VipsImage, RenderError> {
+    let current = apply_operations_through_shadows_highlights_scaled(image, operations)?;
+    apply_operations_after_shadows_highlights_scaled(current, operations, source_scale)
+}
+
+fn apply_operations_through_shadows_highlights_scaled(
+    image: &VipsImage,
+    operations: &[Operation],
+) -> Result<VipsImage, RenderError> {
     let mut current = ops::copy(image).map_err(vips_error)?;
 
     let quarter_turns = operations
@@ -745,6 +817,15 @@ fn apply_operations_scaled(
     if !shadows_highlights.is_identity() {
         current = apply_shadows_highlights_guided(&current, shadows_highlights)?;
     }
+
+    Ok(current)
+}
+
+fn apply_operations_after_shadows_highlights_scaled(
+    mut current: VipsImage,
+    operations: &[Operation],
+    source_scale: f32,
+) -> Result<VipsImage, RenderError> {
     let tone_curve = operations
         .iter()
         .rev()
@@ -796,6 +877,36 @@ fn apply_operations_scaled(
     }
 
     Ok(current)
+}
+
+fn shadows_highlights_active(operations: &[Operation]) -> bool {
+    operations
+        .iter()
+        .rev()
+        .find_map(|operation| match *operation {
+            Operation::ShadowsHighlights { adjustment } => Some(adjustment),
+            _ => None,
+        })
+        .is_some_and(|adjustment| !adjustment.is_identity())
+}
+
+fn operations_through_shadows_highlights(operations: &[Operation]) -> Vec<Operation> {
+    operations
+        .iter()
+        .copied()
+        .filter(|operation| {
+            matches!(
+                operation,
+                Operation::Rotate { .. }
+                    | Operation::Straighten { .. }
+                    | Operation::Crop { .. }
+                    | Operation::WhiteBalance { .. }
+                    | Operation::Exposure { .. }
+                    | Operation::Contrast { .. }
+                    | Operation::ShadowsHighlights { .. }
+            )
+        })
+        .collect()
 }
 
 fn latest_frame(operations: &[Operation]) -> (f32, FrameColor) {
@@ -2477,6 +2588,82 @@ mod tests {
         assert!(
             engine.preview_pipeline.is_none(),
             "a restored fit zoom must not build the full-resolution preview pipeline"
+        );
+    }
+
+    #[test]
+    fn downstream_edits_reuse_the_shadows_highlights_fit_stage() {
+        let directory = tempfile::tempdir().unwrap();
+        let source_path = directory.path().join("fit-stage-cache.png");
+        let mut pixels = Vec::with_capacity(240 * 160 * 4);
+        for y in 0..160_u32 {
+            for x in 0..240_u32 {
+                pixels.extend_from_slice(&[
+                    (32 + x * 191 / 239) as u8,
+                    (24 + y * 207 / 159) as u8,
+                    (48 + (x + y) * 175 / 398) as u8,
+                    255,
+                ]);
+            }
+        }
+        let image =
+            VipsImage::new_from_memory_copy(&pixels, 240, 160, 4, ops::BandFormat::Uchar).unwrap();
+        ops::pngsave(&image, source_path.to_str().unwrap()).unwrap();
+
+        let shadows_highlights = Operation::ShadowsHighlights {
+            adjustment: ShadowsHighlights {
+                shadows: 45.0,
+                highlights: -35.0,
+            },
+        };
+        let mut engine = VipsEngine::new().unwrap();
+        engine
+            .render_preview(&PreviewRequest {
+                generation: 1,
+                source_path: source_path.clone(),
+                operations: vec![shadows_highlights, Operation::Saturation { amount: 20.0 }],
+                viewport: Viewport::fit(120, 80),
+            })
+            .unwrap();
+        let operations = vec![shadows_highlights, Operation::Saturation { amount: 60.0 }];
+        let request = PreviewRequest {
+            generation: 2,
+            source_path: source_path.clone(),
+            operations: operations.clone(),
+            viewport: Viewport::fit(120, 80),
+        };
+        let cached = engine.render_preview(&request).unwrap();
+        assert_eq!(
+            engine.fit_adjustment_builds, 1,
+            "a downstream edit must reuse the materialized shadows/highlights stage"
+        );
+
+        let source = engine.fit_source.as_ref().unwrap();
+        let adjusted =
+            apply_operations_scaled(&source.image, &operations, source.source_scale).unwrap();
+        let (visible, proxy_zoom) = render_viewport(&adjusted, request.viewport).unwrap();
+        let reference =
+            finalize_preview(&request, visible, source.source_scale * proxy_zoom).unwrap();
+        assert_eq!(
+            cached.rgba8, reference.rgba8,
+            "the materialized stage must not change preview pixels"
+        );
+
+        engine
+            .render_preview(&PreviewRequest {
+                generation: 3,
+                source_path,
+                operations: vec![
+                    Operation::Exposure { ev: 0.5 },
+                    shadows_highlights,
+                    Operation::Saturation { amount: 60.0 },
+                ],
+                viewport: Viewport::fit(120, 80),
+            })
+            .unwrap();
+        assert_eq!(
+            engine.fit_adjustment_builds, 2,
+            "an upstream edit must rebuild the shadows/highlights stage"
         );
     }
 

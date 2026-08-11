@@ -1,10 +1,10 @@
-use std::path::PathBuf;
+use std::{collections::VecDeque, path::PathBuf};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub const PROJECT_SCHEMA_VERSION: u32 = 15;
-pub const MAX_HISTORY_LEN: usize = 200;
+pub const PROJECT_SCHEMA_VERSION: u32 = 16;
+pub const MAX_HISTORY_LEN: usize = 20;
 const MIN_CROP_EXTENT: f32 = 0.01;
 const MAX_FRAME_WIDTH_PCT: f32 = 50.0;
 const MAX_STRAIGHTEN_DEGREES: f32 = 45.0;
@@ -390,9 +390,9 @@ pub enum Command {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct CommandHistory {
     #[serde(default)]
-    undo: Vec<Command>,
+    undo: VecDeque<Command>,
     #[serde(default)]
-    redo: Vec<Command>,
+    redo: VecDeque<Command>,
 }
 
 impl CommandHistory {
@@ -417,11 +417,18 @@ impl CommandHistory {
     }
 
     fn push(&mut self, command: Command) {
-        self.undo.push(command);
+        self.undo.push_back(command);
         self.redo.clear();
-        if self.undo.len() > MAX_HISTORY_LEN {
-            let overflow = self.undo.len() - MAX_HISTORY_LEN;
-            self.undo.drain(0..overflow);
+        self.trim_to_limit();
+    }
+
+    fn trim_to_limit(&mut self) {
+        while self.undo.len() + self.redo.len() > MAX_HISTORY_LEN {
+            if self.redo.is_empty() || self.undo.len() >= self.redo.len() {
+                self.undo.pop_front();
+            } else {
+                self.redo.pop_front();
+            }
         }
     }
 }
@@ -673,6 +680,7 @@ impl ProjectDocument {
                 invert_shadows_highlights_command(command);
             }
         }
+        self.history.trim_to_limit();
         self.schema_version = PROJECT_SCHEMA_VERSION;
         Ok(())
     }
@@ -1221,7 +1229,7 @@ impl ProjectDocument {
     }
 
     pub fn undo(&mut self) -> bool {
-        let Some(command) = self.history.undo.pop() else {
+        let Some(command) = self.history.undo.pop_back() else {
             return false;
         };
         match command.clone() {
@@ -1274,12 +1282,12 @@ impl ProjectDocument {
                 self.operations = before;
             }
         }
-        self.history.redo.push(command);
+        self.history.redo.push_back(command);
         true
     }
 
     pub fn redo(&mut self) -> bool {
-        let Some(command) = self.history.redo.pop() else {
+        let Some(command) = self.history.redo.pop_back() else {
             return false;
         };
         match command.clone() {
@@ -1330,7 +1338,7 @@ impl ProjectDocument {
                 self.operations = after;
             }
         }
-        self.history.undo.push(command);
+        self.history.undo.push_back(command);
         true
     }
 }
@@ -1643,6 +1651,43 @@ mod tests {
             document.commit_exposure(before, after).unwrap();
         }
         assert_eq!(document.history.undo_len(), MAX_HISTORY_LEN);
+        for _ in 0..MAX_HISTORY_LEN {
+            assert!(document.undo());
+        }
+        assert!(!document.undo());
+        assert_eq!(document.history.redo_len(), MAX_HISTORY_LEN);
+    }
+
+    #[test]
+    fn schema_v15_migrates_to_the_bounded_history_window() {
+        let mut document = document();
+        document.schema_version = 15;
+        document.history.undo = (0..30)
+            .map(|index| Command::SetExposure {
+                before: index as f32,
+                after: index as f32 + 1.0,
+            })
+            .collect();
+        document.history.redo = (0..10)
+            .map(|index| Command::SetExposure {
+                before: index as f32,
+                after: index as f32 + 1.0,
+            })
+            .collect();
+
+        document.upgrade_to_latest().unwrap();
+
+        assert_eq!(document.schema_version, PROJECT_SCHEMA_VERSION);
+        assert_eq!(
+            document.history.undo_len() + document.history.redo_len(),
+            MAX_HISTORY_LEN
+        );
+        assert_eq!(document.history.undo_len(), 10);
+        assert_eq!(document.history.redo_len(), 10);
+        assert!(matches!(
+            document.history.undo.front(),
+            Some(Command::SetExposure { before, .. }) if *before == 20.0
+        ));
     }
 
     #[test]

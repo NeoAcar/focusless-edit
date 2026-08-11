@@ -67,7 +67,7 @@ changes require numerical reference tests.
 
 ## Document and interaction rules
 
-- The current project schema is version 15. Old versions 1–14 must continue to
+- The current project schema is version 16. Old versions 1–15 must continue to
   load. Any semantic or serialized-model change requires a schema increment
   and an explicit migration test.
 - Every document-changing action must support undo/redo. Group continuous

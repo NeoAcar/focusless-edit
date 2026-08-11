@@ -75,3 +75,33 @@ cargo build -p focusless-engine-vips --example preview_bench --release --locked
 .\target\release\examples\preview_bench.exe `
   .local\focusless-bench-100mp.jpg --adjustment-sequence
 ```
+
+## Shadows/Highlights downstream cache
+
+Measured on August 11, 2026, on Windows 11 Pro with 31.2 GiB RAM, an AMD
+Ryzen 7 6800H, and libvips 8.18.2:
+
+- Source: `2048 x 2048` JPEG
+- Output viewport: `1920 x 1080` RGBA8
+- Initial proxy preview: `190 ms`
+- Shadows/Highlights cache prime: `420 ms`
+- Cached Tone Curve: `86 ms`
+- Cached Saturation: `180 ms`
+- Cached Matrix look: `185 ms`
+- Cached Sharpness: `201 ms`
+- Cached Frame: `48 ms`
+- Whole process wall time: `2.151 s`
+- Peak resident memory: `607.8 MiB`
+
+The cache contains the materialized fit-preview result through the
+Shadows/Highlights stage. Later operations reuse those pixels; geometry,
+White Balance, Exposure, Contrast, and Shadows/Highlights changes rebuild the
+stage. Full-resolution zoom previews and exports do not use this cache.
+
+Reproduce the measurement in PowerShell:
+
+```powershell
+cargo build -p focusless-engine-vips --example preview_bench --release --locked
+.\target\release\examples\preview_bench.exe `
+  path\to\photo.jpg --cached-downstream-sequence
+```

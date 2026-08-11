@@ -16,7 +16,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut arguments = env::args_os().skip(1);
     let source = arguments.next().map(PathBuf::from).ok_or(
         "usage: preview_bench <image> \
-             [--frame-sequence|--adjustment-sequence|--zoom-sequence]",
+             [--frame-sequence|--adjustment-sequence|--cached-downstream-sequence|--zoom-sequence]",
     )?;
     let mode = arguments.next();
     let frame_sequence = mode
@@ -25,6 +25,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     let adjustment_sequence = mode
         .as_deref()
         .is_some_and(|value| value == "--adjustment-sequence");
+    let cached_downstream_sequence = mode
+        .as_deref()
+        .is_some_and(|value| value == "--cached-downstream-sequence");
     let zoom_sequence = mode
         .as_deref()
         .is_some_and(|value| value == "--zoom-sequence");
@@ -135,6 +138,69 @@ fn main() -> Result<(), Box<dyn Error>> {
             let result = wait_for_preview(&engine, feature_started)?;
             println!(
                 "feature_preview={} size={}x{} elapsed_ms={}",
+                name,
+                result.width,
+                result.height,
+                feature_started.elapsed().as_millis()
+            );
+        }
+    }
+    if cached_downstream_sequence {
+        let shadows_highlights = Operation::ShadowsHighlights {
+            adjustment: ShadowsHighlights {
+                shadows: 45.0,
+                highlights: 35.0,
+            },
+        };
+        let cache_started = Instant::now();
+        engine.request_preview(PreviewRequest {
+            generation: 2,
+            source_path: source.clone(),
+            operations: vec![shadows_highlights],
+            viewport: Viewport::fit(1920, 1080),
+        });
+        let result = wait_for_preview(&engine, cache_started)?;
+        println!(
+            "cached_stage_prime size={}x{} elapsed_ms={}",
+            result.width,
+            result.height,
+            cache_started.elapsed().as_millis()
+        );
+
+        let cases = [
+            (
+                "tone_curve",
+                Operation::ToneCurve {
+                    curve: ToneCurve {
+                        shadows: 0.18,
+                        midtones: 0.56,
+                        highlights: 0.84,
+                        ..ToneCurve::IDENTITY
+                    },
+                },
+            ),
+            ("saturation", Operation::Saturation { amount: 45.0 }),
+            ("matrix", Operation::Matrix { enabled: true }),
+            ("sharpness", Operation::Sharpness { amount: 120.0 }),
+            (
+                "frame",
+                Operation::Frame {
+                    width_pct: 20.0,
+                    color: FrameColor::BLACK,
+                },
+            ),
+        ];
+        for (index, (name, operation)) in cases.into_iter().enumerate() {
+            let feature_started = Instant::now();
+            engine.request_preview(PreviewRequest {
+                generation: index as u64 + 3,
+                source_path: source.clone(),
+                operations: vec![shadows_highlights, operation],
+                viewport: Viewport::fit(1920, 1080),
+            });
+            let result = wait_for_preview(&engine, feature_started)?;
+            println!(
+                "cached_downstream_preview={} size={}x{} elapsed_ms={}",
                 name,
                 result.width,
                 result.height,

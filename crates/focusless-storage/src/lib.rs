@@ -257,7 +257,7 @@ fn sync_directory(_path: &Path) -> Result<(), StorageError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use focusless_core::{Operation, WhiteBalance};
+    use focusless_core::{MAX_HISTORY_LEN, Operation, WhiteBalance};
     use tempfile::tempdir;
 
     fn source(path: PathBuf) -> SourceReference {
@@ -709,6 +709,27 @@ mod tests {
                 highlights: -40.0,
             }
         );
+    }
+
+    #[test]
+    fn version_fifteen_project_trims_history_to_the_latest_window() {
+        let directory = tempdir().unwrap();
+        let project_path = directory.path().join("version-fifteen.focusless");
+        let image_path = directory.path().join("image.jpg");
+        let mut document = ProjectDocument::new(source(image_path));
+        document.commit_exposure(0.0, 1.0).unwrap();
+
+        let mut json = serde_json::to_value(&document).unwrap();
+        json["schema_version"] = serde_json::json!(15);
+        let command = json["history"]["undo"][0].clone();
+        json["history"]["undo"] = serde_json::Value::Array(vec![command; MAX_HISTORY_LEN + 15]);
+        fs::write(&project_path, serde_json::to_vec_pretty(&json).unwrap()).unwrap();
+
+        let restored = load_project(&project_path).unwrap();
+
+        assert_eq!(restored.schema_version, PROJECT_SCHEMA_VERSION);
+        assert_eq!(restored.history.undo_len(), MAX_HISTORY_LEN);
+        assert_eq!(restored.history.redo_len(), 0);
     }
 
     #[test]

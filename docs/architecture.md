@@ -34,8 +34,11 @@ The workspace contains four production crates:
 2. The controller creates a `PreviewRequest` with an increasing `generation`.
 3. Only the newest request that has not started reaches the libvips worker.
 4. For fit previews, the worker materializes one color-managed linear source
-   proxy and every interactive operation reuses it. Zoomed previews compute
-   the visible source region from the full-resolution pipeline.
+   proxy and every interactive operation reuses it. When Shadows/Highlights
+   is active, the worker also materializes that stage and reuses it for later
+   Tone Curve, Saturation, Matrix, Sharpness, and Frame changes. Operations
+   before or at Shadows/Highlights invalidate that stage. Zoomed previews
+   compute the visible source region from the full-resolution pipeline.
 5. An RGBA8 pixel buffer returns to the UI thread.
 6. The controller displays the result only when its generation is still the
    newest.
@@ -48,11 +51,11 @@ CPU pool for image computation.
 
 `ProjectDocument` persists:
 
-- Schema version (currently version 15; version 1–14 projects migrate on load)
+- Schema version (currently version 16; version 1–15 projects migrate on load)
 - Source photo path and sampled BLAKE3 fingerprint
 - Ordered non-destructive operation list
 - Zoom and normalized center coordinates
-- Up to 200 undo/redo commands
+- A sliding window of up to 20 undo/redo commands
 
 The source path may be written relative to the project file. Persistence writes
 to a temporary file in the same directory, calls `sync_all`, and atomically
