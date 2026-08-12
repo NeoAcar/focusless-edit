@@ -150,7 +150,30 @@ pub fn load_project(path: &Path) -> Result<ProjectDocument, StorageError> {
         path: path.to_path_buf(),
         source,
     })?;
-    let mut document: ProjectDocument = serde_json::from_slice(&payload)?;
+    let mut json: serde_json::Value = serde_json::from_slice(&payload)?;
+
+    if let Some(version) = json.get("schema_version").and_then(|v| v.as_u64()) {
+        #[allow(clippy::collapsible_if)]
+        if version < 17 {
+            if let Some(operations) = json.get_mut("operations").and_then(|o| o.as_array_mut()) {
+                operations.retain(|op| op.get("type").and_then(|t| t.as_str()) != Some("matrix"));
+            }
+            if let Some(history) = json.get_mut("history").and_then(|h| h.as_object_mut()) {
+                if let Some(undo) = history.get_mut("undo").and_then(|u| u.as_array_mut()) {
+                    undo.retain(|cmd| {
+                        cmd.get("type").and_then(|t| t.as_str()) != Some("set_matrix")
+                    });
+                }
+                if let Some(redo) = history.get_mut("redo").and_then(|r| r.as_array_mut()) {
+                    redo.retain(|cmd| {
+                        cmd.get("type").and_then(|t| t.as_str()) != Some("set_matrix")
+                    });
+                }
+            }
+        }
+    }
+
+    let mut document: ProjectDocument = serde_json::from_value(json)?;
     if document.schema_version > PROJECT_SCHEMA_VERSION {
         return Err(StorageError::UnsupportedSchema {
             found: document.schema_version,
@@ -310,7 +333,7 @@ mod tests {
                     curve: focusless_core::ToneCurve::IDENTITY,
                 },
                 Operation::Saturation { amount: 0.0 },
-                Operation::Matrix { enabled: false },
+                Operation::Vignette { strength: 0.0 },
                 Operation::Sharpness { amount: 0.0 },
                 Operation::Frame {
                     width_pct: 0.0,
@@ -595,40 +618,6 @@ mod tests {
             .position(|operation| matches!(operation, Operation::Straighten { .. }))
             .unwrap();
         assert_eq!(straighten_index, rotate_index + 1);
-    }
-
-    #[test]
-    fn version_twelve_project_gets_disabled_matrix_after_saturation() {
-        let directory = tempdir().unwrap();
-        let project_path = directory.path().join("version-twelve.focusless");
-        let image_path = directory.path().join("image.jpg");
-        let mut document = ProjectDocument::new(source(image_path));
-        document.schema_version = 12;
-        document
-            .operations
-            .retain(|operation| !matches!(operation, Operation::Matrix { .. }));
-        fs::write(&project_path, serde_json::to_vec_pretty(&document).unwrap()).unwrap();
-
-        let restored = load_project(&project_path).unwrap();
-
-        assert_eq!(restored.schema_version, PROJECT_SCHEMA_VERSION);
-        assert!(!restored.matrix_enabled());
-        let saturation_index = restored
-            .operations
-            .iter()
-            .position(|operation| matches!(operation, Operation::Saturation { .. }))
-            .unwrap();
-        let matrix_index = restored
-            .operations
-            .iter()
-            .position(|operation| matches!(operation, Operation::Matrix { .. }))
-            .unwrap();
-        let sharpness_index = restored
-            .operations
-            .iter()
-            .position(|operation| matches!(operation, Operation::Sharpness { .. }))
-            .unwrap();
-        assert!(saturation_index < matrix_index && matrix_index < sharpness_index);
     }
 
     #[test]

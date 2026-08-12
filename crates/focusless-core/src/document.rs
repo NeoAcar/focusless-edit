@@ -3,7 +3,7 @@ use std::{collections::VecDeque, path::PathBuf};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub const PROJECT_SCHEMA_VERSION: u32 = 16;
+pub const PROJECT_SCHEMA_VERSION: u32 = 18;
 pub const MAX_HISTORY_LEN: usize = 20;
 const MIN_CROP_EXTENT: f32 = 0.01;
 const MAX_FRAME_WIDTH_PCT: f32 = 50.0;
@@ -321,7 +321,8 @@ pub enum Operation {
     ShadowsHighlights { adjustment: ShadowsHighlights },
     ToneCurve { curve: ToneCurve },
     Saturation { amount: f32 },
-    Matrix { enabled: bool },
+    Vignette { strength: f32 },
+
     Sharpness { amount: f32 },
     Frame { width_pct: f32, color: FrameColor },
 }
@@ -345,10 +346,11 @@ pub enum Command {
         before: f32,
         after: f32,
     },
-    SetMatrix {
-        before: bool,
-        after: bool,
+    SetVignette {
+        before: f32,
+        after: f32,
     },
+
     SetSharpness {
         before: f32,
         after: f32,
@@ -464,7 +466,7 @@ fn default_operations() -> Vec<Operation> {
             curve: ToneCurve::IDENTITY,
         },
         Operation::Saturation { amount: 0.0 },
-        Operation::Matrix { enabled: false },
+        Operation::Vignette { strength: 0.0 },
         Operation::Sharpness { amount: 0.0 },
         Operation::Frame {
             width_pct: 0.0,
@@ -485,6 +487,8 @@ pub enum DocumentError {
     InvalidWhiteBalance,
     #[error("saturation must be finite and between -100 and +100")]
     InvalidSaturation,
+    #[error("vignette strength must be finite and between 0.0 and 1.0")]
+    InvalidVignette,
     #[error("sharpness must be finite and between 0 and 1000")]
     InvalidSharpness,
     #[error("shadows and highlights must be finite and between -100 and +100")]
@@ -533,7 +537,8 @@ impl ProjectDocument {
                 }
                 Operation::ToneCurve { curve } => validate_tone_curve(curve)?,
                 Operation::Saturation { amount } => validate_saturation(amount)?,
-                Operation::Matrix { .. } => {}
+                Operation::Vignette { strength } => validate_vignette(strength)?,
+
                 Operation::Sharpness { amount } => validate_sharpness(amount)?,
                 Operation::Frame { width_pct, .. } => validate_frame(width_pct)?,
             }
@@ -628,20 +633,7 @@ impl ProjectDocument {
             self.operations
                 .insert(index, Operation::Straighten { degrees: 0.0 });
         }
-        if self.schema_version < 13
-            && !self
-                .operations
-                .iter()
-                .any(|operation| matches!(operation, Operation::Matrix { .. }))
-        {
-            let index = self
-                .operations
-                .iter()
-                .rposition(|operation| matches!(operation, Operation::Saturation { .. }))
-                .map_or(self.operations.len(), |index| index + 1);
-            self.operations
-                .insert(index, Operation::Matrix { enabled: false });
-        }
+
         if self.schema_version < 14
             && !self
                 .operations
@@ -679,6 +671,27 @@ impl ProjectDocument {
             {
                 invert_shadows_highlights_command(command);
             }
+        }
+        if self.schema_version < 18
+            && !self
+                .operations
+                .iter()
+                .any(|operation| matches!(operation, Operation::Vignette { .. }))
+        {
+            // Insert between Saturation and Sharpness.
+            let index = self
+                .operations
+                .iter()
+                .rposition(|operation| matches!(operation, Operation::Saturation { .. }))
+                .map_or(
+                    self.operations
+                        .iter()
+                        .position(|operation| matches!(operation, Operation::Sharpness { .. }))
+                        .unwrap_or(self.operations.len()),
+                    |index| index + 1,
+                );
+            self.operations
+                .insert(index, Operation::Vignette { strength: 0.0 });
         }
         self.history.trim_to_limit();
         self.schema_version = PROJECT_SCHEMA_VERSION;
@@ -782,15 +795,15 @@ impl ProjectDocument {
     }
 
     #[must_use]
-    pub fn matrix_enabled(&self) -> bool {
+    pub fn vignette(&self) -> f32 {
         self.operations
             .iter()
             .rev()
             .find_map(|operation| match *operation {
-                Operation::Matrix { enabled } => Some(enabled),
+                Operation::Vignette { strength } => Some(strength),
                 _ => None,
             })
-            .unwrap_or(false)
+            .unwrap_or(0.0)
     }
 
     #[must_use]
@@ -997,37 +1010,28 @@ impl ProjectDocument {
         Ok(())
     }
 
-    pub fn set_matrix_enabled(&mut self, enabled: bool) {
-        let before = self.matrix_enabled();
-        if let Some(Operation::Matrix { enabled: current }) = self
+    pub fn preview_vignette(&mut self, strength: f32) -> Result<(), DocumentError> {
+        validate_vignette(strength)?;
+        if let Some(Operation::Vignette { strength: current }) = self
             .operations
             .iter_mut()
             .rev()
-            .find(|operation| matches!(operation, Operation::Matrix { .. }))
+            .find(|operation| matches!(operation, Operation::Vignette { .. }))
         {
-            *current = enabled;
+            *current = strength;
         } else {
-            self.operations.push(Operation::Matrix { enabled });
+            self.operations.push(Operation::Vignette { strength });
         }
-        if before != enabled {
-            self.history.push(Command::SetMatrix {
-                before,
-                after: enabled,
-            });
-        }
+        Ok(())
     }
 
-    fn preview_matrix(&mut self, enabled: bool) {
-        if let Some(Operation::Matrix { enabled: current }) = self
-            .operations
-            .iter_mut()
-            .rev()
-            .find(|operation| matches!(operation, Operation::Matrix { .. }))
-        {
-            *current = enabled;
-        } else {
-            self.operations.push(Operation::Matrix { enabled });
+    pub fn commit_vignette(&mut self, before: f32, after: f32) -> Result<(), DocumentError> {
+        validate_vignette(before)?;
+        self.preview_vignette(after)?;
+        if (before - after).abs() > f32::EPSILON {
+            self.history.push(Command::SetVignette { before, after });
         }
+        Ok(())
     }
 
     pub fn preview_sharpness(&mut self, amount: f32) -> Result<(), DocumentError> {
@@ -1248,9 +1252,10 @@ impl ProjectDocument {
             Command::SetSaturation { before, .. } => {
                 let _ = self.preview_saturation(before);
             }
-            Command::SetMatrix { before, .. } => {
-                self.preview_matrix(before);
+            Command::SetVignette { before, .. } => {
+                let _ = self.preview_vignette(before);
             }
+
             Command::SetSharpness { before, .. } => {
                 let _ = self.preview_sharpness(before);
             }
@@ -1306,9 +1311,10 @@ impl ProjectDocument {
             Command::SetSaturation { after, .. } => {
                 let _ = self.preview_saturation(after);
             }
-            Command::SetMatrix { after, .. } => {
-                self.preview_matrix(after);
+            Command::SetVignette { after, .. } => {
+                let _ = self.preview_vignette(after);
             }
+
             Command::SetSharpness { after, .. } => {
                 let _ = self.preview_sharpness(after);
             }
@@ -1464,6 +1470,14 @@ fn validate_saturation(amount: f32) -> Result<(), DocumentError> {
     }
 }
 
+fn validate_vignette(strength: f32) -> Result<(), DocumentError> {
+    if strength.is_finite() && (0.0..=1.0).contains(&strength) {
+        Ok(())
+    } else {
+        Err(DocumentError::InvalidVignette)
+    }
+}
+
 fn validate_sharpness(amount: f32) -> Result<(), DocumentError> {
     if amount.is_finite() && (0.0..=1000.0).contains(&amount) {
         Ok(())
@@ -1605,19 +1619,6 @@ mod tests {
         assert_eq!(document.saturation(), 0.0);
         assert!(document.redo());
         assert_eq!(document.saturation(), 35.0);
-    }
-
-    #[test]
-    fn matrix_transaction_is_undoable_and_redoable() {
-        let mut document = document();
-        assert!(!document.matrix_enabled());
-
-        document.set_matrix_enabled(true);
-        assert!(document.matrix_enabled());
-        assert!(document.undo());
-        assert!(!document.matrix_enabled());
-        assert!(document.redo());
-        assert!(document.matrix_enabled());
     }
 
     #[test]
@@ -1763,6 +1764,66 @@ mod tests {
             document.preview_sharpness(1000.1),
             Err(DocumentError::InvalidSharpness)
         );
+    }
+
+    #[test]
+    fn vignette_transaction_is_undoable_and_redoable() {
+        let mut document = document();
+        document.preview_vignette(0.7).unwrap();
+        document.commit_vignette(0.0, 0.7).unwrap();
+
+        assert_eq!(document.vignette(), 0.7);
+        assert!(document.undo());
+        assert_eq!(document.vignette(), 0.0);
+        assert!(document.redo());
+        assert_eq!(document.vignette(), 0.7);
+    }
+
+    #[test]
+    fn rejects_invalid_vignette() {
+        let mut document = document();
+        assert_eq!(
+            document.preview_vignette(f32::NAN),
+            Err(DocumentError::InvalidVignette)
+        );
+        assert_eq!(
+            document.preview_vignette(-0.1),
+            Err(DocumentError::InvalidVignette)
+        );
+        assert_eq!(
+            document.preview_vignette(1.1),
+            Err(DocumentError::InvalidVignette)
+        );
+    }
+
+    #[test]
+    fn schema_v17_migrates_with_neutral_vignette_in_render_order() {
+        let mut document = document();
+        document.schema_version = 17;
+        document
+            .operations
+            .retain(|operation| !matches!(operation, Operation::Vignette { .. }));
+
+        document.upgrade_to_latest().unwrap();
+
+        assert_eq!(document.schema_version, PROJECT_SCHEMA_VERSION);
+        assert_eq!(document.vignette(), 0.0);
+        let saturation_index = document
+            .operations
+            .iter()
+            .rposition(|operation| matches!(operation, Operation::Saturation { .. }))
+            .unwrap();
+        let vignette_index = document
+            .operations
+            .iter()
+            .position(|operation| matches!(operation, Operation::Vignette { .. }))
+            .unwrap();
+        let sharpness_index = document
+            .operations
+            .iter()
+            .position(|operation| matches!(operation, Operation::Sharpness { .. }))
+            .unwrap();
+        assert!(saturation_index < vignette_index && vignette_index < sharpness_index);
     }
 
     #[test]
@@ -1979,36 +2040,6 @@ mod tests {
     }
 
     #[test]
-    fn schema_v12_migrates_with_disabled_matrix_after_saturation() {
-        let mut document = document();
-        document.schema_version = 12;
-        document
-            .operations
-            .retain(|operation| !matches!(operation, Operation::Matrix { .. }));
-
-        document.upgrade_to_latest().unwrap();
-
-        assert_eq!(document.schema_version, PROJECT_SCHEMA_VERSION);
-        assert!(!document.matrix_enabled());
-        let saturation_index = document
-            .operations
-            .iter()
-            .position(|operation| matches!(operation, Operation::Saturation { .. }))
-            .unwrap();
-        let matrix_index = document
-            .operations
-            .iter()
-            .position(|operation| matches!(operation, Operation::Matrix { .. }))
-            .unwrap();
-        let sharpness_index = document
-            .operations
-            .iter()
-            .position(|operation| matches!(operation, Operation::Sharpness { .. }))
-            .unwrap();
-        assert!(saturation_index < matrix_index && matrix_index < sharpness_index);
-    }
-
-    #[test]
     fn schema_v13_migrates_with_neutral_shadows_highlights_in_render_order() {
         let mut document = document();
         document.schema_version = 13;
@@ -2081,22 +2112,18 @@ mod tests {
         document.commit_exposure(0.0, 1.0).unwrap();
         document.preview_straighten(12.5).unwrap();
         document.commit_straighten(0.0, 12.5).unwrap();
-        document.set_matrix_enabled(true);
         let straightened = document.output_dimensions(100, 50);
         assert!(straightened.0 < 100 && straightened.1 < 50);
 
         document.restore_original();
         assert_eq!(document.exposure_ev(), 0.0);
         assert_eq!(document.straighten_degrees(), 0.0);
-        assert!(!document.matrix_enabled());
         assert!(document.undo());
         assert_eq!(document.exposure_ev(), 1.0);
         assert_eq!(document.straighten_degrees(), 12.5);
-        assert!(document.matrix_enabled());
         assert!(document.redo());
         assert_eq!(document.exposure_ev(), 0.0);
         assert_eq!(document.straighten_degrees(), 0.0);
-        assert!(!document.matrix_enabled());
     }
 
     #[test]

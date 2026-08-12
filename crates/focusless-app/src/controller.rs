@@ -57,6 +57,7 @@ pub struct Controller {
     white_balance_edit_start: Option<WhiteBalance>,
     saturation_edit_start: Option<f32>,
     sharpness_edit_start: Option<f32>,
+    vignette_edit_start: Option<f32>,
     rotation_edit_start: Option<f32>,
     crop_edit_start: Option<CropRect>,
     crop_saved_view: Option<ViewState>,
@@ -97,6 +98,7 @@ impl Controller {
             white_balance_edit_start: None,
             saturation_edit_start: None,
             sharpness_edit_start: None,
+            vignette_edit_start: None,
             rotation_edit_start: None,
             crop_edit_start: None,
             crop_saved_view: None,
@@ -369,6 +371,43 @@ impl Controller {
         {
             let controller = Rc::clone(controller);
             let weak_ui = weak_ui.clone();
+            ui.on_vignette_preview(move |amount| {
+                let Some(ui) = weak_ui.upgrade() else {
+                    return;
+                };
+                controller
+                    .borrow_mut()
+                    .preview_vignette(&ui, amount.clamp(0.0, 100.0));
+            });
+        }
+
+        {
+            let controller = Rc::clone(controller);
+            let weak_ui = weak_ui.clone();
+            ui.on_vignette_commit(move |amount| {
+                let Some(ui) = weak_ui.upgrade() else {
+                    return;
+                };
+                controller
+                    .borrow_mut()
+                    .commit_vignette(&ui, amount.clamp(0.0, 100.0));
+            });
+        }
+
+        {
+            let controller = Rc::clone(controller);
+            let weak_ui = weak_ui.clone();
+            ui.on_reset_vignette_requested(move || {
+                let Some(ui) = weak_ui.upgrade() else {
+                    return;
+                };
+                controller.borrow_mut().reset_vignette(&ui);
+            });
+        }
+
+        {
+            let controller = Rc::clone(controller);
+            let weak_ui = weak_ui.clone();
             ui.on_contrast_preview(move |amount| {
                 let Some(ui) = weak_ui.upgrade() else {
                     return;
@@ -596,6 +635,22 @@ impl Controller {
         {
             let controller = Rc::clone(controller);
             let weak_ui = weak_ui.clone();
+            ui.on_vignette_value_submitted(move |text| {
+                let Some(ui) = weak_ui.upgrade() else {
+                    return;
+                };
+                let Some(value) = submitted_value(&ui, text.as_str(), 0.0, 100.0) else {
+                    return;
+                };
+                let mut controller = controller.borrow_mut();
+                controller.commit_vignette(&ui, value);
+                controller.queue_preview(&ui);
+            });
+        }
+
+        {
+            let controller = Rc::clone(controller);
+            let weak_ui = weak_ui.clone();
             ui.on_rotation_value_submitted(move |text| {
                 let Some(ui) = weak_ui.upgrade() else {
                     return;
@@ -732,16 +787,7 @@ impl Controller {
             });
         }
 
-        {
-            let controller = Rc::clone(controller);
-            let weak_ui = weak_ui.clone();
-            ui.on_matrix_toggled(move |enabled| {
-                let Some(ui) = weak_ui.upgrade() else {
-                    return;
-                };
-                controller.borrow_mut().set_matrix_enabled(&ui, enabled);
-            });
-        }
+        {}
 
         {
             let controller = Rc::clone(controller);
@@ -1215,6 +1261,7 @@ impl Controller {
         self.white_balance_edit_start = None;
         self.saturation_edit_start = None;
         self.sharpness_edit_start = None;
+        self.vignette_edit_start = None;
         self.rotation_edit_start = None;
         self.crop_edit_start = None;
         self.crop_saved_view = None;
@@ -1248,9 +1295,10 @@ impl Controller {
         self.set_white_balance_ui(ui, document.white_balance());
         ui.set_saturation(document.saturation());
         ui.set_saturation_text(format_adjustment(document.saturation()).into());
-        ui.set_matrix_enabled(document.matrix_enabled());
         ui.set_sharpness(document.sharpness());
         ui.set_sharpness_text(format_nonnegative_adjustment(document.sharpness()).into());
+        ui.set_vignette(document.vignette() * 100.0);
+        ui.set_vignette_text(format_nonnegative_adjustment(document.vignette() * 100.0).into());
         let (frame_w, frame_c) = document.frame();
         ui.set_frame_width(frame_w);
         ui.set_frame_width_text(format!("{frame_w:.0}").into());
@@ -1408,28 +1456,6 @@ impl Controller {
         }
     }
 
-    fn set_matrix_enabled(&mut self, ui: &AppWindow, enabled: bool) {
-        if self.crop_edit_start.is_some() || self.curve_edit_start.is_some() {
-            return;
-        }
-        let Some(document) = self.document.as_mut() else {
-            return;
-        };
-        document.set_matrix_enabled(enabled);
-        ui.set_matrix_enabled(enabled);
-        self.mark_changed();
-        self.update_history_ui(ui);
-        self.queue_preview(ui);
-        ui.set_status_text(
-            if enabled {
-                "Matrix look enabled"
-            } else {
-                "Matrix look disabled"
-            }
-            .into(),
-        );
-    }
-
     fn preview_sharpness(&mut self, ui: &AppWindow, amount: f32) {
         if self.crop_edit_start.is_some() || self.curve_edit_start.is_some() {
             return;
@@ -1482,6 +1508,64 @@ impl Controller {
             self.sharpness_edit_start = None;
             ui.set_sharpness(0.0);
             ui.set_sharpness_text(format_nonnegative_adjustment(0.0).into());
+            self.mark_changed();
+            self.update_history_ui(ui);
+            self.queue_preview(ui);
+        }
+    }
+
+    fn preview_vignette(&mut self, ui: &AppWindow, amount: f32) {
+        if self.crop_edit_start.is_some() || self.curve_edit_start.is_some() {
+            return;
+        }
+        let Some(document) = self.document.as_mut() else {
+            return;
+        };
+        if self.vignette_edit_start.is_none() {
+            self.vignette_edit_start = Some(document.vignette());
+        }
+        if let Err(error) = document.preview_vignette(amount / 100.0) {
+            self.show_error(ui, "Could not apply vignette", &error);
+            return;
+        }
+        ui.set_vignette_text(format_nonnegative_adjustment(amount).into());
+        self.mark_changed();
+        self.queue_preview(ui);
+    }
+
+    fn commit_vignette(&mut self, ui: &AppWindow, amount: f32) {
+        if self.crop_edit_start.is_some() || self.curve_edit_start.is_some() {
+            return;
+        }
+        let Some(document) = self.document.as_mut() else {
+            return;
+        };
+        let before = self
+            .vignette_edit_start
+            .take()
+            .unwrap_or_else(|| document.vignette());
+        if let Err(error) = document.commit_vignette(before, amount / 100.0) {
+            self.show_error(ui, "Could not commit vignette", &error);
+            return;
+        }
+        ui.set_vignette(amount);
+        ui.set_vignette_text(format_nonnegative_adjustment(amount).into());
+        self.mark_changed();
+        self.update_history_ui(ui);
+    }
+
+    fn reset_vignette(&mut self, ui: &AppWindow) {
+        if self.crop_edit_start.is_some() || self.curve_edit_start.is_some() {
+            return;
+        }
+        let Some(document) = self.document.as_mut() else {
+            return;
+        };
+        let before = document.vignette();
+        if document.commit_vignette(before, 0.0).is_ok() {
+            self.vignette_edit_start = None;
+            ui.set_vignette(0.0);
+            ui.set_vignette_text(format_nonnegative_adjustment(0.0).into());
             self.mark_changed();
             self.update_history_ui(ui);
             self.queue_preview(ui);
@@ -1838,6 +1922,7 @@ impl Controller {
         self.white_balance_edit_start = None;
         self.saturation_edit_start = None;
         self.sharpness_edit_start = None;
+        self.vignette_edit_start = None;
         self.rotation_edit_start = None;
         self.frame_edit_start = None;
 
@@ -1852,9 +1937,10 @@ impl Controller {
         self.set_white_balance_ui(ui, WhiteBalance::IDENTITY);
         ui.set_saturation(0.0);
         ui.set_saturation_text(format_adjustment(0.0).into());
-        ui.set_matrix_enabled(false);
         ui.set_sharpness(0.0);
         ui.set_sharpness_text(format_nonnegative_adjustment(0.0).into());
+        ui.set_vignette(0.0);
+        ui.set_vignette_text(format_nonnegative_adjustment(0.0).into());
         self.set_curve_ui(ui, ToneCurve::IDENTITY);
         ui.set_frame_width(0.0);
         ui.set_frame_width_text("0".into());
@@ -2235,6 +2321,7 @@ impl Controller {
         self.white_balance_edit_start = None;
         self.saturation_edit_start = None;
         self.sharpness_edit_start = None;
+        self.vignette_edit_start = None;
         self.rotation_edit_start = None;
         self.frame_edit_start = None;
         if document.undo() {
@@ -2242,8 +2329,8 @@ impl Controller {
             let contrast = document.contrast();
             let white_balance = document.white_balance();
             let saturation = document.saturation();
-            let matrix_enabled = document.matrix_enabled();
             let sharpness = document.sharpness();
+            let vignette = document.vignette();
             let curve = document.tone_curve();
             let (frame_w, frame_c) = document.frame();
             ui.set_exposure(exposure);
@@ -2258,9 +2345,10 @@ impl Controller {
             self.set_white_balance_ui(ui, white_balance);
             ui.set_saturation(saturation);
             ui.set_saturation_text(format_adjustment(saturation).into());
-            ui.set_matrix_enabled(matrix_enabled);
             ui.set_sharpness(sharpness);
             ui.set_sharpness_text(format_nonnegative_adjustment(sharpness).into());
+            ui.set_vignette(vignette * 100.0);
+            ui.set_vignette_text(format_nonnegative_adjustment(vignette * 100.0).into());
             self.set_curve_ui(ui, curve);
             ui.set_frame_width(frame_w);
             ui.set_frame_width_text(format!("{frame_w:.0}").into());
@@ -2288,6 +2376,7 @@ impl Controller {
         self.white_balance_edit_start = None;
         self.saturation_edit_start = None;
         self.sharpness_edit_start = None;
+        self.vignette_edit_start = None;
         self.rotation_edit_start = None;
         self.frame_edit_start = None;
         if document.redo() {
@@ -2295,8 +2384,8 @@ impl Controller {
             let contrast = document.contrast();
             let white_balance = document.white_balance();
             let saturation = document.saturation();
-            let matrix_enabled = document.matrix_enabled();
             let sharpness = document.sharpness();
+            let vignette = document.vignette();
             let curve = document.tone_curve();
             let (frame_w, frame_c) = document.frame();
             ui.set_exposure(exposure);
@@ -2311,9 +2400,10 @@ impl Controller {
             self.set_white_balance_ui(ui, white_balance);
             ui.set_saturation(saturation);
             ui.set_saturation_text(format_adjustment(saturation).into());
-            ui.set_matrix_enabled(matrix_enabled);
             ui.set_sharpness(sharpness);
             ui.set_sharpness_text(format_nonnegative_adjustment(sharpness).into());
+            ui.set_vignette(vignette * 100.0);
+            ui.set_vignette_text(format_nonnegative_adjustment(vignette * 100.0).into());
             self.set_curve_ui(ui, curve);
             ui.set_frame_width(frame_w);
             ui.set_frame_width_text(format!("{frame_w:.0}").into());

@@ -199,8 +199,9 @@ export component AppWindow inherits Window {
     in-out property <float> temperature: 0;
     in-out property <float> tint: 0;
     in-out property <float> saturation: 0;
-    in-out property <bool> matrix-enabled: false;
+
     in-out property <float> sharpness: 0;
+    in-out property <float> vignette: 0;
     in-out property <float> exposure: 0;
     in-out property <float> contrast: 0;
     in-out property <float> shadows: 0;
@@ -228,6 +229,7 @@ export component AppWindow inherits Window {
     in property <string> tint-text: "0";
     in property <string> saturation-text: "0";
     in property <string> sharpness-text: "0";
+    in property <string> vignette-text: "0";
     in property <string> curve-text: "Identity";
     in property <string> curve-path: "M 0 1 L 1 0";
     in property <string> rotation-text: "0";
@@ -290,10 +292,13 @@ export component AppWindow inherits Window {
     callback saturation-preview(amount: float);
     callback saturation-commit(amount: float);
     callback reset-saturation-requested;
-    callback matrix-toggled(enabled: bool);
+
     callback sharpness-preview(amount: float);
     callback sharpness-commit(amount: float);
     callback reset-sharpness-requested;
+    callback vignette-preview(amount: float);
+    callback vignette-commit(amount: float);
+    callback reset-vignette-requested;
     callback curve-requested;
     callback curve-preview(point: int, input: float, value: float);
     callback curve-commit-requested;
@@ -330,6 +335,7 @@ export component AppWindow inherits Window {
     callback tint-value-submitted(string);
     callback saturation-value-submitted(string);
     callback sharpness-value-submitted(string);
+    callback vignette-value-submitted(string);
     callback rotation-value-submitted(string);
 
     init => {
@@ -1415,23 +1421,6 @@ export component AppWindow inherits Window {
                     HorizontalLayout {
                         spacing: 8px;
                         Text {
-                            text: "Matrix";
-                            color: root.document-loaded ? #eef1f6 : #777d87;
-                            font-size: 14px;
-                            font-weight: 600;
-                        }
-                        Rectangle { horizontal-stretch: 1; background: transparent; }
-                        ActionButton {
-                            text: root.matrix-enabled ? "On" : "Off";
-                            selected: root.matrix-enabled;
-                            enabled: root.document-loaded && !root.crop-mode && !root.curve-mode;
-                            clicked => { root.matrix-toggled(!root.matrix-enabled); }
-                        }
-                    }
-
-                    HorizontalLayout {
-                        spacing: 8px;
-                        Text {
                             text: "Sharpness";
                             color: root.document-loaded ? #eef1f6 : #777d87;
                             font-size: 14px;
@@ -1470,6 +1459,57 @@ export component AppWindow inherits Window {
                         Rectangle { horizontal-stretch: 1; background: transparent; }
                         Text {
                             text: "1000";
+                            color: #6f7682;
+                            font-size: 11px;
+                        }
+                    }
+
+                    Rectangle {
+                        height: 1px;
+                        background: #343840;
+                    }
+
+                    HorizontalLayout {
+                        spacing: 8px;
+                        Text {
+                            text: "Vignette";
+                            color: root.document-loaded ? #eef1f6 : #777d87;
+                            font-size: 14px;
+                            font-weight: 600;
+                        }
+                        Rectangle { horizontal-stretch: 1; background: transparent; }
+                        EditableValueLabel {
+                            text: root.vignette-text;
+                            enabled: root.document-loaded && !root.crop-mode && !root.curve-mode;
+                            accepted(t) => { root.vignette-value-submitted(t); }
+                            editing-changed(active) => { root.value-input-active = active; }
+                        }
+                        ResetButton {
+                            enabled: root.document-loaded && !root.crop-mode
+                                && !root.curve-mode && root.vignette > 0.001;
+                            clicked => { root.reset-vignette-requested(); }
+                        }
+                    }
+
+                    Slider {
+                        minimum: 0;
+                        maximum: 100;
+                        step: 1;
+                        value <=> root.vignette;
+                        enabled: root.document-loaded && !root.crop-mode && !root.curve-mode;
+                        changed(value) => { root.vignette-preview(value); }
+                        released(value) => { root.vignette-commit(value); }
+                    }
+
+                    HorizontalLayout {
+                        Text {
+                            text: "0";
+                            color: #6f7682;
+                            font-size: 11px;
+                        }
+                        Rectangle { horizontal-stretch: 1; background: transparent; }
+                        Text {
+                            text: "100";
                             color: #6f7682;
                             font-size: 11px;
                         }

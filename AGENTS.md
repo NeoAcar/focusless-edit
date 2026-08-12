@@ -54,7 +54,7 @@ The canonical render order is:
 4. Apply quarter-turn rotation, auto-cropped straighten rotation, and
    normalized crop.
 5. Apply white balance, exposure, contrast, shadows/highlights, tone curve,
-   saturation, and the optional Matrix look in the documented order.
+   and saturation in the documented order.
 6. Apply sharpness to OKLab lightness, then add the frame in linear light,
    before preview resize or output conversion.
 7. Encode to display-referred sRGB and embed the sRGB ICC profile in exported
@@ -67,7 +67,7 @@ changes require numerical reference tests.
 
 ## Document and interaction rules
 
-- The current project schema is version 16. Old versions 1–15 must continue to
+- The current project schema is version 17. Old versions 1–16 must continue to
   load. Any semantic or serialized-model change requires a schema increment
   and an explicit migration test.
 - Every document-changing action must support undo/redo. Group continuous

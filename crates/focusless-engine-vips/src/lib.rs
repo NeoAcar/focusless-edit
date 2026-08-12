@@ -837,6 +837,11 @@ fn apply_operations_after_shadows_highlights_scaled(
     if !tone_curve.is_identity() {
         current = apply_tone_curve_linear(&current, tone_curve)?;
     }
+
+    // Saturation, Vignette and Sharpness all operate on OKLab lightness (and
+    // chroma for Saturation). We convert to OKLab once, run all three in that
+    // space, then convert back to linear scRGB once at the end — avoiding two
+    // redundant round-trips compared to running each step independently.
     let saturation = operations
         .iter()
         .rev()
@@ -845,20 +850,14 @@ fn apply_operations_after_shadows_highlights_scaled(
             _ => None,
         })
         .unwrap_or(0.0);
-    if saturation.abs() > f32::EPSILON {
-        current = apply_saturation_oklab(&current, saturation)?;
-    }
-    let matrix_enabled = operations
+    let vignette_strength = operations
         .iter()
         .rev()
         .find_map(|operation| match *operation {
-            Operation::Matrix { enabled } => Some(enabled),
+            Operation::Vignette { strength } => Some(strength),
             _ => None,
         })
-        .unwrap_or(false);
-    if matrix_enabled {
-        current = apply_matrix_look_oklab(&current)?;
-    }
+        .unwrap_or(0.0);
     let sharpness = operations
         .iter()
         .rev()
@@ -867,8 +866,41 @@ fn apply_operations_after_shadows_highlights_scaled(
             _ => None,
         })
         .unwrap_or(0.0);
-    if sharpness > f32::EPSILON {
-        current = apply_sharpness_oklab(&current, sharpness, source_scale)?;
+
+    let needs_oklab_pass = saturation.abs() > f32::EPSILON
+        || vignette_strength > f32::EPSILON
+        || sharpness > f32::EPSILON;
+
+    if needs_oklab_pass {
+        // Split color and alpha once for the entire OKLab pass.
+        let (color, alpha) = split_color_and_alpha(&current, "tonal adjustments")?;
+        let mut oklab = linear_rgb_to_oklab(&color)?;
+
+        // 1. Saturation: scale the a and b chroma axes.
+        if saturation.abs() > f32::EPSILON {
+            let chroma_scale = 1.0 + f64::from(saturation) / 100.0;
+            oklab = ops::linear(
+                &oklab,
+                &mut [1.0, chroma_scale, chroma_scale],
+                &mut [0.0, 0.0, 0.0],
+            )
+            .map_err(vips_error)?;
+        }
+
+        // 2. Vignette: darken OKLab L proportionally to radial distance.
+        if vignette_strength > f32::EPSILON {
+            let info = dimensions(&current)?;
+            oklab = apply_vignette_on_oklab(&oklab, vignette_strength, info.width, info.height)?;
+        }
+
+        // 3. Sharpness: unsharp-mask on OKLab L only.
+        if sharpness > f32::EPSILON {
+            oklab = apply_sharpness_on_oklab(&oklab, sharpness, source_scale)?;
+        }
+
+        // Single conversion back to linear scRGB.
+        let adjusted_color = oklab_to_linear_rgb(&oklab)?;
+        current = join_alpha(adjusted_color, alpha)?;
     }
 
     let (frame_width_pct, frame_color) = latest_frame(operations);
@@ -1089,82 +1121,120 @@ const LMS_TO_LINEAR_RGB: [[f32; 3]; 3] = [
     [-0.004_196_086_3, -0.703_418_6, 1.707_614_7],
 ];
 
-fn apply_saturation_oklab(image: &VipsImage, amount: f32) -> Result<VipsImage, RenderError> {
-    let (color, alpha) = split_color_and_alpha(image, "saturation")?;
-    let oklab = linear_rgb_to_oklab(&color)?;
-    let chroma_scale = 1.0 + f64::from(amount) / 100.0;
-    let adjusted_oklab = ops::linear(
-        &oklab,
-        &mut [1.0, chroma_scale, chroma_scale],
-        &mut [0.0, 0.0, 0.0],
-    )
-    .map_err(vips_error)?;
-    let saturated = oklab_to_linear_rgb(&adjusted_oklab)?;
-    join_alpha(saturated, alpha)
-}
+/// Darken the OKLab lightness channel with a radially symmetric vignette.
+///
+/// The alpha mask is computed entirely with libvips tensor operations — no
+/// pixel loops. The result is in OKLab space so the next stage (Sharpness)
+/// can consume it directly without an extra color-space round-trip.
+///
+/// Grid convention: the exact image center maps to (0, 0); coordinate values
+/// are normalized by half the shorter dimension so a circle inscribed in
+/// the shorter axis reaches radius 1.0 regardless of aspect ratio.
+fn apply_vignette_on_oklab(
+    oklab: &VipsImage,
+    strength: f32,
+    width: u32,
+    height: u32,
+) -> Result<VipsImage, RenderError> {
+    let s = f64::from(strength);
+    let w = width as i32;
+    let h = height as i32;
+    let n = (w * h) as usize;
 
-fn apply_matrix_look_oklab(image: &VipsImage) -> Result<VipsImage, RenderError> {
-    // The fixed preset follows the published Matrix grading recipe: retain
-    // 30% chroma, bias shadows green/cyan, push midtones further toward
-    // green, and add a small yellow bias in highlights. Smooth interpolation
-    // between these OKLab anchors avoids tonal seams.
-    const CHROMA_SCALE: f64 = 0.30;
-    const SHADOW_BIAS: [f64; 2] = [-0.018, -0.004];
-    const MIDTONE_BIAS: [f64; 2] = [-0.035, 0.006];
-    const HIGHLIGHT_BIAS: [f64; 2] = [-0.006, 0.018];
+    // --- Build normalized coordinate images in one pass ---------------------
+    // We fill two float buffers (u, v) and hand them to libvips as single-band
+    // float images. All subsequent math is libvips tensor ops — fully parallel.
+    let half_short = f64::from(w.min(h)) * 0.5;
+    let cx = f64::from(w - 1) * 0.5;
+    let cy = f64::from(h - 1) * 0.5;
 
-    let (color, alpha) = split_color_and_alpha(image, "Matrix look")?;
-    let oklab = linear_rgb_to_oklab(&color)?;
-    let lightness = ops::extract_band(&oklab, 0).map_err(vips_error)?;
-    let chroma = ops::extract_band_with_opts(&oklab, 1, &ops::ExtractBandOptions { n: 2 })
-        .map_err(vips_error)?;
-
-    let zero = ops::linear(&lightness, &mut [0.0], &mut [0.0]).map_err(vips_error)?;
-    let one = ops::linear(&lightness, &mut [0.0], &mut [1.0]).map_err(vips_error)?;
-    let below = ops::relational_const(&lightness, ops::OperationRelational::Less, &mut [0.0])
-        .map_err(vips_error)?;
-    let above = ops::relational_const(&lightness, ops::OperationRelational::More, &mut [1.0])
-        .map_err(vips_error)?;
-    let bounded_lightness = ops::ifthenelse(&below, &zero, &lightness).map_err(vips_error)?;
-    let bounded_lightness =
-        ops::ifthenelse(&above, &one, &bounded_lightness).map_err(vips_error)?;
-    let lower_half = ops::relational_const(
-        &bounded_lightness,
-        ops::OperationRelational::Lesseq,
-        &mut [0.5],
-    )
-    .map_err(vips_error)?;
-
-    let mut adjusted_chroma = Vec::with_capacity(2);
-    for band in 0..2 {
-        let component = ops::extract_band(&chroma, band).map_err(vips_error)?;
-        let component =
-            ops::linear(&component, &mut [CHROMA_SCALE], &mut [0.0]).map_err(vips_error)?;
-
-        let lower_slope = 2.0 * (MIDTONE_BIAS[band as usize] - SHADOW_BIAS[band as usize]);
-        let lower_bias = ops::linear(
-            &bounded_lightness,
-            &mut [lower_slope],
-            &mut [SHADOW_BIAS[band as usize]],
-        )
-        .map_err(vips_error)?;
-        let upper_slope = 2.0 * (HIGHLIGHT_BIAS[band as usize] - MIDTONE_BIAS[band as usize]);
-        let upper_intercept = 2.0 * MIDTONE_BIAS[band as usize] - HIGHLIGHT_BIAS[band as usize];
-        let upper_bias = ops::linear(
-            &bounded_lightness,
-            &mut [upper_slope],
-            &mut [upper_intercept],
-        )
-        .map_err(vips_error)?;
-        let tonal_bias =
-            ops::ifthenelse(&lower_half, &lower_bias, &upper_bias).map_err(vips_error)?;
-        adjusted_chroma.push(ops::add(&component, &tonal_bias).map_err(vips_error)?);
+    let mut u_bytes = Vec::with_capacity(n * size_of::<f32>());
+    let mut v_bytes = Vec::with_capacity(n * size_of::<f32>());
+    for row in 0..h {
+        let v_val = (f64::from(row) - cy) / half_short;
+        for col in 0..w {
+            let u_val = (f64::from(col) - cx) / half_short;
+            u_bytes.extend_from_slice(&(u_val as f32).to_ne_bytes());
+            v_bytes.extend_from_slice(&(v_val as f32).to_ne_bytes());
+        }
     }
 
-    let adjusted_chroma = ops::bandjoin(&mut adjusted_chroma).map_err(vips_error)?;
-    let adjusted_oklab = ops::bandjoin(&mut [lightness, adjusted_chroma]).map_err(vips_error)?;
-    let graded = oklab_to_linear_rgb(&adjusted_oklab)?;
-    join_alpha(graded, alpha)
+    let u = VipsImage::new_from_memory_copy(&u_bytes, w, h, 1, ops::BandFormat::Float)
+        .map_err(vips_error)?;
+    let v = VipsImage::new_from_memory_copy(&v_bytes, w, h, 1, ops::BandFormat::Float)
+        .map_err(vips_error)?;
+
+    // --- Radial distance r = sqrt(u^2 + v^2) --------------------------------
+    let u2 = ops::multiply(&u, &u).map_err(vips_error)?;
+    let v2 = ops::multiply(&v, &v).map_err(vips_error)?;
+    let r2 = ops::add(&u2, &v2).map_err(vips_error)?;
+    // sqrt via r2^0.5
+    let r = ops::math2_const(&r2, ops::OperationMath2::Pow, &mut [0.5]).map_err(vips_error)?;
+
+    // --- Smoothstep falloff -------------------------------------------------
+    // edge0 = 1.0 - 0.6 * s  (inner boundary, moves inward as strength grows)
+    // edge1 = 1.4             (outer boundary, constant)
+    // t     = clamp((r - edge0) / (edge1 - edge0), 0, 1)
+    // alpha_base = t^2 * (3 - 2*t)   (smoothstep)
+    // alpha      = s * alpha_base
+    let edge0 = 1.0 - 0.6 * s;
+    let edge1 = 1.4_f64;
+    let ramp_scale = 1.0 / (edge1 - edge0);
+    let ramp_offset = -edge0 / (edge1 - edge0);
+    // t (un-clamped)
+    let t_raw = ops::linear(&r, &mut [ramp_scale], &mut [ramp_offset]).map_err(vips_error)?;
+    // clamp to [0, 1]
+    let t = clamp_image(&t_raw, 0.0, 1.0)?;
+    // smoothstep: t^2 * (3 - 2*t)
+    let t2 = ops::multiply(&t, &t).map_err(vips_error)?;
+    let three_minus_2t = ops::linear(&t, &mut [-2.0], &mut [3.0]).map_err(vips_error)?;
+    let alpha_base = ops::multiply(&t2, &three_minus_2t).map_err(vips_error)?;
+    // Scale by strength: alpha = s * alpha_base
+    let alpha_mask = ops::linear(&alpha_base, &mut [s], &mut [0.0]).map_err(vips_error)?;
+
+    // --- Apply to L channel only --------------------------------------------
+    // L_out = L_in * (1.0 - alpha)
+    let one_minus_alpha = ops::linear(&alpha_mask, &mut [-1.0], &mut [1.0]).map_err(vips_error)?;
+    let lightness = ops::extract_band(oklab, 0).map_err(vips_error)?;
+    let chroma = ops::extract_band_with_opts(oklab, 1, &ops::ExtractBandOptions { n: 2 })
+        .map_err(vips_error)?;
+    let darkened_lightness = ops::multiply(&lightness, &one_minus_alpha).map_err(vips_error)?;
+
+    // Re-join L' + a + b and return OKLab (no scRGB conversion).
+    ops::bandjoin(&mut [darkened_lightness, chroma]).map_err(vips_error)
+}
+
+/// Apply unsharp-mask sharpening directly on an OKLab image.
+///
+/// Identical math to `apply_sharpness_oklab` but accepts an already-converted
+/// OKLab tensor and returns one, avoiding the redundant forward conversion.
+fn apply_sharpness_on_oklab(
+    oklab: &VipsImage,
+    amount: f32,
+    source_scale: f32,
+) -> Result<VipsImage, RenderError> {
+    const RADIUS_SIGMA: f64 = 1.0;
+    const DETAIL_THRESHOLD: f64 = 0.003;
+
+    let lightness = ops::extract_band(oklab, 0).map_err(vips_error)?;
+    let chroma = ops::extract_band_with_opts(oklab, 1, &ops::ExtractBandOptions { n: 2 })
+        .map_err(vips_error)?;
+    let radius_sigma = (RADIUS_SIGMA * f64::from(source_scale)).max(0.2);
+    let blurred = ops::gaussblur(&lightness, radius_sigma).map_err(vips_error)?;
+    let detail = ops::subtract(&lightness, &blurred).map_err(vips_error)?;
+    let detail_magnitude = ops::abs(&detail).map_err(vips_error)?;
+    let significant = ops::relational_const(
+        &detail_magnitude,
+        ops::OperationRelational::Moreeq,
+        &mut [DETAIL_THRESHOLD],
+    )
+    .map_err(vips_error)?;
+    let scaled_detail =
+        ops::linear(&detail, &mut [f64::from(amount) / 100.0], &mut [0.0]).map_err(vips_error)?;
+    let sharpened_lightness = ops::add(&lightness, &scaled_detail).map_err(vips_error)?;
+    let adjusted_lightness =
+        ops::ifthenelse(&significant, &sharpened_lightness, &lightness).map_err(vips_error)?;
+    ops::bandjoin(&mut [adjusted_lightness, chroma]).map_err(vips_error)
 }
 
 fn apply_contrast_oklab(image: &VipsImage, amount: f32) -> Result<VipsImage, RenderError> {
@@ -1315,39 +1385,6 @@ fn smoothstep_image(image: &VipsImage) -> Result<VipsImage, RenderError> {
     let squared = ops::multiply(image, image).map_err(vips_error)?;
     let three_minus_twice = ops::linear(image, &mut [-2.0], &mut [3.0]).map_err(vips_error)?;
     ops::multiply(&squared, &three_minus_twice).map_err(vips_error)
-}
-
-fn apply_sharpness_oklab(
-    image: &VipsImage,
-    amount: f32,
-    source_scale: f32,
-) -> Result<VipsImage, RenderError> {
-    const RADIUS_SIGMA: f64 = 1.0;
-    const DETAIL_THRESHOLD: f64 = 0.003;
-
-    let (color, alpha) = split_color_and_alpha(image, "sharpness")?;
-    let oklab = linear_rgb_to_oklab(&color)?;
-    let lightness = ops::extract_band(&oklab, 0).map_err(vips_error)?;
-    let chroma = ops::extract_band_with_opts(&oklab, 1, &ops::ExtractBandOptions { n: 2 })
-        .map_err(vips_error)?;
-    let radius_sigma = (RADIUS_SIGMA * f64::from(source_scale)).max(0.2);
-    let blurred = ops::gaussblur(&lightness, radius_sigma).map_err(vips_error)?;
-    let detail = ops::subtract(&lightness, &blurred).map_err(vips_error)?;
-    let detail_magnitude = ops::abs(&detail).map_err(vips_error)?;
-    let significant = ops::relational_const(
-        &detail_magnitude,
-        ops::OperationRelational::Moreeq,
-        &mut [DETAIL_THRESHOLD],
-    )
-    .map_err(vips_error)?;
-    let scaled_detail =
-        ops::linear(&detail, &mut [f64::from(amount) / 100.0], &mut [0.0]).map_err(vips_error)?;
-    let sharpened_lightness = ops::add(&lightness, &scaled_detail).map_err(vips_error)?;
-    let adjusted_lightness =
-        ops::ifthenelse(&significant, &sharpened_lightness, &lightness).map_err(vips_error)?;
-    let adjusted_oklab = ops::bandjoin(&mut [adjusted_lightness, chroma]).map_err(vips_error)?;
-    let sharpened = oklab_to_linear_rgb(&adjusted_oklab)?;
-    join_alpha(sharpened, alpha)
 }
 
 fn split_color_and_alpha(
@@ -2067,7 +2104,6 @@ mod tests {
                             },
                             Operation::Exposure { ev: 0.5 },
                             Operation::Saturation { amount: 24.0 },
-                            Operation::Matrix { enabled: true },
                             Operation::Sharpness { amount: 145.0 },
                         ],
                         format,
@@ -2211,57 +2247,6 @@ mod tests {
                 "straightening changed source alpha to {value}"
             );
         }
-    }
-
-    #[test]
-    fn matrix_look_matches_tonal_oklab_anchors_and_preserves_alpha() {
-        let mut pixels = Vec::new();
-        for lightness in [0.25_f32, 0.5, 0.75] {
-            let neutral = lightness.powi(3);
-            for value in [neutral, neutral, neutral] {
-                pixels.extend_from_slice(&value.to_ne_bytes());
-            }
-        }
-        let image =
-            VipsImage::new_from_memory_copy(&pixels, 3, 1, 3, ops::BandFormat::Float).unwrap();
-
-        let graded = apply_matrix_look_oklab(&image).unwrap();
-        let oklab = linear_rgb_to_oklab(&graded).unwrap();
-        let values = oklab
-            .write_to_memory()
-            .chunks_exact(size_of::<f32>())
-            .map(|bytes| f32::from_ne_bytes(bytes.try_into().unwrap()))
-            .collect::<Vec<_>>();
-        let expected = [
-            [0.25_f32, -0.0265, 0.001],
-            [0.5, -0.035, 0.006],
-            [0.75, -0.0205, 0.012],
-        ];
-        for (actual, expected) in values.chunks_exact(3).zip(expected) {
-            for (actual, expected) in actual.iter().zip(expected) {
-                assert!(
-                    (*actual - expected).abs() < 3.0e-5,
-                    "Matrix OKLab sample differed: expected {expected}, got {actual}"
-                );
-            }
-        }
-
-        let directory = tempfile::tempdir().unwrap();
-        let source_path = directory.path().join("matrix-alpha.png");
-        let rgba = [96_u8, 128, 160, 77];
-        let image =
-            VipsImage::new_from_memory_copy(&rgba, 1, 1, 4, ops::BandFormat::Uchar).unwrap();
-        ops::pngsave(&image, source_path.to_str().unwrap()).unwrap();
-        let mut engine = VipsEngine::new().unwrap();
-        let preview = engine
-            .render_preview(&PreviewRequest {
-                generation: 1,
-                source_path,
-                operations: vec![Operation::Matrix { enabled: true }],
-                viewport: Viewport::fit(1, 1),
-            })
-            .unwrap();
-        assert_eq!(preview.rgba8[3], 77, "Matrix look must preserve alpha");
     }
 
     #[test]
@@ -2776,5 +2761,155 @@ mod tests {
             1.055 * linear.powf(1.0 / 2.4) - 0.055
         };
         (encoded.clamp(0.0, 1.0) * 255.0).round() as u8
+    }
+
+    /// Build a flat, uniform gray image with an optional alpha channel in
+    /// linear scRGB space (values are already linear, not gamma-encoded).
+    fn make_uniform_linear_image(
+        width: i32,
+        height: i32,
+        value: f32,
+        with_alpha: bool,
+    ) -> VipsImage {
+        let bands = if with_alpha { 4 } else { 3 };
+        let mut data = Vec::with_capacity((width * height * bands) as usize * 4);
+        for _ in 0..(width * height) {
+            for _ in 0..3 {
+                data.extend_from_slice(&value.to_ne_bytes());
+            }
+            if with_alpha {
+                data.extend_from_slice(&0.5_f32.to_ne_bytes());
+            }
+        }
+        VipsImage::new_from_memory_copy(&data, width, height, bands, ops::BandFormat::Float)
+            .unwrap()
+    }
+
+    #[test]
+    fn vignette_darkens_corners_more_than_center() {
+        // A 100×100 uniform image. At full strength the center should be barely
+        // touched while the far corners (distance ≈ 0.71 * sqrt(2) ≈ 1.0) fall
+        // solidly inside the smoothstep falloff.
+        let source_image = make_uniform_linear_image(100, 100, 0.5, false);
+
+        // Convert to OKLab (as the pipeline does) and apply vignette.
+        let oklab = linear_rgb_to_oklab(&source_image).unwrap();
+        let vignetted_oklab = apply_vignette_on_oklab(&oklab, 1.0, 100, 100).unwrap();
+        let vignetted = oklab_to_linear_rgb(&vignetted_oklab).unwrap();
+
+        // Read the resulting float pixels.
+        fn read_pixel(image: &VipsImage, x: i32, y: i32) -> f32 {
+            let pixel_bytes = image.write_to_memory();
+            let bands = image.get_bands() as usize;
+            let idx = (y as usize * image.get_width() as usize + x as usize) * bands;
+            f32::from_ne_bytes(pixel_bytes[idx * 4..idx * 4 + 4].try_into().unwrap())
+        }
+
+        let center_value = read_pixel(&vignetted, 50, 50);
+        let corner_value = read_pixel(&vignetted, 0, 0);
+
+        assert!(
+            corner_value < center_value,
+            "corner ({corner_value}) must be darker than center ({center_value}) with strength=1"
+        );
+        // Center should be essentially untouched (distance ≈ 0 → alpha ≈ 0).
+        assert!(
+            (center_value - 0.5).abs() < 0.02,
+            "center should remain close to input at strength=1, got {center_value}"
+        );
+    }
+
+    #[test]
+    fn vignette_strength_zero_is_identity() {
+        let source_image = make_uniform_linear_image(32, 32, 0.4, false);
+        let oklab = linear_rgb_to_oklab(&source_image).unwrap();
+        let vignetted_oklab = apply_vignette_on_oklab(&oklab, 0.0, 32, 32).unwrap();
+        let vignetted = oklab_to_linear_rgb(&vignetted_oklab).unwrap();
+
+        let original_bytes = source_image.write_to_memory();
+        let vignetted_bytes = vignetted.write_to_memory();
+        assert_eq!(
+            original_bytes.len(),
+            vignetted_bytes.len(),
+            "image size must not change"
+        );
+        for (original, vignetted) in original_bytes
+            .chunks_exact(4)
+            .zip(vignetted_bytes.chunks_exact(4))
+        {
+            let orig = f32::from_ne_bytes(original.try_into().unwrap());
+            let vign = f32::from_ne_bytes(vignetted.try_into().unwrap());
+            assert!(
+                (orig - vign).abs() < 1e-4,
+                "strength=0 must not change any pixel value; orig={orig}, vign={vign}"
+            );
+        }
+    }
+
+    #[test]
+    fn vignette_preserves_alpha_channel() {
+        let directory = tempfile::tempdir().unwrap();
+        let source_path = directory.path().join("vignette-alpha.png");
+
+        // A 5×5 image with a semi-transparent alpha channel.
+        let mut pixels = Vec::new();
+        for _ in 0..25 {
+            pixels.extend_from_slice(&[180_u8, 180, 180, 128]);
+        }
+        let image =
+            VipsImage::new_from_memory_copy(&pixels, 5, 5, 4, ops::BandFormat::Uchar).unwrap();
+        ops::pngsave(&image, source_path.to_str().unwrap()).unwrap();
+
+        let mut engine = VipsEngine::new().unwrap();
+        let result = engine
+            .render_preview(&PreviewRequest {
+                generation: 1,
+                source_path,
+                operations: vec![Operation::Vignette { strength: 0.8 }],
+                viewport: Viewport::fit(5, 5),
+            })
+            .unwrap();
+
+        // Every fourth byte is the alpha channel; it must equal 128 (≈ 50%).
+        for (i, chunk) in result.rgba8.chunks_exact(4).enumerate() {
+            assert_eq!(
+                chunk[3], 128,
+                "vignette must not alter alpha at pixel {i}: got {}",
+                chunk[3]
+            );
+        }
+    }
+
+    #[test]
+    fn vignette_does_not_shift_hue_of_neutral_gray() {
+        // A neutral gray has OKLab a=0 b=0. After vignette, only L changes; a
+        // and b should stay at zero so no color cast appears in the shadows.
+        let source_image = make_uniform_linear_image(11, 11, 0.18, false);
+        let oklab_before = linear_rgb_to_oklab(&source_image).unwrap();
+        let oklab_after = apply_vignette_on_oklab(&oklab_before, 1.0, 11, 11).unwrap();
+
+        let before_bytes = oklab_before.write_to_memory();
+        let after_bytes = oklab_after.write_to_memory();
+        let bands = oklab_after.get_bands() as usize;
+
+        for (before_chunk, after_chunk) in before_bytes
+            .chunks_exact(4 * bands)
+            .zip(after_bytes.chunks_exact(4 * bands))
+        {
+            // Bands 1 and 2 are OKLab a and b (chroma).
+            let a_before = f32::from_ne_bytes(before_chunk[4..8].try_into().unwrap());
+            let b_before = f32::from_ne_bytes(before_chunk[8..12].try_into().unwrap());
+            let a_after = f32::from_ne_bytes(after_chunk[4..8].try_into().unwrap());
+            let b_after = f32::from_ne_bytes(after_chunk[8..12].try_into().unwrap());
+
+            assert!(
+                (a_before - a_after).abs() < 1e-5,
+                "vignette must not alter OKLab 'a' channel; before={a_before}, after={a_after}"
+            );
+            assert!(
+                (b_before - b_after).abs() < 1e-5,
+                "vignette must not alter OKLab 'b' channel; before={b_before}, after={b_after}"
+            );
+        }
     }
 }
