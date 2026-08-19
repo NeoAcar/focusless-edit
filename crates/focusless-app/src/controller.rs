@@ -50,6 +50,9 @@ pub struct Controller {
     recovery_path: PathBuf,
     generation: u64,
     newest_generation: u64,
+    original_generation: u64,
+    show_original: bool,
+    original_preview_pending: bool,
     effective_zoom: f32,
     exposure_edit_start: Option<f32>,
     contrast_edit_start: Option<f32>,
@@ -91,6 +94,9 @@ impl Controller {
             recovery_path: recovery_dir.join("untitled.focusless"),
             generation: 0,
             newest_generation: 0,
+            original_generation: u64::MAX,
+            show_original: false,
+            original_preview_pending: false,
             effective_zoom: 1.0,
             exposure_edit_start: None,
             contrast_edit_start: None,
@@ -183,6 +189,17 @@ impl Controller {
                     return;
                 };
                 controller.borrow_mut().restore_original(&ui);
+            });
+        }
+
+        {
+            let controller = Rc::clone(controller);
+            let weak_ui = weak_ui.clone();
+            ui.on_toggle_original_requested(move || {
+                let Some(ui) = weak_ui.upgrade() else {
+                    return;
+                };
+                controller.borrow_mut().toggle_original(&ui);
             });
         }
 
@@ -1095,6 +1112,11 @@ impl Controller {
                 && canvas_size.0 >= MIN_CANVAS_SIZE
                 && canvas_size.1 >= MIN_CANVAS_SIZE
             {
+                if self.show_original {
+                    // Mark original as pending; it will be queued after the
+                    // edited preview arrives to avoid channel collision.
+                    self.original_preview_pending = true;
+                }
                 self.queue_preview(ui);
             }
         }
@@ -1115,23 +1137,38 @@ impl Controller {
                 Err(error) => self.show_error(ui, "Could not open photo", &error),
             },
             EngineEvent::PreviewReady(Ok(result)) => {
-                if result.generation != self.newest_generation {
-                    return;
+                if result.generation == self.original_generation {
+                    // Original (unedited) preview — store in the original-image slot
+                    let buffer = SharedPixelBuffer::<Rgba8Pixel>::clone_from_slice(
+                        &result.rgba8,
+                        result.width,
+                        result.height,
+                    );
+                    ui.set_original_image(Image::from_rgba8(buffer));
+                } else if result.generation == self.newest_generation {
+                    // Normal edited preview
+                    let buffer = SharedPixelBuffer::<Rgba8Pixel>::clone_from_slice(
+                        &result.rgba8,
+                        result.width,
+                        result.height,
+                    );
+                    ui.set_preview_image(Image::from_rgba8(buffer));
+                    self.render_requested_at = None;
+                    ui.set_rendering(false);
+                    self.effective_zoom = result.effective_zoom;
+                    self.update_zoom_text(ui);
+                    self.update_crop_overlay_geometry(ui);
+                    if !self.exporting {
+                        ui.set_status_text("Ready".into());
+                    }
+                    // Queue original preview after edited is done to avoid
+                    // overwriting each other in the bounded(1) preview channel.
+                    if self.original_preview_pending {
+                        self.original_preview_pending = false;
+                        self.queue_original_preview(ui);
+                    }
                 }
-                let buffer = SharedPixelBuffer::<Rgba8Pixel>::clone_from_slice(
-                    &result.rgba8,
-                    result.width,
-                    result.height,
-                );
-                ui.set_preview_image(Image::from_rgba8(buffer));
-                self.render_requested_at = None;
-                ui.set_rendering(false);
-                self.effective_zoom = result.effective_zoom;
-                self.update_zoom_text(ui);
-                self.update_crop_overlay_geometry(ui);
-                if !self.exporting {
-                    ui.set_status_text("Ready".into());
-                }
+                // Stale generation — discard
             }
             EngineEvent::PreviewReady(Err(error)) => {
                 self.render_requested_at = None;
@@ -1270,9 +1307,14 @@ impl Controller {
         self.frame_edit_start = None;
         self.last_canvas_size = (0, 0);
         self.autosave_due = None;
+        self.show_original = false;
+        self.original_generation = u64::MAX;
+        self.original_preview_pending = false;
 
         let document = self.document.as_ref().expect("document was just assigned");
         ui.set_document_loaded(true);
+        ui.set_show_original(false);
+        ui.set_original_image(Default::default());
         ui.set_file_name(
             document
                 .source
@@ -2580,11 +2622,17 @@ impl Controller {
         let Some(document) = self.document.as_ref() else {
             return;
         };
-        let (width, height) = self.canvas_size(ui);
-        if width < MIN_CANVAS_SIZE || height < MIN_CANVAS_SIZE {
+        let (canvas_width, height) = self.canvas_size(ui);
+        if canvas_width < MIN_CANVAS_SIZE || height < MIN_CANVAS_SIZE {
             return;
         }
-        self.last_canvas_size = (width, height);
+        self.last_canvas_size = (canvas_width, height);
+        // In split-panel mode each half takes roughly half the canvas width.
+        let width = if self.show_original {
+            (canvas_width / 2).max(MIN_CANVAS_SIZE)
+        } else {
+            canvas_width
+        };
         self.generation = self.generation.wrapping_add(1);
         self.newest_generation = self.generation;
         self.render_requested_at = Some(Instant::now());
@@ -2629,6 +2677,59 @@ impl Controller {
             width.clamp(0, MAX_CANVAS_SIZE),
             height.clamp(0, MAX_CANVAS_SIZE),
         )
+    }
+
+    /// Queues a preview of the original source (no operations) into the
+    /// `original-image` Slint property. Uses a dedicated generation number so
+    /// the result is never confused with a normal edited preview.
+    fn queue_original_preview(&mut self, ui: &AppWindow) {
+        let Some(document) = self.document.as_ref() else {
+            return;
+        };
+        let (canvas_width, height) = self.canvas_size(ui);
+        if canvas_width < MIN_CANVAS_SIZE || height < MIN_CANVAS_SIZE {
+            return;
+        }
+        // Each panel is half the canvas width in split mode.
+        let width = (canvas_width / 2).max(MIN_CANVAS_SIZE);
+        // Allocate a generation that will never collide with newest_generation:
+        // generation is monotonically increasing from 0; we place original
+        // generations in the upper half of u64 by XOR-ing with a high bit.
+        self.original_generation = self.generation ^ (1u64 << 63);
+        self.engine.request_preview(PreviewRequest {
+            generation: self.original_generation,
+            source_path: document.source.path.clone(),
+            operations: vec![],
+            viewport: Viewport {
+                output_width: width,
+                output_height: height,
+                zoom: 0.0,
+                center_x: 0.5,
+                center_y: 0.5,
+            },
+        });
+    }
+
+    fn toggle_original(&mut self, ui: &AppWindow) {
+        if !ui.get_document_loaded() || ui.get_crop_mode() || ui.get_curve_mode() {
+            return;
+        }
+        self.show_original = !self.show_original;
+        ui.set_show_original(self.show_original);
+        if self.show_original {
+            // Mark original as pending: it will be queued immediately after the
+            // edited preview result arrives, avoiding channel collision on the
+            // engine's bounded(1) preview channel.
+            self.original_preview_pending = true;
+            self.queue_preview(ui);
+        } else {
+            // Clear the cached original image to free memory, cancel any
+            // pending original request, and re-render at full canvas width.
+            self.original_preview_pending = false;
+            self.original_generation = u64::MAX;
+            ui.set_original_image(Default::default());
+            self.queue_preview(ui);
+        }
     }
 
     fn update_history_ui(&self, ui: &AppWindow) {

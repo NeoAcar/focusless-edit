@@ -196,6 +196,8 @@ export component AppWindow inherits Window {
     background: #17191d;
 
     in-out property <image> preview-image;
+    in-out property <image> original-image;
+    in-out property <bool> show-original: false;
     in-out property <float> temperature: 0;
     in-out property <float> tint: 0;
     in-out property <float> saturation: 0;
@@ -259,6 +261,7 @@ export component AppWindow inherits Window {
     out property <int> canvas-width: canvas.width / 1px;
     out property <int> canvas-height: canvas.height / 1px;
 
+    callback toggle-original-requested;
     callback open-requested;
     callback save-requested;
     callback save-as-requested;
@@ -397,6 +400,13 @@ export component AppWindow inherits Window {
                     enabled: root.can-redo && !root.crop-mode && !root.curve-mode;
                     clicked => { root.redo-requested(); }
                 }
+                ActionButton {
+                    text: "Show Original";
+                    min-width: 100px;
+                    selected: root.show-original;
+                    enabled: root.document-loaded && !root.crop-mode && !root.curve-mode;
+                    clicked => { root.toggle-original-requested(); }
+                }
                 Divider {}
                 ActionButton {
                     text: "Export";
@@ -451,11 +461,105 @@ export component AppWindow inherits Window {
                     background: #101216;
                     clip: true;
 
-                    if root.document-loaded: Image {
+                    // Single-panel: edited preview (normal mode)
+                    if root.document-loaded && !root.show-original: Image {
                         source: root.preview-image;
                         image-fit: fill;
                         width: parent.width;
                         height: parent.height;
+                    }
+
+                    // Split-panel: original (left) | edited (right)
+                    // Explicit x/width positioning guarantees an exact 50/50 split
+                    // regardless of the images' natural or preferred sizes.
+                    if root.document-loaded && root.show-original: Rectangle {
+                        x: 0;
+                        y: 0;
+                        width: parent.width;
+                        height: parent.height;
+
+                        // Left panel: original
+                        Rectangle {
+                            x: 0;
+                            y: 0;
+                            width: parent.width / 2 - 1px;
+                            height: parent.height;
+                            clip: true;
+                            background: #101216;
+
+                            Image {
+                                source: root.original-image;
+                                image-fit: fill;
+                                width: parent.width;
+                                height: parent.height;
+                            }
+
+                            // "ORIGINAL" label
+                            Rectangle {
+                                x: 8px;
+                                y: 8px;
+                                width: label-original.preferred-width + 12px;
+                                height: 20px;
+                                border-radius: 4px;
+                                background: #00000066;
+
+                                label-original := Text {
+                                    x: 6px;
+                                    text: "ORIGINAL";
+                                    color: #ffffffcc;
+                                    font-size: 10px;
+                                    font-weight: 700;
+                                    vertical-alignment: center;
+                                    height: parent.height;
+                                }
+                            }
+                        }
+
+                        // Separator
+                        Rectangle {
+                            x: parent.width / 2 - 0.5px;
+                            y: 0;
+                            width: 1px;
+                            height: parent.height;
+                            background: #3b4049;
+                        }
+
+                        // Right panel: edited
+                        Rectangle {
+                            x: parent.width / 2 + 0.5px;
+                            y: 0;
+                            width: parent.width / 2 - 1px;
+                            height: parent.height;
+                            clip: true;
+                            background: #101216;
+
+                            Image {
+                                source: root.preview-image;
+                                image-fit: fill;
+                                width: parent.width;
+                                height: parent.height;
+                            }
+
+                            // "EDITED" label
+                            Rectangle {
+                                x: 8px;
+                                y: 8px;
+                                width: label-edited.preferred-width + 12px;
+                                height: 20px;
+                                border-radius: 4px;
+                                background: #00000066;
+
+                                label-edited := Text {
+                                    x: 6px;
+                                    text: "EDITED";
+                                    color: #ffffffcc;
+                                    font-size: 10px;
+                                    font-weight: 700;
+                                    vertical-alignment: center;
+                                    height: parent.height;
+                                }
+                            }
+                        }
                     }
 
                     if !root.document-loaded: VerticalLayout {
