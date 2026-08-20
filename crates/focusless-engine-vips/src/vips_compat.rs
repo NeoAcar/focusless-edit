@@ -44,15 +44,9 @@ impl VipsApp {
     }
 }
 
-impl Drop for VipsApp {
-    fn drop(&mut self) {
-        Vips::thread_shutdown();
-    }
-}
-
 pub mod ops {
     pub use rs_vips::enums::{
-        Angle, BandFormat, Extend, Intent, Interpretation, OperationMath, OperationMath2,
+        Angle, BandFormat, Extend, Intent, Interpretation, Kernel, OperationMath, OperationMath2,
         OperationRelational,
     };
 
@@ -266,6 +260,25 @@ pub mod ops {
         image.resize(scale)
     }
 
+    #[derive(Debug, Clone, Copy)]
+    pub struct ResizeOptions {
+        pub vscale: f64,
+        pub kernel: Kernel,
+    }
+
+    pub fn resize_with_opts(
+        image: &VipsImage,
+        scale: f64,
+        options: &ResizeOptions,
+    ) -> Result<VipsImage> {
+        image.resize_with_opts(
+            scale,
+            VOption::new()
+                .set("vscale", options.vscale)
+                .set("kernel", kernel_nick(options.kernel)),
+        )
+    }
+
     pub fn rot(image: &VipsImage, angle: Angle) -> Result<VipsImage> {
         image.rot(angle)
     }
@@ -300,6 +313,19 @@ pub mod ops {
             Intent::Saturation => "saturation",
             Intent::Absolute => "absolute",
             Intent::Auto => "auto",
+        }
+    }
+
+    const fn kernel_nick(kernel: Kernel) -> &'static str {
+        match kernel {
+            Kernel::Nearest => "nearest",
+            Kernel::Linear => "linear",
+            Kernel::Cubic => "cubic",
+            Kernel::Mitchell => "mitchell",
+            Kernel::Lanczos2 => "lanczos2",
+            Kernel::Lanczos3 => "lanczos3",
+            Kernel::Mks2013 => "mks2013",
+            Kernel::Mks2021 => "mks2021",
         }
     }
 }

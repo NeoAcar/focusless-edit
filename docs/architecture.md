@@ -36,7 +36,7 @@ The workspace contains four production crates:
 4. For fit previews, the worker materializes one color-managed linear source
    proxy and every interactive operation reuses it. When Shadows/Highlights
    is active, the worker also materializes that stage and reuses it for later
-   Tone Curve, Saturation, Sharpness, and Frame changes. Operations
+   Tone Curve, Saturation, Sharpness, Vignette, and Frame changes. Operations
    before or at Shadows/Highlights invalidate that stage. Zoomed previews
    compute the visible source region from the full-resolution pipeline.
 5. An RGBA8 pixel buffer returns to the UI thread.
@@ -67,7 +67,7 @@ ICC conversion to the working space, quarter-turn rotation, auto-cropped
 straighten rotation, normalized crop, white balance, exposure, the
 Shadows/Highlights adjustment, contrast, tone curve, and saturation. A crop
 rectangle is stored as normalized coordinates so it remains independent of
-source resolution. Sharpness follows the tonal operations, and the frame is
+source resolution. Sharpness and Vignette follow the tonal operations, and the frame is
 added last before preview resizing or output conversion. Rotating an existing
 crop transforms the rectangle with the image and records both changes as one
 undoable command.
@@ -122,6 +122,10 @@ Sharpness applies a full-resolution unsharp mask only to OKLab lightness:
 `0..10` gain. Detail below a fixed `0.003` OKLab-lightness threshold is left
 unchanged to avoid amplifying low-level noise. Chroma and alpha remain
 separate, which prevents colored sharpening halos.
+
+Vignette applies a smooth radially symmetric falloff to OKLab lightness after
+Sharpness. The `0..100` control darkens corners while leaving the center,
+OKLab chroma, and alpha unchanged.
 
 The frame width is a percentage of the shorter cropped image dimension. Its
 sRGB color preset is decoded to linear light before an opaque border is added

@@ -204,6 +204,8 @@ export component AppWindow inherits Window {
 
     in-out property <float> sharpness: 0;
     in-out property <float> vignette: 0;
+    in-out property <float> luma-denoise: 0;
+    in-out property <float> color-denoise: 0;
     in-out property <float> exposure: 0;
     in-out property <float> contrast: 0;
     in-out property <float> shadows: 0;
@@ -232,6 +234,8 @@ export component AppWindow inherits Window {
     in property <string> saturation-text: "0";
     in property <string> sharpness-text: "0";
     in property <string> vignette-text: "0";
+    in property <string> luma-denoise-text: "0";
+    in property <string> color-denoise-text: "0";
     in property <string> curve-text: "Identity";
     in property <string> curve-path: "M 0 1 L 1 0";
     in property <string> rotation-text: "0";
@@ -302,6 +306,14 @@ export component AppWindow inherits Window {
     callback vignette-preview(amount: float);
     callback vignette-commit(amount: float);
     callback reset-vignette-requested;
+    callback luma-denoise-preview(amount: float);
+    callback luma-denoise-commit(amount: float);
+    callback reset-luma-denoise-requested;
+    callback luma-denoise-value-submitted(string);
+    callback color-denoise-preview(amount: float);
+    callback color-denoise-commit(amount: float);
+    callback reset-color-denoise-requested;
+    callback color-denoise-value-submitted(string);
     callback curve-requested;
     callback curve-preview(point: int, input: float, value: float);
     callback curve-commit-requested;
@@ -1136,6 +1148,113 @@ export component AppWindow inherits Window {
                         color: #828a97;
                         font-size: 11px;
                         font-weight: 700;
+                    }
+
+                    Rectangle {
+                        height: 1px;
+                        background: #343840;
+                    }
+
+                    HorizontalLayout {
+                        Text {
+                            text: "DENOISE";
+                            color: #828a97;
+                            font-size: 11px;
+                            font-weight: 700;
+                            vertical-alignment: center;
+                        }
+                    }
+
+                    HorizontalLayout {
+                        spacing: 8px;
+                        Text {
+                            text: "Luminance";
+                            color: root.document-loaded ? #eef1f6 : #777d87;
+                            font-size: 14px;
+                            font-weight: 600;
+                        }
+                        Rectangle { horizontal-stretch: 1; background: transparent; }
+                        EditableValueLabel {
+                            text: root.luma-denoise-text;
+                            enabled: root.document-loaded && !root.crop-mode && !root.curve-mode;
+                            accepted(t) => { root.luma-denoise-value-submitted(t); }
+                            editing-changed(active) => { root.value-input-active = active; }
+                        }
+                        ResetButton {
+                            enabled: root.document-loaded && !root.crop-mode
+                                && !root.curve-mode && root.luma-denoise > 0.001;
+                            clicked => { root.reset-luma-denoise-requested(); }
+                        }
+                    }
+
+                    Slider {
+                        minimum: 0;
+                        maximum: 100;
+                        step: 1;
+                        value <=> root.luma-denoise;
+                        enabled: root.document-loaded && !root.crop-mode && !root.curve-mode;
+                        changed(value) => { root.luma-denoise-preview(value); }
+                        released(value) => { root.luma-denoise-commit(value); }
+                    }
+
+                    HorizontalLayout {
+                        Text {
+                            text: "0";
+                            color: #6f7682;
+                            font-size: 11px;
+                        }
+                        Rectangle { horizontal-stretch: 1; background: transparent; }
+                        Text {
+                            text: "100";
+                            color: #6f7682;
+                            font-size: 11px;
+                        }
+                    }
+
+                    HorizontalLayout {
+                        spacing: 8px;
+                        Text {
+                            text: "Color";
+                            color: root.document-loaded ? #eef1f6 : #777d87;
+                            font-size: 14px;
+                            font-weight: 600;
+                        }
+                        Rectangle { horizontal-stretch: 1; background: transparent; }
+                        EditableValueLabel {
+                            text: root.color-denoise-text;
+                            enabled: root.document-loaded && !root.crop-mode && !root.curve-mode;
+                            accepted(t) => { root.color-denoise-value-submitted(t); }
+                            editing-changed(active) => { root.value-input-active = active; }
+                        }
+                        ResetButton {
+                            enabled: root.document-loaded && !root.crop-mode
+                                && !root.curve-mode && root.color-denoise > 0.001;
+                            clicked => { root.reset-color-denoise-requested(); }
+                        }
+                    }
+
+                    Slider {
+                        minimum: 0;
+                        maximum: 100;
+                        step: 1;
+                        value <=> root.color-denoise;
+                        enabled: root.document-loaded && !root.crop-mode && !root.curve-mode;
+                        changed(value) => { root.color-denoise-preview(value); }
+                        released(value) => { root.color-denoise-commit(value); }
+                    }
+
+                    HorizontalLayout {
+                        Text {
+                            text: "0";
+                            color: #6f7682;
+                            font-size: 11px;
+                        }
+                        Rectangle { horizontal-stretch: 1; background: transparent; }
+                        Text {
+                            text: "100";
+                            color: #6f7682;
+                            font-size: 11px;
+                        }
                     }
 
                     Rectangle {

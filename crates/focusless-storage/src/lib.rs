@@ -321,6 +321,10 @@ mod tests {
                 Operation::Crop {
                     rect: focusless_core::CropRect::FULL,
                 },
+                Operation::Denoise {
+                    luma_denoise: 0.0,
+                    color_denoise: 0.0,
+                },
                 Operation::WhiteBalance {
                     adjustment: focusless_core::WhiteBalance::IDENTITY,
                 },
@@ -333,8 +337,8 @@ mod tests {
                     curve: focusless_core::ToneCurve::IDENTITY,
                 },
                 Operation::Saturation { amount: 0.0 },
-                Operation::Vignette { strength: 0.0 },
                 Operation::Sharpness { amount: 0.0 },
+                Operation::Vignette { strength: 0.0 },
                 Operation::Frame {
                     width_pct: 0.0,
                     color: focusless_core::FrameColor::WHITE,
@@ -719,6 +723,74 @@ mod tests {
         assert_eq!(restored.schema_version, PROJECT_SCHEMA_VERSION);
         assert_eq!(restored.history.undo_len(), MAX_HISTORY_LEN);
         assert_eq!(restored.history.redo_len(), 0);
+    }
+
+    #[test]
+    fn version_seventeen_project_gets_neutral_vignette_after_sharpness() {
+        let directory = tempdir().unwrap();
+        let project_path = directory.path().join("version-seventeen.focusless");
+        let image_path = directory.path().join("image.jpg");
+        let mut document = ProjectDocument::new(source(image_path));
+        document.schema_version = 17;
+        document
+            .operations
+            .retain(|operation| !matches!(operation, Operation::Vignette { .. }));
+        fs::write(&project_path, serde_json::to_vec_pretty(&document).unwrap()).unwrap();
+
+        let restored = load_project(&project_path).unwrap();
+
+        assert_eq!(restored.schema_version, PROJECT_SCHEMA_VERSION);
+        assert_eq!(restored.vignette(), 0.0);
+        let sharpness_index = restored
+            .operations
+            .iter()
+            .position(|operation| matches!(operation, Operation::Sharpness { .. }))
+            .unwrap();
+        let vignette_index = restored
+            .operations
+            .iter()
+            .position(|operation| matches!(operation, Operation::Vignette { .. }))
+            .unwrap();
+        let frame_index = restored
+            .operations
+            .iter()
+            .position(|operation| matches!(operation, Operation::Frame { .. }))
+            .unwrap();
+        assert!(sharpness_index < vignette_index && vignette_index < frame_index);
+    }
+
+    #[test]
+    fn version_eighteen_project_gets_neutral_denoise_after_crop() {
+        let directory = tempdir().unwrap();
+        let project_path = directory.path().join("version-eighteen.focusless");
+        let image_path = directory.path().join("image.jpg");
+        let mut document = ProjectDocument::new(source(image_path));
+        document.schema_version = 18;
+        document
+            .operations
+            .retain(|operation| !matches!(operation, Operation::Denoise { .. }));
+        fs::write(&project_path, serde_json::to_vec_pretty(&document).unwrap()).unwrap();
+
+        let restored = load_project(&project_path).unwrap();
+
+        assert_eq!(restored.schema_version, PROJECT_SCHEMA_VERSION);
+        assert_eq!(restored.denoise(), (0.0, 0.0));
+        let crop_index = restored
+            .operations
+            .iter()
+            .position(|operation| matches!(operation, Operation::Crop { .. }))
+            .unwrap();
+        let denoise_index = restored
+            .operations
+            .iter()
+            .position(|operation| matches!(operation, Operation::Denoise { .. }))
+            .unwrap();
+        let wb_index = restored
+            .operations
+            .iter()
+            .position(|operation| matches!(operation, Operation::WhiteBalance { .. }))
+            .unwrap();
+        assert!(crop_index < denoise_index && denoise_index < wb_index);
     }
 
     #[test]

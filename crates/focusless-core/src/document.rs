@@ -3,7 +3,7 @@ use std::{collections::VecDeque, path::PathBuf};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub const PROJECT_SCHEMA_VERSION: u32 = 18;
+pub const PROJECT_SCHEMA_VERSION: u32 = 19;
 pub const MAX_HISTORY_LEN: usize = 20;
 const MIN_CROP_EXTENT: f32 = 0.01;
 const MAX_FRAME_WIDTH_PCT: f32 = 50.0;
@@ -312,19 +312,51 @@ fn shape_preserving_tangents(inputs: [f32; 5], values: [f32; 5]) -> [f32; 5] {
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Operation {
-    Rotate { quarter_turns: u8 },
-    Straighten { degrees: f32 },
-    Crop { rect: CropRect },
-    WhiteBalance { adjustment: WhiteBalance },
-    Exposure { ev: f32 },
-    Contrast { amount: f32 },
-    ShadowsHighlights { adjustment: ShadowsHighlights },
-    ToneCurve { curve: ToneCurve },
-    Saturation { amount: f32 },
-    Vignette { strength: f32 },
+    Rotate {
+        quarter_turns: u8,
+    },
+    Straighten {
+        degrees: f32,
+    },
+    Crop {
+        rect: CropRect,
+    },
+    /// Multi-Scale Joint Guided Filter denoising.
+    /// Both values are the raw UI slider positions in [0.0, 100.0].
+    /// The engine maps them to filter parameters (radius, ε, threshold).
+    Denoise {
+        luma_denoise: f32,
+        color_denoise: f32,
+    },
+    WhiteBalance {
+        adjustment: WhiteBalance,
+    },
+    Exposure {
+        ev: f32,
+    },
+    Contrast {
+        amount: f32,
+    },
+    ShadowsHighlights {
+        adjustment: ShadowsHighlights,
+    },
+    ToneCurve {
+        curve: ToneCurve,
+    },
+    Saturation {
+        amount: f32,
+    },
+    Vignette {
+        strength: f32,
+    },
 
-    Sharpness { amount: f32 },
-    Frame { width_pct: f32, color: FrameColor },
+    Sharpness {
+        amount: f32,
+    },
+    Frame {
+        width_pct: f32,
+        color: FrameColor,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -354,6 +386,12 @@ pub enum Command {
     SetSharpness {
         before: f32,
         after: f32,
+    },
+    SetDenoise {
+        before_luma: f32,
+        before_color: f32,
+        after_luma: f32,
+        after_color: f32,
     },
     SetCrop {
         before: CropRect,
@@ -454,6 +492,10 @@ fn default_operations() -> Vec<Operation> {
         Operation::Crop {
             rect: CropRect::FULL,
         },
+        Operation::Denoise {
+            luma_denoise: 0.0,
+            color_denoise: 0.0,
+        },
         Operation::WhiteBalance {
             adjustment: WhiteBalance::IDENTITY,
         },
@@ -466,8 +508,8 @@ fn default_operations() -> Vec<Operation> {
             curve: ToneCurve::IDENTITY,
         },
         Operation::Saturation { amount: 0.0 },
-        Operation::Vignette { strength: 0.0 },
         Operation::Sharpness { amount: 0.0 },
+        Operation::Vignette { strength: 0.0 },
         Operation::Frame {
             width_pct: 0.0,
             color: FrameColor::WHITE,
@@ -491,6 +533,8 @@ pub enum DocumentError {
     InvalidVignette,
     #[error("sharpness must be finite and between 0 and 1000")]
     InvalidSharpness,
+    #[error("luma_denoise and color_denoise must be finite and between 0 and 100")]
+    InvalidDenoise,
     #[error("shadows and highlights must be finite and between -100 and +100")]
     InvalidShadowsHighlights,
     #[error("rotation must be between 0 and 3 quarter turns")]
@@ -529,6 +573,10 @@ impl ProjectDocument {
                 Operation::Rotate { quarter_turns } => validate_rotation(quarter_turns)?,
                 Operation::Straighten { degrees } => validate_straighten(degrees)?,
                 Operation::Crop { rect } => validate_crop(rect)?,
+                Operation::Denoise {
+                    luma_denoise,
+                    color_denoise,
+                } => validate_denoise(luma_denoise, color_denoise)?,
                 Operation::WhiteBalance { adjustment } => validate_white_balance(adjustment)?,
                 Operation::Exposure { ev } => validate_exposure(ev)?,
                 Operation::Contrast { amount } => validate_contrast(amount)?,
@@ -678,20 +726,46 @@ impl ProjectDocument {
                 .iter()
                 .any(|operation| matches!(operation, Operation::Vignette { .. }))
         {
-            // Insert between Saturation and Sharpness.
+            // Insert between Sharpness and Frame.
             let index = self
                 .operations
                 .iter()
-                .rposition(|operation| matches!(operation, Operation::Saturation { .. }))
+                .rposition(|operation| matches!(operation, Operation::Sharpness { .. }))
                 .map_or(
                     self.operations
                         .iter()
-                        .position(|operation| matches!(operation, Operation::Sharpness { .. }))
+                        .position(|operation| matches!(operation, Operation::Frame { .. }))
                         .unwrap_or(self.operations.len()),
                     |index| index + 1,
                 );
             self.operations
                 .insert(index, Operation::Vignette { strength: 0.0 });
+        }
+        if self.schema_version < 19
+            && !self
+                .operations
+                .iter()
+                .any(|operation| matches!(operation, Operation::Denoise { .. }))
+        {
+            // Insert after Crop, before WhiteBalance.
+            let index = self
+                .operations
+                .iter()
+                .rposition(|operation| matches!(operation, Operation::Crop { .. }))
+                .map_or(
+                    self.operations
+                        .iter()
+                        .position(|operation| matches!(operation, Operation::WhiteBalance { .. }))
+                        .unwrap_or(self.operations.len()),
+                    |index| index + 1,
+                );
+            self.operations.insert(
+                index,
+                Operation::Denoise {
+                    luma_denoise: 0.0,
+                    color_denoise: 0.0,
+                },
+            );
         }
         self.history.trim_to_limit();
         self.schema_version = PROJECT_SCHEMA_VERSION;
@@ -816,6 +890,21 @@ impl ProjectDocument {
                 _ => None,
             })
             .unwrap_or(0.0)
+    }
+
+    #[must_use]
+    pub fn denoise(&self) -> (f32, f32) {
+        self.operations
+            .iter()
+            .rev()
+            .find_map(|operation| match *operation {
+                Operation::Denoise {
+                    luma_denoise,
+                    color_denoise,
+                } => Some((luma_denoise, color_denoise)),
+                _ => None,
+            })
+            .unwrap_or((0.0, 0.0))
     }
 
     #[must_use]
@@ -1058,6 +1147,63 @@ impl ProjectDocument {
         Ok(())
     }
 
+    pub fn preview_denoise(
+        &mut self,
+        luma_denoise: f32,
+        color_denoise: f32,
+    ) -> Result<(), DocumentError> {
+        validate_denoise(luma_denoise, color_denoise)?;
+        if let Some(Operation::Denoise {
+            luma_denoise: current_luma,
+            color_denoise: current_color,
+        }) = self
+            .operations
+            .iter_mut()
+            .rev()
+            .find(|operation| matches!(operation, Operation::Denoise { .. }))
+        {
+            *current_luma = luma_denoise;
+            *current_color = color_denoise;
+        } else {
+            // Insert after the last Crop, before WhiteBalance, if possible.
+            let index = self
+                .operations
+                .iter()
+                .rposition(|operation| matches!(operation, Operation::Crop { .. }))
+                .map_or(self.operations.len(), |index| index + 1);
+            self.operations.insert(
+                index,
+                Operation::Denoise {
+                    luma_denoise,
+                    color_denoise,
+                },
+            );
+        }
+        Ok(())
+    }
+
+    pub fn commit_denoise(
+        &mut self,
+        before_luma: f32,
+        before_color: f32,
+        after_luma: f32,
+        after_color: f32,
+    ) -> Result<(), DocumentError> {
+        validate_denoise(before_luma, before_color)?;
+        self.preview_denoise(after_luma, after_color)?;
+        if (before_luma - after_luma).abs() > f32::EPSILON
+            || (before_color - after_color).abs() > f32::EPSILON
+        {
+            self.history.push(Command::SetDenoise {
+                before_luma,
+                before_color,
+                after_luma,
+                after_color,
+            });
+        }
+        Ok(())
+    }
+
     pub fn preview_frame(
         &mut self,
         width_pct: f32,
@@ -1259,6 +1405,13 @@ impl ProjectDocument {
             Command::SetSharpness { before, .. } => {
                 let _ = self.preview_sharpness(before);
             }
+            Command::SetDenoise {
+                before_luma,
+                before_color,
+                ..
+            } => {
+                let _ = self.preview_denoise(before_luma, before_color);
+            }
             Command::SetCrop { before, .. } => {
                 let _ = self.preview_crop(before);
             }
@@ -1317,6 +1470,13 @@ impl ProjectDocument {
 
             Command::SetSharpness { after, .. } => {
                 let _ = self.preview_sharpness(after);
+            }
+            Command::SetDenoise {
+                after_luma,
+                after_color,
+                ..
+            } => {
+                let _ = self.preview_denoise(after_luma, after_color);
             }
             Command::SetCrop { after, .. } => {
                 let _ = self.preview_crop(after);
@@ -1486,6 +1646,18 @@ fn validate_sharpness(amount: f32) -> Result<(), DocumentError> {
     }
 }
 
+fn validate_denoise(luma_denoise: f32, color_denoise: f32) -> Result<(), DocumentError> {
+    if luma_denoise.is_finite()
+        && (0.0..=100.0).contains(&luma_denoise)
+        && color_denoise.is_finite()
+        && (0.0..=100.0).contains(&color_denoise)
+    {
+        Ok(())
+    } else {
+        Err(DocumentError::InvalidDenoise)
+    }
+}
+
 fn validate_exposure(ev: f32) -> Result<(), DocumentError> {
     if ev.is_finite() && (-5.0..=5.0).contains(&ev) {
         Ok(())
@@ -1632,6 +1804,75 @@ mod tests {
         assert_eq!(document.sharpness(), 0.0);
         assert!(document.redo());
         assert_eq!(document.sharpness(), 240.0);
+    }
+
+    #[test]
+    fn denoise_transaction_is_undoable_and_redoable() {
+        let mut document = document();
+        document.preview_denoise(50.0, 30.0).unwrap();
+        document.commit_denoise(0.0, 0.0, 50.0, 30.0).unwrap();
+
+        assert_eq!(document.denoise(), (50.0, 30.0));
+        assert!(document.undo());
+        assert_eq!(document.denoise(), (0.0, 0.0));
+        assert!(document.redo());
+        assert_eq!(document.denoise(), (50.0, 30.0));
+    }
+
+    #[test]
+    fn rejects_invalid_denoise() {
+        let mut document = document();
+        assert_eq!(
+            document.preview_denoise(f32::NAN, 0.0),
+            Err(DocumentError::InvalidDenoise)
+        );
+        assert_eq!(
+            document.preview_denoise(-0.1, 0.0),
+            Err(DocumentError::InvalidDenoise)
+        );
+        assert_eq!(
+            document.preview_denoise(100.1, 0.0),
+            Err(DocumentError::InvalidDenoise)
+        );
+        assert_eq!(
+            document.preview_denoise(0.0, -0.1),
+            Err(DocumentError::InvalidDenoise)
+        );
+        assert_eq!(
+            document.preview_denoise(0.0, 100.1),
+            Err(DocumentError::InvalidDenoise)
+        );
+    }
+
+    #[test]
+    fn schema_v18_migrates_with_neutral_denoise_after_crop() {
+        let mut document = document();
+        document.schema_version = 18;
+        // Remove the Denoise operation to simulate a v18 project.
+        document
+            .operations
+            .retain(|operation| !matches!(operation, Operation::Denoise { .. }));
+
+        document.upgrade_to_latest().unwrap();
+
+        assert_eq!(document.schema_version, PROJECT_SCHEMA_VERSION);
+        assert_eq!(document.denoise(), (0.0, 0.0));
+        let crop_index = document
+            .operations
+            .iter()
+            .position(|operation| matches!(operation, Operation::Crop { .. }))
+            .unwrap();
+        let denoise_index = document
+            .operations
+            .iter()
+            .position(|operation| matches!(operation, Operation::Denoise { .. }))
+            .unwrap();
+        let wb_index = document
+            .operations
+            .iter()
+            .position(|operation| matches!(operation, Operation::WhiteBalance { .. }))
+            .unwrap();
+        assert!(crop_index < denoise_index && denoise_index < wb_index);
     }
 
     #[test]
@@ -1808,22 +2049,22 @@ mod tests {
 
         assert_eq!(document.schema_version, PROJECT_SCHEMA_VERSION);
         assert_eq!(document.vignette(), 0.0);
-        let saturation_index = document
+        let sharpness_index = document
             .operations
             .iter()
-            .rposition(|operation| matches!(operation, Operation::Saturation { .. }))
+            .rposition(|operation| matches!(operation, Operation::Sharpness { .. }))
             .unwrap();
         let vignette_index = document
             .operations
             .iter()
             .position(|operation| matches!(operation, Operation::Vignette { .. }))
             .unwrap();
-        let sharpness_index = document
+        let frame_index = document
             .operations
             .iter()
-            .position(|operation| matches!(operation, Operation::Sharpness { .. }))
+            .position(|operation| matches!(operation, Operation::Frame { .. }))
             .unwrap();
-        assert!(saturation_index < vignette_index && vignette_index < sharpness_index);
+        assert!(sharpness_index < vignette_index && vignette_index < frame_index);
     }
 
     #[test]

@@ -55,8 +55,8 @@ The canonical render order is:
    normalized crop.
 5. Apply white balance, exposure, contrast, shadows/highlights, tone curve,
    and saturation in the documented order.
-6. Apply sharpness to OKLab lightness, then add the frame in linear light,
-   before preview resize or output conversion.
+6. Apply sharpness to OKLab lightness, then vignette, then add the frame
+   in linear light, before preview resize or output conversion.
 7. Encode to display-referred sRGB and embed the sRGB ICC profile in exported
    JPEG, PNG, and WebP files.
 

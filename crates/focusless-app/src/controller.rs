@@ -62,6 +62,7 @@ pub struct Controller {
     sharpness_edit_start: Option<f32>,
     vignette_edit_start: Option<f32>,
     rotation_edit_start: Option<f32>,
+    denoise_edit_start: Option<(f32, f32)>,
     crop_edit_start: Option<CropRect>,
     crop_saved_view: Option<ViewState>,
     crop_aspect_ratio: Option<f32>,
@@ -106,6 +107,7 @@ impl Controller {
             sharpness_edit_start: None,
             vignette_edit_start: None,
             rotation_edit_start: None,
+            denoise_edit_start: None,
             crop_edit_start: None,
             crop_saved_view: None,
             crop_aspect_ratio: None,
@@ -401,6 +403,80 @@ impl Controller {
         {
             let controller = Rc::clone(controller);
             let weak_ui = weak_ui.clone();
+            ui.on_luma_denoise_preview(move |amount| {
+                let Some(ui) = weak_ui.upgrade() else {
+                    return;
+                };
+                controller
+                    .borrow_mut()
+                    .preview_luma_denoise(&ui, amount.clamp(0.0, 100.0));
+            });
+        }
+
+        {
+            let controller = Rc::clone(controller);
+            let weak_ui = weak_ui.clone();
+            ui.on_luma_denoise_commit(move |amount| {
+                let Some(ui) = weak_ui.upgrade() else {
+                    return;
+                };
+                controller
+                    .borrow_mut()
+                    .commit_luma_denoise(&ui, amount.clamp(0.0, 100.0));
+            });
+        }
+
+        {
+            let controller = Rc::clone(controller);
+            let weak_ui = weak_ui.clone();
+            ui.on_color_denoise_preview(move |amount| {
+                let Some(ui) = weak_ui.upgrade() else {
+                    return;
+                };
+                controller
+                    .borrow_mut()
+                    .preview_color_denoise(&ui, amount.clamp(0.0, 100.0));
+            });
+        }
+
+        {
+            let controller = Rc::clone(controller);
+            let weak_ui = weak_ui.clone();
+            ui.on_color_denoise_commit(move |amount| {
+                let Some(ui) = weak_ui.upgrade() else {
+                    return;
+                };
+                controller
+                    .borrow_mut()
+                    .commit_color_denoise(&ui, amount.clamp(0.0, 100.0));
+            });
+        }
+
+        {
+            let controller = Rc::clone(controller);
+            let weak_ui = weak_ui.clone();
+            ui.on_reset_luma_denoise_requested(move || {
+                let Some(ui) = weak_ui.upgrade() else {
+                    return;
+                };
+                controller.borrow_mut().reset_luma_denoise(&ui);
+            });
+        }
+
+        {
+            let controller = Rc::clone(controller);
+            let weak_ui = weak_ui.clone();
+            ui.on_reset_color_denoise_requested(move || {
+                let Some(ui) = weak_ui.upgrade() else {
+                    return;
+                };
+                controller.borrow_mut().reset_color_denoise(&ui);
+            });
+        }
+
+        {
+            let controller = Rc::clone(controller);
+            let weak_ui = weak_ui.clone();
             ui.on_vignette_commit(move |amount| {
                 let Some(ui) = weak_ui.upgrade() else {
                     return;
@@ -661,6 +737,38 @@ impl Controller {
                 };
                 let mut controller = controller.borrow_mut();
                 controller.commit_vignette(&ui, value);
+                controller.queue_preview(&ui);
+            });
+        }
+
+        {
+            let controller = Rc::clone(controller);
+            let weak_ui = weak_ui.clone();
+            ui.on_luma_denoise_value_submitted(move |text| {
+                let Some(ui) = weak_ui.upgrade() else {
+                    return;
+                };
+                let Some(value) = submitted_value(&ui, text.as_str(), 0.0, 100.0) else {
+                    return;
+                };
+                let mut controller = controller.borrow_mut();
+                controller.commit_luma_denoise(&ui, value);
+                controller.queue_preview(&ui);
+            });
+        }
+
+        {
+            let controller = Rc::clone(controller);
+            let weak_ui = weak_ui.clone();
+            ui.on_color_denoise_value_submitted(move |text| {
+                let Some(ui) = weak_ui.upgrade() else {
+                    return;
+                };
+                let Some(value) = submitted_value(&ui, text.as_str(), 0.0, 100.0) else {
+                    return;
+                };
+                let mut controller = controller.borrow_mut();
+                controller.commit_color_denoise(&ui, value);
                 controller.queue_preview(&ui);
             });
         }
@@ -1339,6 +1447,11 @@ impl Controller {
         ui.set_saturation_text(format_adjustment(document.saturation()).into());
         ui.set_sharpness(document.sharpness());
         ui.set_sharpness_text(format_nonnegative_adjustment(document.sharpness()).into());
+        let (luma_den, color_den) = document.denoise();
+        ui.set_luma_denoise(luma_den);
+        ui.set_luma_denoise_text(format_nonnegative_adjustment(luma_den).into());
+        ui.set_color_denoise(color_den);
+        ui.set_color_denoise_text(format_nonnegative_adjustment(color_den).into());
         ui.set_vignette(document.vignette() * 100.0);
         ui.set_vignette_text(format_nonnegative_adjustment(document.vignette() * 100.0).into());
         let (frame_w, frame_c) = document.frame();
@@ -1357,6 +1470,135 @@ impl Controller {
         self.update_history_ui(ui);
         self.queue_preview(ui);
         info!(path = %opened_source.display(), "document opened");
+    }
+
+    fn preview_luma_denoise(&mut self, ui: &AppWindow, amount: f32) {
+        if self.crop_edit_start.is_some() || self.curve_edit_start.is_some() {
+            return;
+        }
+        let Some(document) = self.document.as_mut() else {
+            return;
+        };
+        let (_, current_color) = document.denoise();
+        if self.denoise_edit_start.is_none() {
+            self.denoise_edit_start = Some(document.denoise());
+        }
+        if let Err(error) = document.preview_denoise(amount, current_color) {
+            self.show_error(ui, "Could not apply luminance denoise", &error);
+            return;
+        }
+        ui.set_luma_denoise_text(format_nonnegative_adjustment(amount).into());
+        self.mark_changed();
+        self.queue_preview(ui);
+    }
+
+    fn commit_luma_denoise(&mut self, ui: &AppWindow, amount: f32) {
+        if self.crop_edit_start.is_some() || self.curve_edit_start.is_some() {
+            return;
+        }
+        let Some(document) = self.document.as_mut() else {
+            return;
+        };
+        let (before_luma, before_color) = self
+            .denoise_edit_start
+            .take()
+            .unwrap_or_else(|| document.denoise());
+        let (_, current_color) = document.denoise();
+        if let Err(error) =
+            document.commit_denoise(before_luma, before_color, amount, current_color)
+        {
+            self.show_error(ui, "Could not commit luminance denoise", &error);
+            return;
+        }
+        ui.set_luma_denoise(amount);
+        ui.set_luma_denoise_text(format_nonnegative_adjustment(amount).into());
+        self.mark_changed();
+        self.update_history_ui(ui);
+    }
+
+    fn reset_luma_denoise(&mut self, ui: &AppWindow) {
+        if self.crop_edit_start.is_some() || self.curve_edit_start.is_some() {
+            return;
+        }
+        let Some(document) = self.document.as_mut() else {
+            return;
+        };
+        let (before_luma, before_color) = document.denoise();
+        if document
+            .commit_denoise(before_luma, before_color, 0.0, before_color)
+            .is_ok()
+        {
+            self.denoise_edit_start = None;
+            ui.set_luma_denoise(0.0);
+            ui.set_luma_denoise_text(format_nonnegative_adjustment(0.0).into());
+            self.mark_changed();
+            self.update_history_ui(ui);
+            self.queue_preview(ui);
+        }
+    }
+
+    fn preview_color_denoise(&mut self, ui: &AppWindow, amount: f32) {
+        if self.crop_edit_start.is_some() || self.curve_edit_start.is_some() {
+            return;
+        }
+        let Some(document) = self.document.as_mut() else {
+            return;
+        };
+        let (current_luma, _) = document.denoise();
+        if self.denoise_edit_start.is_none() {
+            self.denoise_edit_start = Some(document.denoise());
+        }
+        if let Err(error) = document.preview_denoise(current_luma, amount) {
+            self.show_error(ui, "Could not apply color denoise", &error);
+            return;
+        }
+        ui.set_color_denoise_text(format_nonnegative_adjustment(amount).into());
+        self.mark_changed();
+        self.queue_preview(ui);
+    }
+
+    fn commit_color_denoise(&mut self, ui: &AppWindow, amount: f32) {
+        if self.crop_edit_start.is_some() || self.curve_edit_start.is_some() {
+            return;
+        }
+        let Some(document) = self.document.as_mut() else {
+            return;
+        };
+        let (before_luma, before_color) = self
+            .denoise_edit_start
+            .take()
+            .unwrap_or_else(|| document.denoise());
+        let (current_luma, _) = document.denoise();
+        if let Err(error) = document.commit_denoise(before_luma, before_color, current_luma, amount)
+        {
+            self.show_error(ui, "Could not commit color denoise", &error);
+            return;
+        }
+        ui.set_color_denoise(amount);
+        ui.set_color_denoise_text(format_nonnegative_adjustment(amount).into());
+        self.mark_changed();
+        self.update_history_ui(ui);
+    }
+
+    fn reset_color_denoise(&mut self, ui: &AppWindow) {
+        if self.crop_edit_start.is_some() || self.curve_edit_start.is_some() {
+            return;
+        }
+        let Some(document) = self.document.as_mut() else {
+            return;
+        };
+        let (before_luma, before_color) = document.denoise();
+        if document
+            .commit_denoise(before_luma, before_color, before_luma, 0.0)
+            .is_ok()
+        {
+            self.denoise_edit_start = None;
+            ui.set_color_denoise(0.0);
+            ui.set_color_denoise_text(format_nonnegative_adjustment(0.0).into());
+            self.mark_changed();
+            self.update_history_ui(ui);
+            self.queue_preview(ui);
+        }
     }
 
     fn preview_white_balance(&mut self, ui: &AppWindow, adjustment: WhiteBalance) {
@@ -2365,6 +2607,7 @@ impl Controller {
         self.sharpness_edit_start = None;
         self.vignette_edit_start = None;
         self.rotation_edit_start = None;
+        self.denoise_edit_start = None;
         self.frame_edit_start = None;
         if document.undo() {
             let exposure = document.exposure_ev();
@@ -2373,6 +2616,7 @@ impl Controller {
             let saturation = document.saturation();
             let sharpness = document.sharpness();
             let vignette = document.vignette();
+            let (luma_den, color_den) = document.denoise();
             let curve = document.tone_curve();
             let (frame_w, frame_c) = document.frame();
             ui.set_exposure(exposure);
@@ -2391,6 +2635,10 @@ impl Controller {
             ui.set_sharpness_text(format_nonnegative_adjustment(sharpness).into());
             ui.set_vignette(vignette * 100.0);
             ui.set_vignette_text(format_nonnegative_adjustment(vignette * 100.0).into());
+            ui.set_luma_denoise(luma_den);
+            ui.set_luma_denoise_text(format_nonnegative_adjustment(luma_den).into());
+            ui.set_color_denoise(color_den);
+            ui.set_color_denoise_text(format_nonnegative_adjustment(color_den).into());
             self.set_curve_ui(ui, curve);
             ui.set_frame_width(frame_w);
             ui.set_frame_width_text(format!("{frame_w:.0}").into());
@@ -2420,6 +2668,7 @@ impl Controller {
         self.sharpness_edit_start = None;
         self.vignette_edit_start = None;
         self.rotation_edit_start = None;
+        self.denoise_edit_start = None;
         self.frame_edit_start = None;
         if document.redo() {
             let exposure = document.exposure_ev();
@@ -2428,6 +2677,7 @@ impl Controller {
             let saturation = document.saturation();
             let sharpness = document.sharpness();
             let vignette = document.vignette();
+            let (luma_den, color_den) = document.denoise();
             let curve = document.tone_curve();
             let (frame_w, frame_c) = document.frame();
             ui.set_exposure(exposure);
@@ -2446,6 +2696,10 @@ impl Controller {
             ui.set_sharpness_text(format_nonnegative_adjustment(sharpness).into());
             ui.set_vignette(vignette * 100.0);
             ui.set_vignette_text(format_nonnegative_adjustment(vignette * 100.0).into());
+            ui.set_luma_denoise(luma_den);
+            ui.set_luma_denoise_text(format_nonnegative_adjustment(luma_den).into());
+            ui.set_color_denoise(color_den);
+            ui.set_color_denoise_text(format_nonnegative_adjustment(color_den).into());
             self.set_curve_ui(ui, curve);
             ui.set_frame_width(frame_w);
             ui.set_frame_width_text(format!("{frame_w:.0}").into());

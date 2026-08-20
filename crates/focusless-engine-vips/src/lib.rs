@@ -772,6 +772,23 @@ fn apply_operations_through_shadows_highlights_scaled(
         current = crop_image(&current, crop)?;
     }
 
+    // --- Phase 3: Denoise -------------------------------------------------------
+    // Performed after geometry (crop/straighten) and before any tonal adjustments.
+    let (luma_denoise, color_denoise) = operations
+        .iter()
+        .rev()
+        .find_map(|operation| match *operation {
+            Operation::Denoise {
+                luma_denoise,
+                color_denoise,
+            } => Some((luma_denoise, color_denoise)),
+            _ => None,
+        })
+        .unwrap_or((0.0, 0.0));
+    if luma_denoise > f32::EPSILON || color_denoise > f32::EPSILON {
+        current = apply_denoising_msgjf(&current, luma_denoise, color_denoise)?;
+    }
+
     let white_balance = operations
         .iter()
         .rev()
@@ -887,15 +904,15 @@ fn apply_operations_after_shadows_highlights_scaled(
             .map_err(vips_error)?;
         }
 
-        // 2. Vignette: darken OKLab L proportionally to radial distance.
+        // 2. Sharpness: unsharp-mask on OKLab L only.
+        if sharpness > f32::EPSILON {
+            oklab = apply_sharpness_on_oklab(&oklab, sharpness, source_scale)?;
+        }
+
+        // 3. Vignette: darken OKLab L proportionally to radial distance.
         if vignette_strength > f32::EPSILON {
             let info = dimensions(&current)?;
             oklab = apply_vignette_on_oklab(&oklab, vignette_strength, info.width, info.height)?;
-        }
-
-        // 3. Sharpness: unsharp-mask on OKLab L only.
-        if sharpness > f32::EPSILON {
-            oklab = apply_sharpness_on_oklab(&oklab, sharpness, source_scale)?;
         }
 
         // Single conversion back to linear scRGB.
@@ -932,6 +949,7 @@ fn operations_through_shadows_highlights(operations: &[Operation]) -> Vec<Operat
                 Operation::Rotate { .. }
                     | Operation::Straighten { .. }
                     | Operation::Crop { .. }
+                    | Operation::Denoise { .. }
                     | Operation::WhiteBalance { .. }
                     | Operation::Exposure { .. }
                     | Operation::Contrast { .. }
@@ -939,6 +957,241 @@ fn operations_through_shadows_highlights(operations: &[Operation]) -> Vec<Operat
             )
         })
         .collect()
+}
+
+/// Map UI slider values (0–100) to guided-filter math parameters.
+///
+/// Returns `(r_luma, eps_luma, threshold, r_chroma, eps_chroma)`.
+///
+/// # Mapping functions
+/// The exponent gives an intuitive response curve across the slider range.
+/// Luma regularization is tuned for OKLab lightness ($[0.0, 1.0]$) to keep
+/// contrast edges sharp while smoothing fine grain.
+///
+/// ```text
+/// r_chroma    = 4.0  + 20.0  × (t/100)^0.7   ∈ [4, 24] px
+/// ε_chroma    = 5e-4 × (t/100)^1.5           ∈ [0, 5e-4]
+/// r_luma      = 1.0  + 3.0   × (t/100)^0.7   ∈ [1, 4] px
+/// ε_luma      = 0.008 × (t/100)^1.5          ∈ [0, 0.008]
+/// threshold   = 0.02 × (t/100)^0.6           ∈ [0, 0.02]  (OKLab L units)
+/// ```
+fn denoise_params_from_ui(luma: f32, color: f32) -> (f64, f64, f64, f64, f64) {
+    let tl = (f64::from(luma) / 100.0).clamp(0.0, 1.0);
+    let tc = (f64::from(color) / 100.0).clamp(0.0, 1.0);
+
+    let r_luma = 1.0 + 3.0 * tl.powf(0.7);
+    let eps_luma = 0.008 * tl.powf(1.5);
+    let threshold = 0.02 * tl.powf(0.6);
+
+    let r_chroma = 4.0 + 20.0 * tc.powf(0.7);
+    let eps_chroma = 5e-4 * tc.powf(1.5);
+
+    (r_luma, eps_luma, threshold, r_chroma, eps_chroma)
+}
+
+/// Multi-Scale Joint Guided Filter denoising on linear scRGB.
+///
+/// The image is converted to OKLab for processing:
+/// - Chrominance ($a, b$ channels) is filtered with a joint guided filter
+///   ($4\times$ subsampled) using raw luminance ($L$) as guidance.
+/// - Luminance ($L$) is filtered at full resolution ($s=1$) with self-guidance
+///   and adaptive detail recovery to preserve 100% of edge sharpness.
+fn apply_denoising_msgjf(
+    image: &VipsImage,
+    luma_denoise: f32,
+    color_denoise: f32,
+) -> Result<VipsImage, RenderError> {
+    let (r_luma, eps_luma, threshold, r_chroma, eps_chroma) =
+        denoise_params_from_ui(luma_denoise, color_denoise);
+
+    let (color, alpha) = split_color_and_alpha(image, "denoising")?;
+    let oklab = linear_rgb_to_oklab(&color)?;
+
+    let luma = ops::extract_band(&oklab, 0).map_err(vips_error)?;
+    let chroma = ops::extract_band_with_opts(&oklab, 1, &ops::ExtractBandOptions { n: 2 })
+        .map_err(vips_error)?;
+    let chroma_a = ops::extract_band(&chroma, 0).map_err(vips_error)?;
+    let chroma_b = ops::extract_band(&chroma, 1).map_err(vips_error)?;
+
+    // Chroma pass: Joint guided filter with luma as guidance (s=4 for speed and broad radius).
+    let filtered_a = if color_denoise > f32::EPSILON {
+        guided_filter_joint(&luma, &chroma_a, r_chroma, eps_chroma, 4.0)?
+    } else {
+        ops::copy(&chroma_a).map_err(vips_error)?
+    };
+    let filtered_b = if color_denoise > f32::EPSILON {
+        guided_filter_joint(&luma, &chroma_b, r_chroma, eps_chroma, 4.0)?
+    } else {
+        ops::copy(&chroma_b).map_err(vips_error)?
+    };
+
+    // Luma pass: Full resolution self-guided filter (s=1.0) with edge-preserving detail recovery.
+    let filtered_luma = if luma_denoise > f32::EPSILON {
+        luma_guided_filter_with_detail(&luma, r_luma, eps_luma, threshold)?
+    } else {
+        ops::copy(&luma).map_err(vips_error)?
+    };
+
+    let filtered_chroma = ops::bandjoin(&mut [filtered_a, filtered_b]).map_err(vips_error)?;
+    let filtered_oklab =
+        ops::bandjoin(&mut [filtered_luma, filtered_chroma]).map_err(vips_error)?;
+    let filtered_color = oklab_to_linear_rgb(&filtered_oklab)?;
+    join_alpha(filtered_color, alpha)
+}
+
+/// Guided Filter — joint variant with configurable subsampling factor `subsample`.
+///
+/// For `subsample > 1.0` (Fast Guided Filter, e.g. $s=4$ on Chroma), statistics
+/// and linear coefficients $(a, b)$ are computed at downsampled resolution and
+/// bilinearly upscaled back.
+/// For `subsample = 1.0` (Full-Resolution Guided Filter on Luma), all math is
+/// evaluated directly on the native pixel grid to prevent any edge smearing.
+fn guided_filter_joint(
+    guidance: &VipsImage,
+    input: &VipsImage,
+    radius: f64,
+    epsilon: f64,
+    subsample: f64,
+) -> Result<VipsImage, RenderError> {
+    let s = subsample.max(1.0);
+    let is_subsampled = s > 1.05;
+
+    let w = guidance.get_width() as f64;
+    let h = guidance.get_height() as f64;
+
+    let (i_s, p_s, ws, hs) = if is_subsampled {
+        let ws = (w / s).max(1.0).round();
+        let hs = (h / s).max(1.0).round();
+        let scale_x = ws / w;
+        let scale_y = hs / h;
+
+        let i_down = ops::resize_with_opts(
+            guidance,
+            scale_x,
+            &ops::ResizeOptions {
+                vscale: scale_y,
+                kernel: ops::Kernel::Linear,
+            },
+        )
+        .map_err(vips_error)?;
+        let p_down = ops::resize_with_opts(
+            input,
+            scale_x,
+            &ops::ResizeOptions {
+                vscale: scale_y,
+                kernel: ops::Kernel::Linear,
+            },
+        )
+        .map_err(vips_error)?;
+
+        (i_down, p_down, ws, hs)
+    } else {
+        (
+            ops::copy(guidance).map_err(vips_error)?,
+            ops::copy(input).map_err(vips_error)?,
+            w,
+            h,
+        )
+    };
+
+    // Gaussian sigma matching the variance of a box window of half-width `radius / s`.
+    let sigma = (radius / s / f64::sqrt(3.0)).max(0.3);
+
+    // Local statistics.
+    let mean_i = ops::gaussblur(&i_s, sigma).map_err(vips_error)?;
+    let mean_p = ops::gaussblur(&p_s, sigma).map_err(vips_error)?;
+
+    let i_times_p = ops::multiply(&i_s, &p_s).map_err(vips_error)?;
+    let mean_ip = ops::gaussblur(&i_times_p, sigma).map_err(vips_error)?;
+
+    let i_sq = ops::multiply(&i_s, &i_s).map_err(vips_error)?;
+    let mean_ii = ops::gaussblur(&i_sq, sigma).map_err(vips_error)?;
+
+    // cov(I,p) = E[Ip] - E[I]*E[p]
+    let mean_i_mean_p = ops::multiply(&mean_i, &mean_p).map_err(vips_error)?;
+    let cov_ip = ops::subtract(&mean_ip, &mean_i_mean_p).map_err(vips_error)?;
+
+    // var(I) = E[I²] - E[I]² ; clamped to zero to prevent negative variance.
+    let mean_i_sq = ops::multiply(&mean_i, &mean_i).map_err(vips_error)?;
+    let var_i_raw = ops::subtract(&mean_ii, &mean_i_sq).map_err(vips_error)?;
+    let var_i = clamp_image(&var_i_raw, 0.0, f64::from(f32::MAX))?;
+
+    // a = cov(I,p) / (var(I) + ε)
+    let denom = ops::linear(&var_i, &mut [1.0], &mut [epsilon]).map_err(vips_error)?;
+    let a = ops::divide(&cov_ip, &denom).map_err(vips_error)?;
+    // b = E[p] - a * E[I]
+    let a_mean_i = ops::multiply(&a, &mean_i).map_err(vips_error)?;
+    let b = ops::subtract(&mean_p, &a_mean_i).map_err(vips_error)?;
+
+    // Second blur pass: local average of linear coefficients.
+    let mean_a = ops::gaussblur(&a, sigma).map_err(vips_error)?;
+    let mean_b = ops::gaussblur(&b, sigma).map_err(vips_error)?;
+
+    // Upsample coefficients if subsampled, otherwise reuse directly.
+    let (mean_a_full, mean_b_full) = if is_subsampled {
+        let a_up = ops::resize_with_opts(
+            &mean_a,
+            w / ws,
+            &ops::ResizeOptions {
+                vscale: h / hs,
+                kernel: ops::Kernel::Linear,
+            },
+        )
+        .map_err(vips_error)?;
+        let b_up = ops::resize_with_opts(
+            &mean_b,
+            w / ws,
+            &ops::ResizeOptions {
+                vscale: h / hs,
+                kernel: ops::Kernel::Linear,
+            },
+        )
+        .map_err(vips_error)?;
+        (a_up, b_up)
+    } else {
+        (mean_a, mean_b)
+    };
+
+    // q = mean_a * I + mean_b
+    let a_times_guidance = ops::multiply(&mean_a_full, guidance).map_err(vips_error)?;
+    ops::add(&a_times_guidance, &mean_b_full).map_err(vips_error)
+}
+
+/// Full-resolution self-guided filter on luminance with adaptive edge-preserving detail recovery.
+///
+/// For small noise perturbations ($|r| \le T$), the residual is suppressed so
+/// the smooth guided base removes the noise.
+/// For prominent edge features ($|r| \ge 2T$), 100% of the original edge detail
+/// is restored without attenuation, completely avoiding edge softening.
+fn luma_guided_filter_with_detail(
+    luma: &VipsImage,
+    radius: f64,
+    epsilon: f64,
+    threshold: f64,
+) -> Result<VipsImage, RenderError> {
+    // Run guided filter natively at full resolution (s=1.0) so edges are sharp.
+    let filtered = guided_filter_joint(luma, luma, radius, epsilon, 1.0)?;
+
+    if threshold < 1e-9 {
+        return Ok(filtered);
+    }
+
+    // High-frequency residual: original - filtered.
+    let residual = ops::subtract(luma, &filtered).map_err(vips_error)?;
+
+    // Adaptive edge recovery factor:
+    // edge_ratio = clamp((|r| - T) / T, 0.0, 1.0)
+    // - |r| <= T   => edge_ratio = 0.0 (noise completely eliminated)
+    // - |r| >= 2*T => edge_ratio = 1.0 (edges 100% preserved)
+    // - T < |r| < 2*T => smooth transition
+    let abs_r = ops::abs(&residual).map_err(vips_error)?;
+    // (|r| - T) / T = |r| * (1/T) - 1.0
+    let inv_t = 1.0 / threshold;
+    let ratio_raw = ops::linear(&abs_r, &mut [inv_t], &mut [-1.0]).map_err(vips_error)?;
+    let edge_ratio = clamp_image(&ratio_raw, 0.0, 1.0)?;
+
+    let recovered_detail = ops::multiply(&residual, &edge_ratio).map_err(vips_error)?;
+    ops::add(&filtered, &recovered_detail).map_err(vips_error)
 }
 
 fn latest_frame(operations: &[Operation]) -> (f32, FrameColor) {
@@ -1124,8 +1377,8 @@ const LMS_TO_LINEAR_RGB: [[f32; 3]; 3] = [
 /// Darken the OKLab lightness channel with a radially symmetric vignette.
 ///
 /// The alpha mask is computed entirely with libvips tensor operations — no
-/// pixel loops. The result is in OKLab space so the next stage (Sharpness)
-/// can consume it directly without an extra color-space round-trip.
+/// pixel loops. The result is in OKLab space, applied after Sharpness, before
+/// conversion back to linear scRGB.
 ///
 /// Grid convention: the exact image center maps to (0, 0); coordinate values
 /// are normalized by half the shorter dimension so a circle inscribed in
@@ -2911,5 +3164,105 @@ mod tests {
                 "vignette must not alter OKLab 'b' channel; before={b_before}, after={b_after}"
             );
         }
+    }
+
+    #[test]
+    fn denoising_preserves_alpha_channel() {
+        let directory = tempfile::tempdir().unwrap();
+        let source_path = directory.path().join("denoise-alpha.png");
+
+        // A 16×16 image with semi-transparent alpha channel.
+        let mut pixels = Vec::new();
+        for _ in 0..256 {
+            pixels.extend_from_slice(&[140_u8, 160, 180, 128]);
+        }
+        let image =
+            VipsImage::new_from_memory_copy(&pixels, 16, 16, 4, ops::BandFormat::Uchar).unwrap();
+        ops::pngsave(&image, source_path.to_str().unwrap()).unwrap();
+
+        let mut engine = VipsEngine::new().unwrap();
+        let result = engine
+            .render_preview(&PreviewRequest {
+                generation: 1,
+                source_path,
+                operations: vec![Operation::Denoise {
+                    luma_denoise: 60.0,
+                    color_denoise: 80.0,
+                }],
+                viewport: Viewport::fit(16, 16),
+            })
+            .unwrap();
+
+        for (i, chunk) in result.rgba8.chunks_exact(4).enumerate() {
+            assert_eq!(
+                chunk[3], 128,
+                "denoising must not alter alpha at pixel {i}: got {}",
+                chunk[3]
+            );
+        }
+    }
+
+    #[test]
+    fn denoising_attenuates_color_and_luma_noise() {
+        let directory = tempfile::tempdir().unwrap();
+        let source_path = directory.path().join("denoise-pattern.png");
+
+        // Create a 32×32 noisy test image with alternating color noise
+        let mut pixels = Vec::new();
+        for y in 0..32 {
+            for x in 0..32 {
+                let noise = if (x + y) % 2 == 0 { 30_u8 } else { 0_u8 };
+                pixels.extend_from_slice(&[128 + noise, 128 - noise, 128 + noise, 255]);
+            }
+        }
+        let image =
+            VipsImage::new_from_memory_copy(&pixels, 32, 32, 4, ops::BandFormat::Uchar).unwrap();
+        ops::pngsave(&image, source_path.to_str().unwrap()).unwrap();
+
+        let mut engine = VipsEngine::new().unwrap();
+        let clean = engine
+            .render_preview(&PreviewRequest {
+                generation: 1,
+                source_path: source_path.clone(),
+                operations: vec![Operation::Denoise {
+                    luma_denoise: 0.0,
+                    color_denoise: 0.0,
+                }],
+                viewport: Viewport::fit(32, 32),
+            })
+            .unwrap();
+
+        let denoised = engine
+            .render_preview(&PreviewRequest {
+                generation: 2,
+                source_path,
+                operations: vec![Operation::Denoise {
+                    luma_denoise: 80.0,
+                    color_denoise: 80.0,
+                }],
+                viewport: Viewport::fit(32, 32),
+            })
+            .unwrap();
+
+        // Calculate variance of red channel in original vs denoised
+        let orig_r: Vec<f64> = clean.rgba8.chunks_exact(4).map(|c| c[0] as f64).collect();
+        let den_r: Vec<f64> = denoised
+            .rgba8
+            .chunks_exact(4)
+            .map(|c| c[0] as f64)
+            .collect();
+
+        let mean_orig = orig_r.iter().sum::<f64>() / orig_r.len() as f64;
+        let mean_den = den_r.iter().sum::<f64>() / den_r.len() as f64;
+
+        let var_orig =
+            orig_r.iter().map(|v| (v - mean_orig).powi(2)).sum::<f64>() / orig_r.len() as f64;
+        let var_den =
+            den_r.iter().map(|v| (v - mean_den).powi(2)).sum::<f64>() / den_r.len() as f64;
+
+        assert!(
+            var_den < var_orig * 0.7,
+            "denoising should reduce variation in noisy pattern: var_den={var_den} vs var_orig={var_orig}"
+        );
     }
 }

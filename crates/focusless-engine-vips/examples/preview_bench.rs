@@ -105,8 +105,8 @@ fn main() -> Result<(), Box<dyn Error>> {
                 }],
             ),
             ("saturation", vec![Operation::Saturation { amount: 45.0 }]),
-            ("vignette", vec![Operation::Vignette { strength: 0.8 }]),
             ("sharpness", vec![Operation::Sharpness { amount: 120.0 }]),
+            ("vignette", vec![Operation::Vignette { strength: 0.8 }]),
             (
                 "crop",
                 vec![Operation::Crop {
@@ -180,8 +180,8 @@ fn main() -> Result<(), Box<dyn Error>> {
                 },
             ),
             ("saturation", Operation::Saturation { amount: 45.0 }),
-            ("vignette", Operation::Vignette { strength: 0.8 }),
             ("sharpness", Operation::Sharpness { amount: 120.0 }),
+            ("vignette", Operation::Vignette { strength: 0.8 }),
             (
                 "frame",
                 Operation::Frame {
