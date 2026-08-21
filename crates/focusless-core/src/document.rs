@@ -1324,12 +1324,15 @@ impl ProjectDocument {
         Ok(())
     }
 
-    pub fn restore_original(&mut self) {
+    pub fn restore_original(&mut self) -> bool {
         let after = default_operations();
         if self.operations != after {
             let before = std::mem::replace(&mut self.operations, after.clone());
             self.history
                 .push(Command::RestoreOriginal { before, after });
+            true
+        } else {
+            false
         }
     }
 
@@ -1898,6 +1901,30 @@ mod tests {
         }
         assert!(!document.undo());
         assert_eq!(document.history.redo_len(), MAX_HISTORY_LEN);
+    }
+
+    #[test]
+    fn restore_original_reports_changes_when_history_is_full() {
+        let mut document = document();
+        for _ in 0..MAX_HISTORY_LEN {
+            let before = document.exposure_ev();
+            let after = if before > 0.0 { -1.0 } else { 1.0 };
+            document.preview_exposure(after).unwrap();
+            document.commit_exposure(before, after).unwrap();
+        }
+        let before_restore = document.exposure_ev();
+        assert_eq!(document.history.undo_len(), MAX_HISTORY_LEN);
+
+        assert!(document.restore_original());
+        assert_eq!(document.exposure_ev(), 0.0);
+        assert_eq!(
+            document.history.undo_len(),
+            MAX_HISTORY_LEN,
+            "the sliding window stays full while accepting Restore Original"
+        );
+        assert!(!document.restore_original());
+        assert!(document.undo());
+        assert_eq!(document.exposure_ev(), before_restore);
     }
 
     #[test]

@@ -16,7 +16,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut arguments = env::args_os().skip(1);
     let source = arguments.next().map(PathBuf::from).ok_or(
         "usage: preview_bench <image> \
-             [--frame-sequence|--adjustment-sequence|--cached-downstream-sequence|--zoom-sequence]",
+             [--frame-sequence|--adjustment-sequence|--cached-downstream-sequence|--denoise-downstream-sequence|--zoom-sequence]",
     )?;
     let mode = arguments.next();
     let frame_sequence = mode
@@ -28,6 +28,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     let cached_downstream_sequence = mode
         .as_deref()
         .is_some_and(|value| value == "--cached-downstream-sequence");
+    let denoise_downstream_sequence = mode
+        .as_deref()
+        .is_some_and(|value| value == "--denoise-downstream-sequence");
     let zoom_sequence = mode
         .as_deref()
         .is_some_and(|value| value == "--zoom-sequence");
@@ -91,6 +94,13 @@ fn main() -> Result<(), Box<dyn Error>> {
                         shadows: 45.0,
                         highlights: 35.0,
                     },
+                }],
+            ),
+            (
+                "denoise",
+                vec![Operation::Denoise {
+                    luma_denoise: 55.0,
+                    color_denoise: 35.0,
                 }],
             ),
             (
@@ -201,6 +211,69 @@ fn main() -> Result<(), Box<dyn Error>> {
             let result = wait_for_preview(&engine, feature_started)?;
             println!(
                 "cached_downstream_preview={} size={}x{} elapsed_ms={}",
+                name,
+                result.width,
+                result.height,
+                feature_started.elapsed().as_millis()
+            );
+        }
+    }
+    if denoise_downstream_sequence {
+        let denoise = Operation::Denoise {
+            luma_denoise: 55.0,
+            color_denoise: 35.0,
+        };
+        let cache_started = Instant::now();
+        engine.request_preview(PreviewRequest {
+            generation: 2,
+            source_path: source.clone(),
+            operations: vec![denoise],
+            viewport: Viewport::fit(1920, 1080),
+        });
+        let result = wait_for_preview(&engine, cache_started)?;
+        println!(
+            "denoise_stage_prime size={}x{} elapsed_ms={}",
+            result.width,
+            result.height,
+            cache_started.elapsed().as_millis()
+        );
+
+        let cases = [
+            ("exposure", Operation::Exposure { ev: 1.25 }),
+            ("contrast", Operation::Contrast { amount: 40.0 }),
+            (
+                "tone_curve",
+                Operation::ToneCurve {
+                    curve: ToneCurve {
+                        shadows: 0.18,
+                        midtones: 0.56,
+                        highlights: 0.84,
+                        ..ToneCurve::IDENTITY
+                    },
+                },
+            ),
+            ("saturation", Operation::Saturation { amount: 45.0 }),
+            ("sharpness", Operation::Sharpness { amount: 120.0 }),
+            ("vignette", Operation::Vignette { strength: 0.8 }),
+            (
+                "frame",
+                Operation::Frame {
+                    width_pct: 20.0,
+                    color: FrameColor::BLACK,
+                },
+            ),
+        ];
+        for (index, (name, operation)) in cases.into_iter().enumerate() {
+            let feature_started = Instant::now();
+            engine.request_preview(PreviewRequest {
+                generation: index as u64 + 3,
+                source_path: source.clone(),
+                operations: vec![denoise, operation],
+                viewport: Viewport::fit(1920, 1080),
+            });
+            let result = wait_for_preview(&engine, feature_started)?;
+            println!(
+                "denoise_cached_preview={} size={}x{} elapsed_ms={}",
                 name,
                 result.width,
                 result.height,

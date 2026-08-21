@@ -34,11 +34,12 @@ The workspace contains four production crates:
 2. The controller creates a `PreviewRequest` with an increasing `generation`.
 3. Only the newest request that has not started reaches the libvips worker.
 4. For fit previews, the worker materializes one color-managed linear source
-   proxy and every interactive operation reuses it. When Shadows/Highlights
-   is active, the worker also materializes that stage and reuses it for later
-   Tone Curve, Saturation, Sharpness, Vignette, and Frame changes. Operations
-   before or at Shadows/Highlights invalidate that stage. Zoomed previews
-   compute the visible source region from the full-resolution pipeline.
+   proxy and every interactive operation reuses it. When Denoise is active,
+   the worker materializes that stage so White Balance, Exposure, and later
+   edits do not recompute it. When Shadows/Highlights is also active, the cache
+   advances through that stage. Only operations at or before the selected
+   stage invalidate it. Zoomed previews compute the visible source region from
+   the full-resolution pipeline.
 5. An RGBA8 pixel buffer returns to the UI thread.
 6. The controller displays the result only when its generation is still the
    newest.
@@ -51,7 +52,7 @@ CPU pool for image computation.
 
 `ProjectDocument` persists:
 
-- Schema version (currently version 17; version 1–16 projects migrate on load)
+- Schema version (currently version 19; version 1–18 projects migrate on load)
 - Source photo path and sampled BLAKE3 fingerprint
 - Ordered non-destructive operation list
 - Zoom and normalized center coordinates
@@ -64,13 +65,13 @@ synchronization cannot block the UI.
 
 Geometry and tonal operations use a stable render order: EXIF orientation,
 ICC conversion to the working space, quarter-turn rotation, auto-cropped
-straighten rotation, normalized crop, white balance, exposure, the
+straighten rotation, normalized crop, denoise, white balance, exposure, the
 Shadows/Highlights adjustment, contrast, tone curve, and saturation. A crop
 rectangle is stored as normalized coordinates so it remains independent of
-source resolution. Sharpness and Vignette follow the tonal operations, and the frame is
-added last before preview resizing or output conversion. Rotating an existing
-crop transforms the rectangle with the image and records both changes as one
-undoable command.
+source resolution. Sharpness and Vignette follow the tonal operations, and the
+frame is added last before preview resizing or output conversion. Rotating an
+existing crop transforms the rectangle with the image and records both changes
+as one undoable command.
 
 The color pipeline converts an embedded source profile to sRGB with LittleCMS,
 using relative colorimetric intent and black-point compensation. An untagged
@@ -87,6 +88,11 @@ UCS. The target white is applied with full CAT16 chromatic adaptation through
 linear sRGB and XYZ matrices. The transform preserves the reference-white
 luminance, leaves alpha separate, and retains extended-range floating-point
 channel values until output conversion.
+
+Denoise converts linear scRGB to OKLab and applies separate guided filtering
+to lightness and chroma. Spatial radii scale with the fit-preview proxy while
+regularization and detail thresholds remain in OKLab units, keeping preview
+and full-resolution output visually consistent. Alpha stays separate.
 
 The tone curve is a shape-preserving piecewise cubic Hermite spline over five
 points. Its endpoints stay at `(0, 0)` and `(1, 1)`; users may move the three
@@ -129,7 +135,7 @@ OKLab chroma, and alpha unchanged.
 
 The frame width is a percentage of the shorter cropped image dimension. Its
 sRGB color preset is decoded to linear light before an opaque border is added
-after sharpening. Preview rendering caches the color-managed linear source
+after vignette. Preview rendering caches the color-managed linear source
 proxy, so frame changes do not repeat source decoding or ICC conversion.
 Export still evaluates the complete full-resolution pipeline.
 
@@ -141,6 +147,11 @@ undoable command.
 Crop editing temporarily renders the complete rotated photo and draws the
 interactive frame in Slint. Apply creates one history command; Cancel restores
 the original rectangle without modifying history or autosave state.
+
+Show Original renders the same quarter-turn rotation, straighten, crop, zoom,
+and center as the edited panel while omitting tonal and detail adjustments.
+Comparison requests reuse the existing fit source and do not evict a cached
+Denoise or Shadows/Highlights stage.
 
 ## Thread model
 

@@ -40,6 +40,13 @@ enum PendingOpen {
     },
 }
 
+#[derive(Clone, PartialEq)]
+struct OriginalPreviewKey {
+    source_path: PathBuf,
+    operations: Vec<Operation>,
+    viewport: Viewport,
+}
+
 pub struct Controller {
     engine: EngineWorker,
     storage: StorageWorker,
@@ -53,6 +60,8 @@ pub struct Controller {
     original_generation: u64,
     show_original: bool,
     original_preview_pending: bool,
+    original_preview_key: Option<OriginalPreviewKey>,
+    original_request_key: Option<OriginalPreviewKey>,
     effective_zoom: f32,
     exposure_edit_start: Option<f32>,
     contrast_edit_start: Option<f32>,
@@ -98,6 +107,8 @@ impl Controller {
             original_generation: u64::MAX,
             show_original: false,
             original_preview_pending: false,
+            original_preview_key: None,
+            original_request_key: None,
             effective_zoom: 1.0,
             exposure_edit_start: None,
             contrast_edit_start: None,
@@ -1253,6 +1264,7 @@ impl Controller {
                         result.height,
                     );
                     ui.set_original_image(Image::from_rgba8(buffer));
+                    self.original_preview_key = self.original_request_key.take();
                 } else if result.generation == self.newest_generation {
                     // Normal edited preview
                     let buffer = SharedPixelBuffer::<Rgba8Pixel>::clone_from_slice(
@@ -1408,6 +1420,7 @@ impl Controller {
         self.sharpness_edit_start = None;
         self.vignette_edit_start = None;
         self.rotation_edit_start = None;
+        self.denoise_edit_start = None;
         self.crop_edit_start = None;
         self.crop_saved_view = None;
         self.crop_aspect_ratio = None;
@@ -1418,6 +1431,8 @@ impl Controller {
         self.show_original = false;
         self.original_generation = u64::MAX;
         self.original_preview_pending = false;
+        self.original_preview_key = None;
+        self.original_request_key = None;
 
         let document = self.document.as_ref().expect("document was just assigned");
         ui.set_document_loaded(true);
@@ -2194,9 +2209,7 @@ impl Controller {
         let Some(document) = self.document.as_mut() else {
             return;
         };
-        let history_len = document.history.undo_len();
-        document.restore_original();
-        if document.history.undo_len() == history_len {
+        if !document.restore_original() {
             return;
         }
         document.view = ViewState::default();
@@ -2208,6 +2221,7 @@ impl Controller {
         self.sharpness_edit_start = None;
         self.vignette_edit_start = None;
         self.rotation_edit_start = None;
+        self.denoise_edit_start = None;
         self.frame_edit_start = None;
 
         ui.set_exposure(0.0);
@@ -2225,6 +2239,10 @@ impl Controller {
         ui.set_sharpness_text(format_nonnegative_adjustment(0.0).into());
         ui.set_vignette(0.0);
         ui.set_vignette_text(format_nonnegative_adjustment(0.0).into());
+        ui.set_luma_denoise(0.0);
+        ui.set_luma_denoise_text(format_nonnegative_adjustment(0.0).into());
+        ui.set_color_denoise(0.0);
+        ui.set_color_denoise_text(format_nonnegative_adjustment(0.0).into());
         self.set_curve_ui(ui, ToneCurve::IDENTITY);
         ui.set_frame_width(0.0);
         ui.set_frame_width_text("0".into());
@@ -2901,25 +2919,36 @@ impl Controller {
         } else {
             document.operations.clone()
         };
+        let viewport = Viewport {
+            output_width: width,
+            output_height: height,
+            zoom: if crop_mode { 0.0 } else { document.view.zoom },
+            center_x: if crop_mode {
+                0.5
+            } else {
+                document.view.center_x
+            },
+            center_y: if crop_mode {
+                0.5
+            } else {
+                document.view.center_y
+            },
+        };
+        if self.show_original {
+            let desired_original = OriginalPreviewKey {
+                source_path: document.source.path.clone(),
+                operations: original_comparison_operations(&document.operations),
+                viewport,
+            };
+            if self.original_preview_key.as_ref() != Some(&desired_original) {
+                self.original_preview_pending = true;
+            }
+        }
         self.engine.request_preview(PreviewRequest {
             generation: self.generation,
             source_path: document.source.path.clone(),
             operations,
-            viewport: Viewport {
-                output_width: width,
-                output_height: height,
-                zoom: if crop_mode { 0.0 } else { document.view.zoom },
-                center_x: if crop_mode {
-                    0.5
-                } else {
-                    document.view.center_x
-                },
-                center_y: if crop_mode {
-                    0.5
-                } else {
-                    document.view.center_y
-                },
-            },
+            viewport,
         });
     }
 
@@ -2933,9 +2962,8 @@ impl Controller {
         )
     }
 
-    /// Queues a preview of the original source (no operations) into the
-    /// `original-image` Slint property. Uses a dedicated generation number so
-    /// the result is never confused with a normal edited preview.
+    /// Queues the source with only geometry operations so the original and
+    /// edited panels share the same crop, rotation, zoom, and pan.
     fn queue_original_preview(&mut self, ui: &AppWindow) {
         let Some(document) = self.document.as_ref() else {
             return;
@@ -2946,21 +2974,30 @@ impl Controller {
         }
         // Each panel is half the canvas width in split mode.
         let width = (canvas_width / 2).max(MIN_CANVAS_SIZE);
+        let key = OriginalPreviewKey {
+            source_path: document.source.path.clone(),
+            operations: original_comparison_operations(&document.operations),
+            viewport: Viewport {
+                output_width: width,
+                output_height: height,
+                zoom: document.view.zoom,
+                center_x: document.view.center_x,
+                center_y: document.view.center_y,
+            },
+        };
+        if self.original_preview_key.as_ref() == Some(&key) {
+            return;
+        }
         // Allocate a generation that will never collide with newest_generation:
         // generation is monotonically increasing from 0; we place original
         // generations in the upper half of u64 by XOR-ing with a high bit.
         self.original_generation = self.generation ^ (1u64 << 63);
+        self.original_request_key = Some(key.clone());
         self.engine.request_preview(PreviewRequest {
             generation: self.original_generation,
-            source_path: document.source.path.clone(),
-            operations: vec![],
-            viewport: Viewport {
-                output_width: width,
-                output_height: height,
-                zoom: 0.0,
-                center_x: 0.5,
-                center_y: 0.5,
-            },
+            source_path: key.source_path,
+            operations: key.operations,
+            viewport: key.viewport,
         });
     }
 
@@ -2981,6 +3018,8 @@ impl Controller {
             // pending original request, and re-render at full canvas width.
             self.original_preview_pending = false;
             self.original_generation = u64::MAX;
+            self.original_preview_key = None;
+            self.original_request_key = None;
             ui.set_original_image(Default::default());
             self.queue_preview(ui);
         }
@@ -3449,6 +3488,19 @@ fn constrained_crop_size(
     (width, width / aspect)
 }
 
+fn original_comparison_operations(operations: &[Operation]) -> Vec<Operation> {
+    operations
+        .iter()
+        .copied()
+        .filter(|operation| {
+            matches!(
+                operation,
+                Operation::Rotate { .. } | Operation::Straighten { .. } | Operation::Crop { .. }
+            )
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod crop_tests {
     use super::*;
@@ -3460,6 +3512,26 @@ mod crop_tests {
             width: 0.8,
             height: 0.6,
         }
+    }
+
+    #[test]
+    fn original_comparison_keeps_geometry_and_removes_adjustments() {
+        let operations = vec![
+            Operation::Rotate { quarter_turns: 1 },
+            Operation::Straighten { degrees: 3.5 },
+            Operation::Crop { rect: rect() },
+            Operation::Denoise {
+                luma_denoise: 40.0,
+                color_denoise: 20.0,
+            },
+            Operation::Exposure { ev: 1.0 },
+            Operation::Frame {
+                width_pct: 10.0,
+                color: FrameColor::BLACK,
+            },
+        ];
+
+        assert_eq!(original_comparison_operations(&operations), operations[..3]);
     }
 
     #[test]

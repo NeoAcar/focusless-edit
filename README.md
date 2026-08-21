@@ -11,14 +11,15 @@ The project currently contains its first working vertical slice:
 - Live Temperature and Tint white-balance adjustment
 - Perceptual Contrast adjustment from `-100` to `+100`
 - Edge-aware Shadows and Highlights adjustments from `-100` to `+100`
+- Separate luminance and color denoise adjustments from `0` to `100`
 - Perceptual Saturation adjustment from `-100` to `+100`
-- One-click Matrix-inspired cinematic look
 - Luminance-only Sharpness adjustment from `0` to `1000`
 - Live exposure adjustment from `-3 EV` to `+3 EV`
 - Interactive five-point tone curve drawn directly over the photo
 - Non-destructive ±45-degree straighten dial
 - Interactive crop with move, edge/corner resize, Free mode, and aspect presets
 - Adjustable export frame with five neutral color presets
+- Adjustable luminance vignette from `0` to `100`
 - Persistent undo/redo history
 - Versioned `.focusless` project files
 - Debounced, atomic autosave
@@ -144,13 +145,14 @@ adaptation in linear RGB and preserve alpha. Contrast reshapes OKLab
 lightness while leaving chroma and extended-range values intact. Shadows and
 Highlights use an edge-aware guided filter over log OKLab lightness, preserving
 fine detail, chroma, alpha, and extended-range values. Saturation scales OKLab
-chroma while preserving perceptual lightness and hue. The Matrix look retains
-30% chroma and applies smooth green/cyan shadow, green midtone, and yellow
-highlight biases in OKLab. Sharpness uses a
+chroma while preserving perceptual lightness and hue. Denoise uses scale-aware
+guided filters on OKLab lightness and chroma so fitted previews remain
+consistent with full-resolution output. Sharpness uses a
 thresholded unsharp mask on OKLab lightness to avoid color halos. The tone
 curve works in linear RGB with fixed endpoints, three two-dimensional control
 points, shape-preserving interpolation, and a live full-image preview. The
-frame is composited in linear light after sharpening and is included in
+vignette darkens OKLab lightness radially after sharpening. The frame is
+composited in linear light after vignette and is included in
 full-resolution exports.
 
 ## Quality checks

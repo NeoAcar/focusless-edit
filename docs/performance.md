@@ -33,26 +33,27 @@ together.
 
 ## 100 MP interactive adjustments
 
-Measured on July 31, August 3, and August 7, 2026, on Windows 11 Pro with 31.2 GiB RAM,
-an AMD Ryzen 7 6800H, and libvips 8.18.2. Values are medians from three
+Measured most recently on August 21, 2026, on Windows 11 Pro with 31.2 GiB
+RAM, an AMD Ryzen 7 6800H, and libvips 8.18.2. Values are medians from three
 release-mode runs:
 
 - Source: synthetic `10000 × 10000` JPEG, 100 MP
 - Output viewport: `1920 × 1080` RGBA8
-- Initial color-managed proxy preview: `989 ms`
-- White balance: `56 ms`
-- Exposure: `50 ms`
-- Contrast: `197 ms`
-- Shadows and highlights: `492 ms`
-- Tone curve: `84 ms`
-- Saturation: `154 ms`
-- Matrix look: `259 ms`
-- Sharpness: `181 ms`
-- Crop: `44 ms`
-- Straighten rotation: `125 ms`
-- Frame: `63 ms`
-- Whole twelve-preview process wall time: `2.555 s`
-- Peak resident memory: `862.7 MiB` in a separate instrumented run
+- Initial color-managed proxy preview: `1071 ms`
+- White balance: `54 ms`
+- Exposure: `47 ms`
+- Contrast: `125 ms`
+- Shadows and highlights: `303 ms`
+- Denoise: `516 ms`
+- Tone curve: `67 ms`
+- Saturation: `101 ms`
+- Sharpness: `170 ms`
+- Vignette: `210 ms`
+- Crop: `19 ms`
+- Straighten rotation: `75 ms`
+- Frame: `30 ms`
+- Whole thirteen-preview process wall time: `2.933 s`
+- Peak resident memory: `631.2 MiB`
 
 The first Shadows/Highlights implementation measured `1778 ms` for the same
 case. Replacing its multi-level pseudo-Laplacian reconstruction with the
@@ -95,8 +96,9 @@ Ryzen 7 6800H, and libvips 8.18.2:
 
 The cache contains the materialized fit-preview result through the
 Shadows/Highlights stage. Later operations reuse those pixels; geometry,
-White Balance, Exposure, Contrast, and Shadows/Highlights changes rebuild the
-stage. Full-resolution zoom previews and exports do not use this cache.
+Denoise, White Balance, Exposure, and Shadows/Highlights changes rebuild the
+stage. Contrast is downstream and now reuses the cache. Full-resolution zoom
+previews and exports do not use this cache.
 
 Reproduce the measurement in PowerShell:
 
@@ -104,4 +106,38 @@ Reproduce the measurement in PowerShell:
 cargo build -p focusless-engine-vips --example preview_bench --release --locked
 .\target\release\examples\preview_bench.exe `
   path\to\photo.jpg --cached-downstream-sequence
+```
+
+## Denoise downstream cache
+
+Measured on August 21, 2026, on Windows 11 Pro with 31.2 GiB RAM, an AMD
+Ryzen 7 6800H, and libvips 8.18.2. Values are medians from three release-mode
+runs:
+
+- Source: synthetic `10000 × 10000` JPEG, 100 MP
+- Output viewport: `1920 × 1080` RGBA8
+- Initial color-managed proxy preview: `1058 ms`
+- Denoise cache prime: `520 ms`
+- Cached Exposure: `45 ms`
+- Cached Contrast: `166 ms`
+- Cached Tone Curve: `72 ms`
+- Cached Saturation: `118 ms`
+- Cached Sharpness: `124 ms`
+- Cached Vignette: `199 ms`
+- Cached Frame: `40 ms`
+- Whole process wall time: `2.373 s`
+- Peak resident memory: `601.5 MiB`
+
+When Denoise is active without Shadows/Highlights, the fit-preview cache ends
+immediately after Denoise. White Balance, Exposure, and every later adjustment
+reuse the denoised pixels. Changing geometry or either Denoise amount rebuilds
+the stage. Denoise spatial radii and chroma subsampling scale with the proxy;
+full-resolution zoom previews and exports still use full-resolution radii.
+
+Reproduce the measurement in PowerShell:
+
+```powershell
+cargo build -p focusless-engine-vips --example preview_bench --release --locked
+.\target\release\examples\preview_bench.exe `
+  .local\focusless-bench-100mp.jpg --denoise-downstream-sequence
 ```

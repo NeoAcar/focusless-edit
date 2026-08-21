@@ -216,8 +216,15 @@ struct FitAdjustmentCache {
     source_path: PathBuf,
     output_width: u32,
     output_height: u32,
+    stage: FitAdjustmentStage,
     operations: Vec<Operation>,
     image: VipsImage,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FitAdjustmentStage {
+    Denoise,
+    ShadowsHighlights,
 }
 
 impl VipsEngine {
@@ -330,24 +337,37 @@ impl VipsEngine {
             .expect("fit-preview source was initialized");
         let source_image = source.image.clone();
         let source_scale = source.source_scale;
-        let adjusted = if shadows_highlights_active(&request.operations) {
-            let cached_operations = operations_through_shadows_highlights(&request.operations);
+        let adjusted = if let Some(stage) = fit_adjustment_stage(&request.operations) {
+            let cached_operations =
+                operations_through_fit_adjustment_stage(&request.operations, stage);
             let rebuild_cache = self.fit_adjustment_cache.as_ref().is_none_or(|cache| {
                 cache.source_path != request.source_path
                     || cache.output_width != request.viewport.output_width
                     || cache.output_height != request.viewport.output_height
+                    || cache.stage != stage
                     || cache.operations != cached_operations
             });
             if rebuild_cache {
-                let image = apply_operations_through_shadows_highlights_scaled(
-                    &source_image,
-                    &request.operations,
-                )?;
+                let image = match stage {
+                    FitAdjustmentStage::Denoise => apply_operations_through_denoise_scaled(
+                        &source_image,
+                        &request.operations,
+                        source_scale,
+                    )?,
+                    FitAdjustmentStage::ShadowsHighlights => {
+                        apply_operations_through_shadows_highlights_scaled(
+                            &source_image,
+                            &request.operations,
+                            source_scale,
+                        )?
+                    }
+                };
                 let image = image.copy_memory().map_err(vips_error)?;
                 self.fit_adjustment_cache = Some(FitAdjustmentCache {
                     source_path: request.source_path.clone(),
                     output_width: request.viewport.output_width,
                     output_height: request.viewport.output_height,
+                    stage,
                     operations: cached_operations,
                     image,
                 });
@@ -357,25 +377,35 @@ impl VipsEngine {
                 }
                 debug!(
                     generation = request.generation,
-                    "materialized shadows/highlights fit-preview stage"
+                    ?stage,
+                    "materialized fit-preview adjustment stage"
                 );
             } else {
                 debug!(
                     generation = request.generation,
-                    "reusing shadows/highlights fit-preview stage"
+                    ?stage,
+                    "reusing fit-preview adjustment stage"
                 );
             }
             let cached = self
                 .fit_adjustment_cache
                 .as_ref()
                 .expect("fit adjustment cache was initialized");
-            apply_operations_after_shadows_highlights_scaled(
-                cached.image.clone(),
-                &request.operations,
-                source_scale,
-            )?
+            match stage {
+                FitAdjustmentStage::Denoise => apply_operations_after_denoise_scaled(
+                    cached.image.clone(),
+                    &request.operations,
+                    source_scale,
+                )?,
+                FitAdjustmentStage::ShadowsHighlights => {
+                    apply_operations_after_shadows_highlights_scaled(
+                        cached.image.clone(),
+                        &request.operations,
+                        source_scale,
+                    )?
+                }
+            }
         } else {
-            self.fit_adjustment_cache = None;
             apply_operations_scaled(&source_image, &request.operations, source_scale)?
         };
         let proxy_viewport = Viewport {
@@ -722,13 +752,15 @@ fn apply_operations_scaled(
     operations: &[Operation],
     source_scale: f32,
 ) -> Result<VipsImage, RenderError> {
-    let current = apply_operations_through_shadows_highlights_scaled(image, operations)?;
+    let current =
+        apply_operations_through_shadows_highlights_scaled(image, operations, source_scale)?;
     apply_operations_after_shadows_highlights_scaled(current, operations, source_scale)
 }
 
-fn apply_operations_through_shadows_highlights_scaled(
+fn apply_operations_through_denoise_scaled(
     image: &VipsImage,
     operations: &[Operation],
+    source_scale: f32,
 ) -> Result<VipsImage, RenderError> {
     let mut current = ops::copy(image).map_err(vips_error)?;
 
@@ -786,9 +818,34 @@ fn apply_operations_through_shadows_highlights_scaled(
         })
         .unwrap_or((0.0, 0.0));
     if luma_denoise > f32::EPSILON || color_denoise > f32::EPSILON {
-        current = apply_denoising_msgjf(&current, luma_denoise, color_denoise)?;
+        current = apply_denoising_msgjf(&current, luma_denoise, color_denoise, source_scale)?;
     }
 
+    Ok(current)
+}
+
+fn apply_operations_through_shadows_highlights_scaled(
+    image: &VipsImage,
+    operations: &[Operation],
+    source_scale: f32,
+) -> Result<VipsImage, RenderError> {
+    let current = apply_operations_through_denoise_scaled(image, operations, source_scale)?;
+    apply_white_balance_exposure_shadows_highlights(current, operations)
+}
+
+fn apply_operations_after_denoise_scaled(
+    current: VipsImage,
+    operations: &[Operation],
+    source_scale: f32,
+) -> Result<VipsImage, RenderError> {
+    let current = apply_white_balance_exposure_shadows_highlights(current, operations)?;
+    apply_operations_after_shadows_highlights_scaled(current, operations, source_scale)
+}
+
+fn apply_white_balance_exposure_shadows_highlights(
+    mut current: VipsImage,
+    operations: &[Operation],
+) -> Result<VipsImage, RenderError> {
     let white_balance = operations
         .iter()
         .rev()
@@ -939,22 +996,53 @@ fn shadows_highlights_active(operations: &[Operation]) -> bool {
         .is_some_and(|adjustment| !adjustment.is_identity())
 }
 
-fn operations_through_shadows_highlights(operations: &[Operation]) -> Vec<Operation> {
+fn denoise_active(operations: &[Operation]) -> bool {
+    operations
+        .iter()
+        .rev()
+        .find_map(|operation| match *operation {
+            Operation::Denoise {
+                luma_denoise,
+                color_denoise,
+            } => Some((luma_denoise, color_denoise)),
+            _ => None,
+        })
+        .is_some_and(|(luma, color)| luma > f32::EPSILON || color > f32::EPSILON)
+}
+
+fn fit_adjustment_stage(operations: &[Operation]) -> Option<FitAdjustmentStage> {
+    if shadows_highlights_active(operations) {
+        Some(FitAdjustmentStage::ShadowsHighlights)
+    } else if denoise_active(operations) {
+        Some(FitAdjustmentStage::Denoise)
+    } else {
+        None
+    }
+}
+
+fn operations_through_fit_adjustment_stage(
+    operations: &[Operation],
+    stage: FitAdjustmentStage,
+) -> Vec<Operation> {
     operations
         .iter()
         .copied()
         .filter(|operation| {
-            matches!(
+            let through_denoise = matches!(
                 operation,
                 Operation::Rotate { .. }
                     | Operation::Straighten { .. }
                     | Operation::Crop { .. }
                     | Operation::Denoise { .. }
-                    | Operation::WhiteBalance { .. }
-                    | Operation::Exposure { .. }
-                    | Operation::Contrast { .. }
-                    | Operation::ShadowsHighlights { .. }
-            )
+            );
+            through_denoise
+                || (stage == FitAdjustmentStage::ShadowsHighlights
+                    && matches!(
+                        operation,
+                        Operation::WhiteBalance { .. }
+                            | Operation::Exposure { .. }
+                            | Operation::ShadowsHighlights { .. }
+                    ))
         })
         .collect()
 }
@@ -1000,9 +1088,14 @@ fn apply_denoising_msgjf(
     image: &VipsImage,
     luma_denoise: f32,
     color_denoise: f32,
+    source_scale: f32,
 ) -> Result<VipsImage, RenderError> {
-    let (r_luma, eps_luma, threshold, r_chroma, eps_chroma) =
+    let (mut r_luma, eps_luma, threshold, mut r_chroma, eps_chroma) =
         denoise_params_from_ui(luma_denoise, color_denoise);
+    let spatial_scale = f64::from(source_scale).clamp(0.01, 1.0);
+    r_luma *= spatial_scale;
+    r_chroma *= spatial_scale;
+    let chroma_subsample = (4.0 * spatial_scale).clamp(1.0, 4.0);
 
     let (color, alpha) = split_color_and_alpha(image, "denoising")?;
     let oklab = linear_rgb_to_oklab(&color)?;
@@ -1015,12 +1108,12 @@ fn apply_denoising_msgjf(
 
     // Chroma pass: Joint guided filter with luma as guidance (s=4 for speed and broad radius).
     let filtered_a = if color_denoise > f32::EPSILON {
-        guided_filter_joint(&luma, &chroma_a, r_chroma, eps_chroma, 4.0)?
+        guided_filter_joint(&luma, &chroma_a, r_chroma, eps_chroma, chroma_subsample)?
     } else {
         ops::copy(&chroma_a).map_err(vips_error)?
     };
     let filtered_b = if color_denoise > f32::EPSILON {
-        guided_filter_joint(&luma, &chroma_b, r_chroma, eps_chroma, 4.0)?
+        guided_filter_joint(&luma, &chroma_b, r_chroma, eps_chroma, chroma_subsample)?
     } else {
         ops::copy(&chroma_b).map_err(vips_error)?
     };
@@ -2890,6 +2983,23 @@ mod tests {
         engine
             .render_preview(&PreviewRequest {
                 generation: 3,
+                source_path: source_path.clone(),
+                operations: vec![
+                    shadows_highlights,
+                    Operation::Contrast { amount: 45.0 },
+                    Operation::Saturation { amount: 60.0 },
+                ],
+                viewport: Viewport::fit(120, 80),
+            })
+            .unwrap();
+        assert_eq!(
+            engine.fit_adjustment_builds, 1,
+            "contrast follows shadows/highlights and must reuse the cached stage"
+        );
+
+        engine
+            .render_preview(&PreviewRequest {
+                generation: 4,
                 source_path,
                 operations: vec![
                     Operation::Exposure { ev: 0.5 },
@@ -2902,6 +3012,144 @@ mod tests {
         assert_eq!(
             engine.fit_adjustment_builds, 2,
             "an upstream edit must rebuild the shadows/highlights stage"
+        );
+    }
+
+    #[test]
+    fn edits_after_denoise_reuse_the_fit_stage() {
+        let directory = tempfile::tempdir().unwrap();
+        let source_path = directory.path().join("denoise-stage-cache.png");
+        let mut pixels = Vec::with_capacity(240 * 160 * 4);
+        for y in 0..160_u32 {
+            for x in 0..240_u32 {
+                let noise = if (x + y) % 2 == 0 { 18 } else { 0 };
+                pixels.extend_from_slice(&[
+                    (70 + x * 140 / 239 + noise) as u8,
+                    (60 + y * 150 / 159) as u8,
+                    (80 + (x + y) * 130 / 398) as u8,
+                    255,
+                ]);
+            }
+        }
+        let image =
+            VipsImage::new_from_memory_copy(&pixels, 240, 160, 4, ops::BandFormat::Uchar).unwrap();
+        ops::pngsave(&image, source_path.to_str().unwrap()).unwrap();
+
+        let denoise = Operation::Denoise {
+            luma_denoise: 55.0,
+            color_denoise: 35.0,
+        };
+        let mut engine = VipsEngine::new().unwrap();
+        engine
+            .render_preview(&PreviewRequest {
+                generation: 1,
+                source_path: source_path.clone(),
+                operations: vec![denoise, Operation::Exposure { ev: 0.25 }],
+                viewport: Viewport::fit(120, 80),
+            })
+            .unwrap();
+        engine
+            .render_preview(&PreviewRequest {
+                generation: 2,
+                source_path: source_path.clone(),
+                operations: vec![],
+                viewport: Viewport::fit(120, 80),
+            })
+            .unwrap();
+        engine
+            .render_preview(&PreviewRequest {
+                generation: 3,
+                source_path: source_path.clone(),
+                operations: vec![denoise, Operation::Exposure { ev: 0.75 }],
+                viewport: Viewport::fit(120, 80),
+            })
+            .unwrap();
+        assert_eq!(
+            engine.fit_adjustment_builds, 1,
+            "white balance, exposure, later edits, and comparison previews must reuse active denoise"
+        );
+
+        engine
+            .render_preview(&PreviewRequest {
+                generation: 4,
+                source_path,
+                operations: vec![
+                    Operation::Denoise {
+                        luma_denoise: 65.0,
+                        color_denoise: 35.0,
+                    },
+                    Operation::Exposure { ev: 0.75 },
+                ],
+                viewport: Viewport::fit(120, 80),
+            })
+            .unwrap();
+        assert_eq!(
+            engine.fit_adjustment_builds, 2,
+            "changing denoise must rebuild its materialized stage"
+        );
+    }
+
+    #[test]
+    fn scaled_denoise_fit_preview_stays_close_to_full_resolution() {
+        let directory = tempfile::tempdir().unwrap();
+        let source_path = directory.path().join("denoise-scale-reference.png");
+        let mut pixels = Vec::with_capacity(640 * 400 * 4);
+        for y in 0..400_u32 {
+            for x in 0..640_u32 {
+                let noise = ((x.wrapping_mul(17) + y.wrapping_mul(29)) % 31) as u8;
+                pixels.extend_from_slice(&[
+                    72 + (x * 96 / 639) as u8 + noise,
+                    68 + (y * 104 / 399) as u8 + noise / 2,
+                    80 + ((x + y) * 82 / 1038) as u8 + (30 - noise),
+                    255,
+                ]);
+            }
+        }
+        let image =
+            VipsImage::new_from_memory_copy(&pixels, 640, 400, 4, ops::BandFormat::Uchar).unwrap();
+        ops::pngsave(&image, source_path.to_str().unwrap()).unwrap();
+
+        let operations = vec![Operation::Denoise {
+            luma_denoise: 70.0,
+            color_denoise: 65.0,
+        }];
+        let viewport = Viewport::fit(160, 100);
+        let request = PreviewRequest {
+            generation: 1,
+            source_path: source_path.clone(),
+            operations: operations.clone(),
+            viewport,
+        };
+        let mut engine = VipsEngine::new().unwrap();
+        let proxy = engine.render_preview(&request).unwrap();
+
+        let source = load_oriented(&source_path).unwrap();
+        let source = to_working_linear(&source, &engine.srgb_profile).unwrap();
+        let adjusted = apply_operations(&source, &operations).unwrap();
+        let (visible, _) = render_viewport(&adjusted, viewport).unwrap();
+        let display = from_working_linear(&visible).unwrap();
+        let rgba = ensure_rgba8(&display).unwrap();
+        let reference = fit_to_canvas(&rgba, viewport).unwrap().write_to_memory();
+
+        let differences = proxy
+            .rgba8
+            .iter()
+            .zip(reference)
+            .map(|(proxy, reference)| proxy.abs_diff(reference))
+            .collect::<Vec<_>>();
+        let mean_difference = differences
+            .iter()
+            .map(|difference| u64::from(*difference))
+            .sum::<u64>() as f64
+            / differences.len() as f64;
+        let large_differences = differences
+            .iter()
+            .filter(|difference| **difference > 8)
+            .count();
+
+        assert!(
+            mean_difference <= 2.5 && large_differences <= differences.len() / 50,
+            "scaled denoise preview diverged from full resolution: mean={mean_difference}, {large_differences} channels exceeded 8"
         );
     }
 
